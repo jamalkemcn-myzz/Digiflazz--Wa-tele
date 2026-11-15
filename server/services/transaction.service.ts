@@ -1304,7 +1304,7 @@ export async function cancelCustomerTransaction(
   const gatewayRef = resolveGatewayReference(tx);
   if (gatewayRef) {
     persistGatewayReferenceIfMissing(tx.transaction_id, gatewayRef);
-    const check = await gateway.checkPaymentStatus(gatewayRef, tx.transaction_id);
+    const check = await gateway.checkPaymentStatus(gatewayRef, tx.transaction_id, tx.payment_amount);
     const effectiveGatewayRef = check.gatewayReference?.trim() || gatewayRef;
     if (check.mappedStatus === 'PAID') {
       handleVerifiedPaymentPaid(

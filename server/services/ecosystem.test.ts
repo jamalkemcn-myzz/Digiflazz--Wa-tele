@@ -1257,16 +1257,23 @@ test('Gateway trx_id polling, ?format=raw QRIS download, original payment link i
 
     if (parsedUrl.pathname === '/check-payment') {
       pollQueries.push(parsedUrl.searchParams);
+      const hasValidParams =
+        Boolean(parsedUrl.searchParams.get('trx_id')) &&
+        Boolean(parsedUrl.searchParams.get('amount')) &&
+        parsedUrl.searchParams.get('api_key') === 'test-api-key';
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(
-        JSON.stringify({
-          status: 'success',
-          data: {
-            trx_id: parsedUrl.searchParams.get('trx_id') || parsedUrl.searchParams.get('order_id'),
-            status: gatewayShouldReturnPaid ? 'PAID' : 'PENDING',
-            paid_at: gatewayShouldReturnPaid ? '2026-11-15T12:00:00.000Z' : undefined,
-          },
-        })
+        JSON.stringify(
+          gatewayShouldReturnPaid && hasValidParams
+            ? { success: true, paid: true }
+            : {
+                status: 'success',
+                data: {
+                  trx_id: parsedUrl.searchParams.get('trx_id'),
+                  status: 'PENDING',
+                },
+              }
+        )
       );
       return;
     }
@@ -1316,8 +1323,9 @@ test('Gateway trx_id polling, ?format=raw QRIS download, original payment link i
     assert.ok(pollQueries.length >= 1);
     const lastQuery = pollQueries[pollQueries.length - 1];
     assert.equal(lastQuery.get('trx_id'), 'MZ-POLL-998877-1');
-    assert.equal(lastQuery.get('order_id'), 'MZ-POLL-998877-1');
-    assert.notEqual(lastQuery.get('order_id'), orderRes.transaction!.transaction_id);
+    assert.equal(lastQuery.get('amount'), String(orderRes.transaction!.payment_amount));
+    assert.equal(lastQuery.get('api_key'), 'test-api-key');
+    assert.notEqual(lastQuery.get('trx_id'), orderRes.transaction!.transaction_id);
 
     // Clear cooldown/cancel the order via /batal on Telegram after 30s backdate
     const db = getDb();

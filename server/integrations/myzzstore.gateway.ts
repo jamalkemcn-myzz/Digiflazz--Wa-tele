@@ -61,7 +61,7 @@ export interface PaymentGatewayPort {
   isConfigured(): boolean;
   getMissingConfiguration(): string[];
   createPayment(input: CreatePaymentInput): Promise<CreatePaymentResult>;
-  checkPaymentStatus(gatewayReference: string, transactionId: string): Promise<CheckPaymentStatusResult>;
+  checkPaymentStatus(gatewayReference: string, transactionId: string, amount?: number): Promise<CheckPaymentStatusResult>;
   verifyCallback(
     headers: Record<string, string | string[] | undefined>,
     rawBody: string,
@@ -107,14 +107,33 @@ export class MyZZStoreGateway implements PaymentGatewayPort {
     ).trim();
     const upper = rawStatusStr.toUpperCase();
 
+    const isTrueFlag = (val: unknown): boolean =>
+      val === true ||
+      val === 1 ||
+      (typeof val === 'string' && ['true', '1', 'yes', 'paid', 'lunas'].includes(val.trim().toLowerCase()));
+    const isFalseFlag = (val: unknown): boolean =>
+      val === false ||
+      val === 0 ||
+      (typeof val === 'string' && ['false', '0', 'no', 'unpaid', 'pending'].includes(val.trim().toLowerCase()));
+
     let status: GatewayPaymentState = 'UNKNOWN';
     if (
-      data.paid === true ||
-      data.is_paid === true ||
+      isTrueFlag(data.paid) ||
+      isTrueFlag(obj.paid) ||
+      isTrueFlag(data.is_paid) ||
+      isTrueFlag(obj.is_paid) ||
+      isTrueFlag(data.lunas) ||
+      isTrueFlag(obj.lunas) ||
       ['PAID', 'SUCCESS', 'SETTLED', 'COMPLETED', 'BERHASIL', 'LUNAS'].includes(upper)
     ) {
       status = 'PAID';
-    } else if (['PENDING', 'UNPAID', 'WAITING', 'OPEN', 'CREATED'].includes(upper)) {
+    } else if (
+      ['PENDING', 'UNPAID', 'WAITING', 'OPEN', 'CREATED'].includes(upper) ||
+      isFalseFlag(data.paid) ||
+      isFalseFlag(obj.paid) ||
+      isFalseFlag(data.is_paid) ||
+      isFalseFlag(obj.is_paid)
+    ) {
       status = 'PENDING';
     } else if (['EXPIRED', 'TIMEOUT'].includes(upper)) {
       status = 'EXPIRED';
@@ -147,27 +166,34 @@ export class MyZZStoreGateway implements PaymentGatewayPort {
       pickStringOrNumberId(obj.order_id) ??
       pickStringOrNumberId(obj.id);
 
-    const qrString =
-      typeof data.qr_string === 'string'
-        ? data.qr_string
-        : typeof data.qris_content === 'string'
-        ? data.qris_content
-        : typeof data.qr_code === 'string'
-        ? data.qr_code
-        : typeof data.qris_string === 'string'
-        ? data.qris_string
-        : undefined;
+    const pickStr = (...vals: unknown[]): string | undefined => {
+      for (const v of vals) {
+        if (typeof v === 'string' && v.trim()) return v.trim();
+      }
+      return undefined;
+    };
 
-    const qrUrl =
-      typeof data.qris_url === 'string' && data.qris_url.trim()
-        ? data.qris_url.trim()
-        : typeof data.qr_url === 'string' && data.qr_url.trim()
-        ? data.qr_url.trim()
-        : typeof data.qrisUrl === 'string' && data.qrisUrl.trim()
-        ? data.qrisUrl.trim()
-        : typeof data.qr_image === 'string' && data.qr_image.trim()
-        ? data.qr_image.trim()
-        : undefined;
+    const qrString = pickStr(
+      data.qr_string,
+      data.qris_content,
+      data.qr_code,
+      data.qris_string,
+      obj.qr_string,
+      obj.qris_content,
+      obj.qr_code,
+      obj.qris_string
+    );
+
+    const qrUrl = pickStr(
+      data.qris_url,
+      data.qr_url,
+      data.qrisUrl,
+      data.qr_image,
+      obj.qris_url,
+      obj.qr_url,
+      obj.qrisUrl,
+      obj.qr_image
+    );
 
     const paidAmountRaw = data.amount ?? data.total_amount ?? data.nominal;
     const paidAmount =
@@ -210,6 +236,9 @@ export class MyZZStoreGateway implements PaymentGatewayPort {
     urlObj.searchParams.set('merchant_id', config.paymentGateway.merchantId);
     urlObj.searchParams.set('order_id', input.transactionId);
     urlObj.searchParams.set('amount', String(input.amount));
+    if (config.paymentGateway.apiKey) {
+      urlObj.searchParams.set('api_key', config.paymentGateway.apiKey);
+    }
     urlObj.searchParams.set('payment_method', 'QRIS');
     urlObj.searchParams.set('description', input.productName);
     urlObj.searchParams.set('customer_code', input.customerCode);
@@ -251,6 +280,9 @@ export class MyZZStoreGateway implements PaymentGatewayPort {
       }
 
       const parsed = this.parseGatewayResponse(body);
+      console.log(
+        `[MyZZStore] createPayment extracted trx_id=${parsed.gatewayReference ?? 'NONE'} internal_tx=${input.transactionId} amount=${input.amount}`
+      );
       if (!parsed.gatewayReference || (!parsed.qrString && !parsed.qrUrl)) {
         return {
           ok: false,
@@ -289,7 +321,11 @@ export class MyZZStoreGateway implements PaymentGatewayPort {
     }
   }
 
-  async checkPaymentStatus(gatewayReference: string, transactionId: string): Promise<CheckPaymentStatusResult> {
+  async checkPaymentStatus(
+    gatewayReference: string,
+    transactionId: string,
+    amount?: number
+  ): Promise<CheckPaymentStatusResult> {
     if (!this.isConfigured()) {
       return {
         ok: false,
@@ -301,6 +337,9 @@ export class MyZZStoreGateway implements PaymentGatewayPort {
 
     const effectiveGatewayId = (gatewayReference || '').trim();
     if (!effectiveGatewayId) {
+      console.log(
+        `[MyZZStore] checkPaymentStatus ABORTED: trx_id Gateway kosong untuk transaksi internal=${transactionId}`
+      );
       return {
         ok: false,
         gatewayReference: '',
@@ -321,8 +360,21 @@ export class MyZZStoreGateway implements PaymentGatewayPort {
     const urlObj = new URL(`${config.paymentGateway.baseUrl}${rawPath.startsWith('/') ? '' : '/'}${rawPath}`);
     if (!hasPathPlaceholder) {
       urlObj.searchParams.set('trx_id', effectiveGatewayId);
-      urlObj.searchParams.set('order_id', effectiveGatewayId);
     }
+    if (amount !== undefined && Number.isFinite(amount)) {
+      urlObj.searchParams.set('amount', String(amount));
+    }
+    if (config.paymentGateway.apiKey) {
+      urlObj.searchParams.set('api_key', config.paymentGateway.apiKey);
+    }
+
+    const maskedUrl = new URL(urlObj.toString());
+    if (maskedUrl.searchParams.has('api_key')) {
+      maskedUrl.searchParams.set('api_key', '[REDACTED]');
+    }
+    console.log(
+      `[MyZZStore] checkPaymentStatus sending trx_id=${effectiveGatewayId} (internal_tx=${transactionId}, amount=${amount ?? '-'}) -> ${maskedUrl.toString()}`
+    );
 
     try {
       const response = await fetch(urlObj.toString(), {
@@ -337,18 +389,29 @@ export class MyZZStoreGateway implements PaymentGatewayPort {
 
       const body = await response.json().catch(() => null);
       if (!response.ok || !body) {
+        console.log(
+          `[MyZZStore] checkPaymentStatus non-OK response trx_id=${effectiveGatewayId} httpStatus=${response.status}`
+        );
         return {
           ok: false,
-          gatewayReference,
+          gatewayReference: effectiveGatewayId,
           mappedStatus: 'UNKNOWN',
           errorMessage: `Gateway status HTTP ${response.status}`,
         };
       }
 
       const parsed = this.parseGatewayResponse(body);
+      const rootObj = body as Record<string, unknown>;
+      const dataObj =
+        rootObj.data && typeof rootObj.data === 'object' ? (rootObj.data as Record<string, unknown>) : rootObj;
+      console.log(
+        `[MyZZStore] checkPaymentStatus response trx_id=${effectiveGatewayId} mappedStatus=${parsed.status} paid=${String(
+          dataObj?.paid ?? rootObj?.paid ?? '-'
+        )} rawStatus=${parsed.rawStatus ?? '-'}`
+      );
       return {
         ok: true,
-        gatewayReference: parsed.gatewayReference || gatewayReference,
+        gatewayReference: parsed.gatewayReference || effectiveGatewayId,
         mappedStatus: parsed.status,
         paidAmount: parsed.paidAmount,
         paidAt: parsed.paidAt,
@@ -356,9 +419,12 @@ export class MyZZStoreGateway implements PaymentGatewayPort {
         safeMetadata: { rawStatus: parsed.rawStatus },
       };
     } catch (err) {
+      console.log(
+        `[MyZZStore] checkPaymentStatus error trx_id=${effectiveGatewayId} err=${err instanceof Error ? err.message : 'unknown'}`
+      );
       return {
         ok: false,
-        gatewayReference,
+        gatewayReference: effectiveGatewayId,
         mappedStatus: 'UNKNOWN',
         errorMessage: err instanceof Error ? err.message : 'Gateway status check error',
       };

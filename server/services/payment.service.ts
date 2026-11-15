@@ -182,6 +182,21 @@ export async function processGatewayCallback(
   };
 }
 
+export async function checkTransactionPaymentStatus(
+  tx: TransactionRow,
+  gateway: PaymentGatewayPort = defaultPaymentGateway
+) {
+  const gatewayRef = resolveGatewayReference(tx);
+  if (!gatewayRef) {
+    return null;
+  }
+  persistGatewayReferenceIfMissing(tx.transaction_id, gatewayRef);
+  const check = await gateway.checkPaymentStatus(gatewayRef, tx.transaction_id, tx.payment_amount);
+  const effectiveGatewayRef = check.gatewayReference?.trim() || gatewayRef;
+  persistGatewayReferenceIfMissing(tx.transaction_id, effectiveGatewayRef);
+  return { check, effectiveGatewayRef };
+}
+
 export async function finalizeExpiredInvoice(
   tx: TransactionRow,
   source: string,
@@ -192,12 +207,9 @@ export async function finalizeExpiredInvoice(
   }
 
   // Always verify status with MyZZStore using Gateway trx_id before marking EXPIRED!
-  const gatewayRef = resolveGatewayReference(tx);
-  if (gatewayRef) {
-    persistGatewayReferenceIfMissing(tx.transaction_id, gatewayRef);
-    const check = await gateway.checkPaymentStatus(gatewayRef, tx.transaction_id);
-    const effectiveGatewayRef = check.gatewayReference?.trim() || gatewayRef;
-    persistGatewayReferenceIfMissing(tx.transaction_id, effectiveGatewayRef);
+  const verified = await checkTransactionPaymentStatus(tx, gateway);
+  if (verified) {
+    const { check, effectiveGatewayRef } = verified;
     if (check.mappedStatus === 'PAID') {
       handleVerifiedPaymentPaid(tx.transaction_id, `${source}_VERIFY`, check.paidAt, effectiveGatewayRef);
       return 'PAID';

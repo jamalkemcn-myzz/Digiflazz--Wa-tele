@@ -124,11 +124,17 @@ export async function reconcileSingleTransactionManual(
     | undefined;
   if (!tx) throw new Error('Transaksi tidak ditemukan');
 
-  if (tx.payment_status !== 'PAID' && tx.gateway_reference && gateway.isConfigured()) {
-    const check = await gateway.checkPaymentStatus(tx.gateway_reference, tx.transaction_id);
-    if (check.mappedStatus === 'PAID') {
+  if (tx.payment_status !== 'PAID' && gateway.isConfigured()) {
+    const { checkTransactionPaymentStatus } = await import('./payment.service');
+    const verified = await checkTransactionPaymentStatus(tx, gateway);
+    if (verified && verified.check.mappedStatus === 'PAID') {
       const { handleVerifiedPaymentPaid } = await import('./transaction.service');
-      handleVerifiedPaymentPaid(tx.transaction_id, 'MANUAL_RECONCILE', check.paidAt, tx.gateway_reference);
+      handleVerifiedPaymentPaid(
+        tx.transaction_id,
+        'MANUAL_RECONCILE',
+        verified.check.paidAt,
+        verified.effectiveGatewayRef
+      );
     }
   }
 
