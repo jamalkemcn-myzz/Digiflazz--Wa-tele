@@ -3,6 +3,8 @@ import { logger, sanitizeForLog } from '../logging/logger';
 import { defaultPaymentGateway, type PaymentGatewayPort } from '../integrations/myzzstore.gateway';
 import {
   handleVerifiedPaymentPaid,
+  persistGatewayReferenceIfMissing,
+  resolveGatewayReference,
   setCustomerCooldown,
   transitionTransactionStatus,
   type TransactionRow,
@@ -89,16 +91,25 @@ export async function processGatewayCallback(
 
   const eventId = verified.eventId || `${verified.gatewayReference}:${verified.mappedStatus}`;
 
-  // Locate transaction by transactionId or gatewayReference
+  // Locate transaction by transactionId or gatewayReference (supporting gateways sending trx_id in order_id or vice versa)
+  const idA = verified.transactionId?.trim() || '';
+  const idB = verified.gatewayReference?.trim() || '';
   const tx = db
     .prepare(
       `SELECT * FROM transactions
-       WHERE transaction_id = ? OR (gateway_reference IS NOT NULL AND gateway_reference = ?)`
+       WHERE transaction_id IN (?, ?)
+          OR (gateway_reference IS NOT NULL AND gateway_reference IN (?, ?))
+       ORDER BY id DESC LIMIT 1`
     )
-    .get(verified.transactionId ?? '', verified.gatewayReference ?? '') as TransactionRow | undefined;
+    .get(idA, idB, idA, idB) as TransactionRow | undefined;
 
   if (!tx) {
     return { statusCode: 404, body: { ok: false, error: 'Transaction not found' } };
+  }
+
+  const effectiveGatewayRef = verified.gatewayReference?.trim() || resolveGatewayReference(tx) || undefined;
+  if (effectiveGatewayRef) {
+    persistGatewayReferenceIfMissing(tx.transaction_id, effectiveGatewayRef);
   }
 
   if (verified.amount !== undefined && verified.amount !== tx.payment_amount) {
@@ -146,7 +157,7 @@ export async function processGatewayCallback(
       tx.transaction_id,
       'MYZZSTORE_CALLBACK',
       verified.paidAt,
-      verified.gatewayReference
+      effectiveGatewayRef
     );
   } else if (verified.mappedStatus === 'EXPIRED') {
     await finalizeExpiredInvoice(tx, 'MYZZSTORE_CALLBACK', gateway);
@@ -180,11 +191,15 @@ export async function finalizeExpiredInvoice(
     return 'PAID';
   }
 
-  // Always verify status with MyZZStore before marking EXPIRED!
-  if (tx.gateway_reference) {
-    const check = await gateway.checkPaymentStatus(tx.gateway_reference, tx.transaction_id);
+  // Always verify status with MyZZStore using Gateway trx_id before marking EXPIRED!
+  const gatewayRef = resolveGatewayReference(tx);
+  if (gatewayRef) {
+    persistGatewayReferenceIfMissing(tx.transaction_id, gatewayRef);
+    const check = await gateway.checkPaymentStatus(gatewayRef, tx.transaction_id);
+    const effectiveGatewayRef = check.gatewayReference?.trim() || gatewayRef;
+    persistGatewayReferenceIfMissing(tx.transaction_id, effectiveGatewayRef);
     if (check.mappedStatus === 'PAID') {
-      handleVerifiedPaymentPaid(tx.transaction_id, `${source}_VERIFY`, check.paidAt, tx.gateway_reference);
+      handleVerifiedPaymentPaid(tx.transaction_id, `${source}_VERIFY`, check.paidAt, effectiveGatewayRef);
       return 'PAID';
     }
     if (check.mappedStatus === 'UNKNOWN') {
@@ -200,7 +215,7 @@ export async function finalizeExpiredInvoice(
       return 'UNKNOWN';
     }
     // Cancel on gateway if supported
-    await gateway.cancelPayment(tx.gateway_reference, tx.transaction_id);
+    await gateway.cancelPayment(effectiveGatewayRef, tx.transaction_id);
   }
 
   const now = new Date().toISOString();

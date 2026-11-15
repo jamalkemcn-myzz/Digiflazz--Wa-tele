@@ -4,7 +4,7 @@ import https from 'node:https';
 import type { Telegraf } from 'telegraf';
 import QRCode from 'qrcode';
 import { logger } from '../logging/logger';
-import { fetchQrisImageBuffer } from '../integrations/qris-image';
+import { appendRawFormatToQrisUrl, fetchQrisImageBuffer } from '../integrations/qris-image';
 
 function detectImageMeta(buf: Buffer): { filename: string; mimeType: string } {
   if (buf.length >= 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
@@ -220,7 +220,8 @@ export async function sendTelegramQrisInvoice(
       return await uploadPhotoResilient(bot, chatId, pngBuffer, caption, replyMarkup);
     }
     if (qris?.qrUrl) {
-      const imageBuffer = await fetchQrisImageBuffer(qris.qrUrl);
+      const rawQrUrl = appendRawFormatToQrisUrl(qris.qrUrl);
+      const imageBuffer = await fetchQrisImageBuffer(rawQrUrl);
       return await uploadPhotoResilient(bot, chatId, imageBuffer, caption, replyMarkup);
     }
     const msg = await bot.telegram.sendMessage(chatId, caption, replyMarkup);

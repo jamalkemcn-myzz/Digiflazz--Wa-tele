@@ -188,6 +188,7 @@ export function BotDemoPage({ admin }: { admin: AdminSession }) {
           { label: 'Daftar Produk', cmd: 'produk' },
           { label: `Simulasi Order (${sampleSku})`, cmd: `order ${sampleSku} 081234567890` },
           { label: 'Cek Status Terakhir', cmd: 'status' },
+          { label: 'Batalkan Pending (batal)', cmd: 'batal' },
           { label: 'Riwayat & Refund', cmd: 'riwayat' },
           { label: 'Kode Hubungkan Akun', cmd: 'hubungkan' },
         ]
@@ -197,6 +198,7 @@ export function BotDemoPage({ admin }: { admin: AdminSession }) {
           { label: '/produk', cmd: '/produk' },
           { label: `Simulasi /order (${sampleSku})`, cmd: `/order ${sampleSku} 081234567890` },
           { label: '/status', cmd: '/status' },
+          { label: '/batal (Batalkan Pending)', cmd: '/batal' },
           { label: '/riwayat', cmd: '/riwayat' },
           { label: '/hubungkan', cmd: '/hubungkan' },
         ];

@@ -21,6 +21,7 @@ import {
   sendTelegramCategoryList,
   sendTelegramProductPage,
   promptTelegramProductDestination,
+  executeTelegramOrder,
   handleTelegramOrderCancellation,
   toMarkupKeyboard,
   clearTrackedTelegramMessages,
@@ -31,7 +32,7 @@ import {
   type TelegramReplyTransport,
 } from './telegram.command-handler';
 import { sendTelegramQrisInvoice } from './telegram.notification.service';
-import { recordTelegramBotMessageId } from './bot-session';
+import { clearBotSession, getBotSession, recordTelegramBotMessageId } from './bot-session';
 
 export async function dispatchTelegramCallback(
   transport: TelegramReplyTransport,
@@ -87,6 +88,35 @@ export async function dispatchTelegramCallback(
     const prodId = data.replace('BUY_ID_', '').trim();
     if (transport.answerCbQuery) await transport.answerCbQuery();
     await promptTelegramProductDestination(transport, input.userId || 'guest', prodId, dryRun);
+    return;
+  }
+
+  if (data === 'CONFIRM_ORDER') {
+    const userId = input.userId || 'guest';
+    const session = getBotSession('TELEGRAM', userId, dryRun);
+    if (transport.answerCbQuery) await transport.answerCbQuery();
+    if (session?.mode !== 'AWAITING_ORDER_CONFIRMATION') {
+      await transport.reply(
+        'Sesi konfirmasi pesanan sudah berakhir ya Kak. Silakan pilih produk kembali.',
+        TG_NAV_BACK_BUTTONS
+      );
+      return;
+    }
+    await executeTelegramOrder(transport, {
+      userId,
+      username: input.username,
+      sku: session.sku,
+      destination: session.destination,
+      couponCode: session.couponCode || null,
+      dryRun,
+    });
+    return;
+  }
+
+  if (data === 'CANCEL_CONFIRM_ORDER') {
+    clearBotSession('TELEGRAM', input.userId || 'guest', dryRun);
+    if (transport.answerCbQuery) await transport.answerCbQuery();
+    await transport.reply('Pembuatan pesanan dibatalkan sebelum QRIS dibuat.', TG_NAV_BACK_BUTTONS);
     return;
   }
 
@@ -232,9 +262,10 @@ export async function dispatchTelegramCallback(
     await transport.reply(
       `Panduan Belanja Praktis:\n` +
         `1. Tap tombol Daftar Produk atau Kategori Produk.\n` +
-        `2. Pilih produk yang Anda mau, lalu kirim nomor tujuan.\n` +
-        `3. Bayar QRIS sebelum 5 menit sesuai nominal tepat.\n` +
-        `4. Hubungkan akun WhatsApp melalui tombol Hubungkan WhatsApp.`,
+        `2. Pilih produk yang Anda mau, kirim nomor tujuan, lalu konfirmasi (Ya/Batal).\n` +
+        `3. Bayar QRIS atau klik Link Pembayaran sebelum 5 menit sesuai nominal tepat.\n` +
+        `4. Ketik /batal untuk membatalkan pesanan PENDING (minimal 30 detik setelah dibuat).\n` +
+        `5. Hubungkan akun WhatsApp melalui tombol Hubungkan WhatsApp.`,
       TG_MAIN_MENU_BUTTONS
     );
     return;

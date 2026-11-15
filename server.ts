@@ -102,7 +102,10 @@ async function bootstrap() {
   if (config.nodeEnv !== 'production') {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        allowedHosts: ['dashboard.myzzstore.my.id', 'localhost', '127.0.0.1'],
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);

@@ -1,3 +1,22 @@
+export function appendRawFormatToQrisUrl(qrUrl: string): string {
+  const trimmed = qrUrl.trim();
+  if (!trimmed || trimmed.startsWith('data:')) {
+    return trimmed;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.searchParams.get('format') !== 'raw') {
+      parsed.searchParams.set('format', 'raw');
+    }
+    return parsed.toString();
+  } catch {
+    if (/[?&]format=raw(?:&|$)/i.test(trimmed)) {
+      return trimmed;
+    }
+    return `${trimmed}${trimmed.includes('?') ? '&' : '?'}format=raw`;
+  }
+}
+
 export async function fetchQrisImageBuffer(qrUrl: string, timeoutMs = 15_000): Promise<Buffer> {
   const trimmed = qrUrl.trim();
   if (!trimmed) {
@@ -17,10 +36,12 @@ export async function fetchQrisImageBuffer(qrUrl: string, timeoutMs = 15_000): P
     return buf;
   }
 
+  const downloadUrl = appendRawFormatToQrisUrl(trimmed);
+
   let lastErr: unknown;
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      const response = await fetch(trimmed, {
+      const response = await fetch(downloadUrl, {
         method: 'GET',
         redirect: 'follow',
         headers: {

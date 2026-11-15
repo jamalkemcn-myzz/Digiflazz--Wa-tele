@@ -91,6 +91,33 @@ function generateTransactionId(): string {
   return `TRX-${datePart}-${randPart}`;
 }
 
+export function resolveGatewayReference(tx: Pick<TransactionRow, 'gateway_reference' | 'qris_payload_json'>): string | null {
+  const direct = tx.gateway_reference?.trim();
+  if (direct) return direct;
+  if (!tx.qris_payload_json) return null;
+  try {
+    const parsed = JSON.parse(tx.qris_payload_json) as Record<string, unknown>;
+    const candidate = parsed.trxId ?? parsed.trx_id ?? parsed.gatewayReference ?? parsed.orderId ?? parsed.order_id;
+    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
+    if (typeof candidate === 'number' && Number.isFinite(candidate)) return String(candidate);
+  } catch {
+    // ignore malformed json
+  }
+  return null;
+}
+
+export function persistGatewayReferenceIfMissing(transactionId: string, gatewayReference?: string | null): void {
+  const ref = gatewayReference?.trim();
+  if (!ref) return;
+  const db = getDb();
+  db.prepare(
+    `UPDATE transactions
+     SET gateway_reference = ?, updated_at = ?
+     WHERE transaction_id = ?
+       AND (gateway_reference IS NULL OR TRIM(gateway_reference) = '')`
+  ).run(ref, new Date().toISOString(), transactionId);
+}
+
 export function setCustomerCooldown(customerId: number, reason: string, transactionId?: string): void {
   if (config.transaction.cooldownSeconds <= 0) return;
   const db = getDb();
@@ -457,7 +484,9 @@ export async function createOrder(
     };
   }
 
+  const gatewayRef = gwRes.gatewayReference?.trim() || null;
   const qrisPayload = {
+    trxId: gatewayRef,
     qrString: gwRes.qrString,
     qrUrl: gwRes.qrUrl,
   };
@@ -469,7 +498,7 @@ export async function createOrder(
     'Invoice QRIS MyZZStore berhasil dibuat',
     {
       paymentStatus: 'PENDING',
-      gatewayReference: gwRes.gatewayReference ?? null,
+      gatewayReference: gatewayRef,
       qrisPayloadJson: JSON.stringify(qrisPayload),
     }
   );
@@ -487,7 +516,10 @@ export async function createOrder(
   return {
     ok: true,
     transaction: pendingTx,
-    qris: qrisPayload,
+    qris: {
+      qrString: gwRes.qrString,
+      qrUrl: gwRes.qrUrl,
+    },
   };
 }
 
@@ -545,7 +577,7 @@ export function handleVerifiedPaymentPaid(
         `UPDATE transactions
          SET payment_status = 'PAID',
              transaction_status = 'PAID_PROCESSING',
-             gateway_reference = COALESCE(?, gateway_reference),
+             gateway_reference = COALESCE(NULLIF(TRIM(?), ''), gateway_reference),
              paid_at = ?,
              updated_at = ?
          WHERE transaction_id = ?`
@@ -1269,14 +1301,17 @@ export async function cancelCustomerTransaction(
     };
   }
 
-  if (tx.gateway_reference) {
-    const check = await gateway.checkPaymentStatus(tx.gateway_reference, tx.transaction_id);
+  const gatewayRef = resolveGatewayReference(tx);
+  if (gatewayRef) {
+    persistGatewayReferenceIfMissing(tx.transaction_id, gatewayRef);
+    const check = await gateway.checkPaymentStatus(gatewayRef, tx.transaction_id);
+    const effectiveGatewayRef = check.gatewayReference?.trim() || gatewayRef;
     if (check.mappedStatus === 'PAID') {
       handleVerifiedPaymentPaid(
         tx.transaction_id,
         'CUSTOMER_CANCEL_VERIFY',
         check.paidAt,
-        tx.gateway_reference
+        effectiveGatewayRef
       );
       return {
         ok: false,
@@ -1284,7 +1319,7 @@ export async function cancelCustomerTransaction(
         errorMessage: `Pembayaran untuk ${tx.transaction_id} sudah diterima LUNAS sehingga pesanan sedang diproses.`,
       };
     }
-    await gateway.cancelPayment(tx.gateway_reference, tx.transaction_id).catch(() => undefined);
+    await gateway.cancelPayment(effectiveGatewayRef, tx.transaction_id).catch(() => undefined);
   }
 
   const now = new Date().toISOString();

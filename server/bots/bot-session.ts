@@ -11,6 +11,17 @@ export type BotConversationState =
       productName: string;
       sellingPrice: number;
       updatedAt: number;
+    }
+  | {
+      mode: 'AWAITING_ORDER_CONFIRMATION';
+      sku: string;
+      productName: string;
+      sellingPrice: number;
+      discountAmount: number;
+      estimatedTotal: number;
+      destination: string;
+      couponCode?: string | null;
+      updatedAt: number;
     };
 
 const SESSION_TTL_MS = 10 * 60 * 1000;

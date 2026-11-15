@@ -133,11 +133,19 @@ export class MyZZStoreGateway implements PaymentGatewayPort {
     const gatewayReference =
       pickStringOrNumberId(data.trx_id) ??
       pickStringOrNumberId(data.trxId) ??
+      pickStringOrNumberId(data.id_transaksi) ??
       pickStringOrNumberId(data.reference) ??
       pickStringOrNumberId(data.ref_id) ??
       pickStringOrNumberId(data.invoice_id) ??
       pickStringOrNumberId(data.transaction_id) ??
-      pickStringOrNumberId(data.id);
+      pickStringOrNumberId(data.id) ??
+      pickStringOrNumberId(data.order_id) ??
+      pickStringOrNumberId(obj.trx_id) ??
+      pickStringOrNumberId(obj.trxId) ??
+      pickStringOrNumberId(obj.id_transaksi) ??
+      pickStringOrNumberId(obj.reference) ??
+      pickStringOrNumberId(obj.order_id) ??
+      pickStringOrNumberId(obj.id);
 
     const qrString =
       typeof data.qr_string === 'string'
@@ -291,22 +299,29 @@ export class MyZZStoreGateway implements PaymentGatewayPort {
       };
     }
 
+    const effectiveGatewayId = (gatewayReference || '').trim();
+    if (!effectiveGatewayId) {
+      return {
+        ok: false,
+        gatewayReference: '',
+        mappedStatus: 'UNKNOWN',
+        errorMessage: `trx_id (order_id) Gateway tidak ditemukan untuk transaksi ${transactionId}`,
+      };
+    }
+
     const statusPath = config.paymentGateway.statusPath || '/check-payment';
     const hasPathPlaceholder =
       statusPath.includes(':trx_id') ||
       statusPath.includes(':reference') ||
       statusPath.includes(':order_id');
     const rawPath = statusPath
-      .replace(':trx_id', encodeURIComponent(gatewayReference))
-      .replace(':reference', encodeURIComponent(gatewayReference))
-      .replace(':order_id', encodeURIComponent(transactionId));
+      .replace(':trx_id', encodeURIComponent(effectiveGatewayId))
+      .replace(':reference', encodeURIComponent(effectiveGatewayId))
+      .replace(':order_id', encodeURIComponent(effectiveGatewayId));
     const urlObj = new URL(`${config.paymentGateway.baseUrl}${rawPath.startsWith('/') ? '' : '/'}${rawPath}`);
     if (!hasPathPlaceholder) {
-      if (gatewayReference) {
-        urlObj.searchParams.set('trx_id', gatewayReference);
-      } else if (transactionId) {
-        urlObj.searchParams.set('order_id', transactionId);
-      }
+      urlObj.searchParams.set('trx_id', effectiveGatewayId);
+      urlObj.searchParams.set('order_id', effectiveGatewayId);
     }
 
     try {

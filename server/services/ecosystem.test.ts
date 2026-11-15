@@ -638,7 +638,7 @@ test('Bot Demo Simulator: simulates WhatsApp & Telegram replies, inline callback
   });
   assert.match(waSelectProd.replies[0].text, /nomor tujuan/i);
 
-  const waOrder = await runBotDemoInteraction({
+  const waConfirmPrompt = await runBotDemoInteraction({
     platform: 'WHATSAPP',
     senderRole: 'CUSTOMER',
     inputType: 'TEXT',
@@ -646,10 +646,44 @@ test('Bot Demo Simulator: simulates WhatsApp & Telegram replies, inline callback
     senderId: '628111222333',
     actor: { id: 'testowner', role: 'OWNER' },
   });
+  assert.equal(waConfirmPrompt.replies.length, 1);
+  assert.match(waConfirmPrompt.replies[0].text, /Konfirmasi Pesanan/i);
+  const waConfirmBtns = (waConfirmPrompt.replies[0].buttons || []).flat().map((b) => b.replyText);
+  assert.ok(waConfirmBtns.includes('ya'));
+  assert.ok(waConfirmBtns.includes('batal'));
+
+  // Confirming with "ya" proceeds to generate the QRIS invoice
+  const waOrder = await runBotDemoInteraction({
+    platform: 'WHATSAPP',
+    senderRole: 'CUSTOMER',
+    inputType: 'TEXT',
+    text: 'ya',
+    senderId: '628111222333',
+    actor: { id: 'testowner', role: 'OWNER' },
+  });
   assert.equal(waOrder.replies.length, 1);
   assert.ok(waOrder.replies[0].imageDataUrl?.startsWith('data:image/png;base64,'));
   assert.match(waOrder.replies[0].text, /INVOICE PEMBAYARAN QRIS/);
   assert.ok(waOrder.replies[0].buttons && waOrder.replies[0].buttons.length >= 1);
+
+  // Cancelling during WhatsApp confirmation aborts before QRIS creation
+  await runBotDemoInteraction({
+    platform: 'WHATSAPP',
+    senderRole: 'CUSTOMER',
+    inputType: 'TEXT',
+    text: 'order TSEL10 081234567899',
+    senderId: '628111222444',
+    actor: { id: 'testowner', role: 'OWNER' },
+  });
+  const waCancelConfirm = await runBotDemoInteraction({
+    platform: 'WHATSAPP',
+    senderRole: 'CUSTOMER',
+    inputType: 'TEXT',
+    text: 'batal',
+    senderId: '628111222444',
+    actor: { id: 'testowner', role: 'OWNER' },
+  });
+  assert.match(waCancelConfirm.replies[0].text, /dibatalkan sebelum QRIS dibuat/i);
 
   // Customer role must be denied !admin
   const waAdminDenied = await runBotDemoInteraction({
@@ -703,11 +737,24 @@ test('Bot Demo Simulator: simulates WhatsApp & Telegram replies, inline callback
   });
   assert.match(tgPickSku.replies[0].text, /kirimkan nomor tujuan/i);
 
-  const tgDest = await runBotDemoInteraction({
+  const tgConfirmPrompt = await runBotDemoInteraction({
     platform: 'TELEGRAM',
     senderRole: 'CUSTOMER',
     inputType: 'TEXT',
     text: '081234567890',
+    senderId: '555666',
+    actor: { id: 'testowner', role: 'OWNER' },
+  });
+  assert.match(tgConfirmPrompt.replies[0].text, /Konfirmasi Pesanan/i);
+  const tgConfirmBtns = (tgConfirmPrompt.replies[0].buttons || []).flat().map((b) => b.callbackData);
+  assert.ok(tgConfirmBtns.includes('CONFIRM_ORDER'));
+  assert.ok(tgConfirmBtns.includes('CANCEL_CONFIRM_ORDER'));
+
+  const tgDest = await runBotDemoInteraction({
+    platform: 'TELEGRAM',
+    senderRole: 'CUSTOMER',
+    inputType: 'CALLBACK',
+    callbackData: 'CONFIRM_ORDER',
     senderId: '555666',
     actor: { id: 'testowner', role: 'OWNER' },
   });
@@ -1160,6 +1207,204 @@ test('sendTelegramQrisInvoice recovers from Telegraf sendPhoto socket hang up vi
     assert.match(receivedRawBody, /Invoice QRIS #1/);
   } finally {
     await new Promise<void>((resolve) => mockTgServer.close(() => resolve()));
+  }
+});
+
+test('Gateway trx_id polling, ?format=raw QRIS download, original payment link in invoice, /batal & batal, and Vite allowedHosts', async () => {
+  const pngBytes = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+    'base64'
+  );
+  const pollQueries: URLSearchParams[] = [];
+  let qrisRequestFormatParam: string | null = null;
+  let gatewayShouldReturnPaid = false;
+
+  let qrisSeq = 0;
+  let lastCreatedTrxId = 'MZ-POLL-998877-1';
+  const mockServer = http.createServer((req, res) => {
+    const parsedUrl = new URL(req.url || '/', 'http://127.0.0.1');
+    if (parsedUrl.pathname === '/create-qris') {
+      qrisSeq++;
+      lastCreatedTrxId = `MZ-POLL-998877-${qrisSeq}`;
+      const port = (mockServer.address() as { port: number }).port;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          status: 'success',
+          data: {
+            trx_id: lastCreatedTrxId,
+            qris_url: `http://127.0.0.1:${port}/pay/${lastCreatedTrxId}`,
+            amount: Number(parsedUrl.searchParams.get('amount') || 11200),
+            status: 'PENDING',
+          },
+        })
+      );
+      return;
+    }
+
+    if (parsedUrl.pathname.startsWith('/pay/')) {
+      qrisRequestFormatParam = parsedUrl.searchParams.get('format');
+      if (qrisRequestFormatParam === 'raw') {
+        res.writeHead(200, { 'Content-Type': 'image/png' });
+        res.end(pngBytes);
+      } else {
+        // Without ?format=raw, MyZZStore serves an HTML checkout page
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end('<html><body>Pay QRIS Here</body></html>');
+      }
+      return;
+    }
+
+    if (parsedUrl.pathname === '/check-payment') {
+      pollQueries.push(parsedUrl.searchParams);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          status: 'success',
+          data: {
+            trx_id: parsedUrl.searchParams.get('trx_id') || parsedUrl.searchParams.get('order_id'),
+            status: gatewayShouldReturnPaid ? 'PAID' : 'PENDING',
+            paid_at: gatewayShouldReturnPaid ? '2026-11-15T12:00:00.000Z' : undefined,
+          },
+        })
+      );
+      return;
+    }
+
+    res.writeHead(404);
+    res.end();
+  });
+
+  await new Promise<void>((resolve) => mockServer.listen(0, '127.0.0.1', resolve));
+  const port = (mockServer.address() as { port: number }).port;
+
+  process.env.PAYMENT_GATEWAY_BASE_URL = `http://127.0.0.1:${port}`;
+  process.env.PAYMENT_GATEWAY_API_KEY = 'test-api-key';
+  process.env.PAYMENT_GATEWAY_SECRET = 'test-secret';
+  process.env.PAYMENT_GATEWAY_MERCHANT_ID = 'MERCHANT01';
+  process.env.PAYMENT_GATEWAY_CREATE_PATH = '/create-qris';
+  process.env.PAYMENT_GATEWAY_STATUS_PATH = '/check-payment';
+  refreshConfig(process.env);
+
+  try {
+    const gateway = new MyZZStoreGateway();
+
+    // 1. Verify appendRawFormatToQrisUrl and fetchQrisImageBuffer recover PNG even when base URL returns text/html
+    const { appendRawFormatToQrisUrl } = await import('../integrations/qris-image');
+    const samplePayUrl = `http://127.0.0.1:${port}/pay/MZ-POLL-SAMPLE`;
+    assert.equal(appendRawFormatToQrisUrl(samplePayUrl), `${samplePayUrl}?format=raw`);
+    const downloadedPng = await fetchQrisImageBuffer(samplePayUrl);
+    assert.equal(qrisRequestFormatParam, 'raw');
+    assert.equal(downloadedPng.equals(pngBytes), true);
+
+    // 2. Verify createOrder stores gateway trx_id & qris_url, and pollPendingPayments sends Gateway ID (NEVER internal TRX-...)
+    const orderRes = await createOrder(
+      {
+        platform: 'TELEGRAM',
+        platformUserId: '88776655',
+        productSkuOrId: 'TSEL10',
+        destination: '081233445566',
+      },
+      gateway
+    );
+    assert.equal(orderRes.ok, true);
+    assert.equal(orderRes.transaction?.gateway_reference, 'MZ-POLL-998877-1');
+    assert.equal(orderRes.qris?.qrUrl, `http://127.0.0.1:${port}/pay/MZ-POLL-998877-1`);
+
+    const { pollPendingPayments } = await import('./payment.reconciliation.service');
+    await pollPendingPayments(gateway);
+    assert.ok(pollQueries.length >= 1);
+    const lastQuery = pollQueries[pollQueries.length - 1];
+    assert.equal(lastQuery.get('trx_id'), 'MZ-POLL-998877-1');
+    assert.equal(lastQuery.get('order_id'), 'MZ-POLL-998877-1');
+    assert.notEqual(lastQuery.get('order_id'), orderRes.transaction!.transaction_id);
+
+    // Clear cooldown/cancel the order via /batal on Telegram after 30s backdate
+    const db = getDb();
+    db.prepare('UPDATE transactions SET created_at = ? WHERE transaction_id = ?').run(
+      new Date(Date.now() - 40_000).toISOString(),
+      orderRes.transaction!.transaction_id
+    );
+
+    const { dispatchTelegramCommand } = await import('../bots/telegram.command-handler');
+    const tgReplies: string[] = [];
+    await dispatchTelegramCommand(
+      {
+        async reply(text) {
+          tgReplies.push(text);
+        },
+      },
+      { userId: '88776655', username: 'Canceller', text: '/batal' }
+    );
+    assert.match(tgReplies[0], /DIBATALKAN/);
+
+    // Verify WhatsApp batal on customer with NO pending order returns explicit feedback (not silent main menu)
+    const { handleWhatsappCommand } = await import('../bots/whatsapp.command-handler');
+    const waReplies: Array<{ text?: string }> = [];
+    await handleWhatsappCommand(
+      {
+        async sendMessage(_jid, content) {
+          waReplies.push({ text: 'text' in content ? content.text : content.caption });
+          return undefined;
+        },
+      },
+      '628999000111',
+      'batal',
+      'NoPending'
+    );
+    assert.match(waReplies[0].text || '', /belum ada pesanan aktif yang dapat dibatalkan|tidak ada pesanan/i);
+
+    // 3. Verify invoice caption contains original payment link WITHOUT ?format=raw on WhatsApp & Telegram
+    const origDefaultCreate = MyZZStoreGateway.prototype.createPayment;
+    assert.ok(typeof origDefaultCreate === 'function');
+    // Test via executeWhatsappOrder confirmation flow on live-like order using default gateway pointed at mockServer
+    const waOrderReplies: Array<{ text?: string; image?: unknown }> = [];
+    await handleWhatsappCommand(
+      {
+        async sendMessage(_jid, content) {
+          waOrderReplies.push({
+            text: 'text' in content ? content.text : content.caption,
+            image: 'image' in content ? content.image : undefined,
+          });
+          return undefined;
+        },
+      },
+      '628999000222',
+      'order TSEL10 081288889999',
+      'BuyerWA'
+    );
+    assert.match(waOrderReplies[0].text || '', /Konfirmasi Pesanan/);
+    await handleWhatsappCommand(
+      {
+        async sendMessage(_jid, content) {
+          waOrderReplies.push({
+            text: 'text' in content ? content.text : content.caption,
+            image: 'image' in content ? content.image : undefined,
+          });
+          return undefined;
+        },
+      },
+      '628999000222',
+      'ya',
+      'BuyerWA'
+    );
+    const invoiceReply = waOrderReplies[1];
+    assert.ok(Buffer.isBuffer(invoiceReply.image));
+    assert.ok((invoiceReply.text || '').includes(`Link Pembayaran: http://127.0.0.1:${port}/pay/${lastCreatedTrxId}`));
+    assert.equal((invoiceReply.text || '').includes('?format=raw'), false);
+
+    // Verify polling marks it PAID when gateway returns PAID
+    gatewayShouldReturnPaid = true;
+    const paidPoll = await pollPendingPayments(gateway);
+    assert.ok(paidPoll.paid >= 1);
+
+    // 4. Verify vite.config.ts includes required allowedHosts for HTTPS reverse proxy
+    const viteConfigRaw = fs.readFileSync(path.resolve(process.cwd(), 'vite.config.ts'), 'utf8');
+    assert.ok(viteConfigRaw.includes("'dashboard.myzzstore.my.id'"));
+    assert.ok(viteConfigRaw.includes("'localhost'"));
+    assert.ok(viteConfigRaw.includes("'127.0.0.1'"));
+  } finally {
+    await new Promise<void>((resolve) => mockServer.close(() => resolve()));
   }
 });
 

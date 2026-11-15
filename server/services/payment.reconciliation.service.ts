@@ -1,7 +1,13 @@
 import { getDb } from '../database/connection';
 import { logger } from '../logging/logger';
 import { defaultPaymentGateway, type PaymentGatewayPort } from '../integrations/myzzstore.gateway';
-import { handleVerifiedPaymentPaid, transitionTransactionStatus, type TransactionRow } from './transaction.service';
+import {
+  handleVerifiedPaymentPaid,
+  persistGatewayReferenceIfMissing,
+  resolveGatewayReference,
+  transitionTransactionStatus,
+  type TransactionRow,
+} from './transaction.service';
 import { finalizeExpiredInvoice } from './payment.service';
 
 export async function pollPendingPayments(
@@ -35,11 +41,16 @@ export async function pollPendingPayments(
       continue;
     }
 
-    if (!tx.gateway_reference) continue;
+    const gatewayRef = resolveGatewayReference(tx);
+    if (!gatewayRef) continue;
+    persistGatewayReferenceIfMissing(tx.transaction_id, gatewayRef);
 
-    const check = await gateway.checkPaymentStatus(tx.gateway_reference, tx.transaction_id);
+    const check = await gateway.checkPaymentStatus(gatewayRef, tx.transaction_id);
+    const effectiveGatewayRef = check.gatewayReference?.trim() || gatewayRef;
+    persistGatewayReferenceIfMissing(tx.transaction_id, effectiveGatewayRef);
+
     if (check.mappedStatus === 'PAID') {
-      handleVerifiedPaymentPaid(tx.transaction_id, 'PAYMENT_POLLER', check.paidAt, tx.gateway_reference);
+      handleVerifiedPaymentPaid(tx.transaction_id, 'PAYMENT_POLLER', check.paidAt, effectiveGatewayRef);
       paid++;
     } else if (check.mappedStatus === 'EXPIRED') {
       await finalizeExpiredInvoice(tx, 'PAYMENT_POLLER', gateway);
@@ -86,10 +97,14 @@ export async function reconcileUnknownAndMissedCallbacks(
 
   let recoveredPaid = 0;
   for (const tx of candidates) {
-    if (!tx.gateway_reference) continue;
-    const check = await gateway.checkPaymentStatus(tx.gateway_reference, tx.transaction_id);
+    const gatewayRef = resolveGatewayReference(tx);
+    if (!gatewayRef) continue;
+    persistGatewayReferenceIfMissing(tx.transaction_id, gatewayRef);
+    const check = await gateway.checkPaymentStatus(gatewayRef, tx.transaction_id);
+    const effectiveGatewayRef = check.gatewayReference?.trim() || gatewayRef;
+    persistGatewayReferenceIfMissing(tx.transaction_id, effectiveGatewayRef);
     if (check.mappedStatus === 'PAID') {
-      handleVerifiedPaymentPaid(tx.transaction_id, 'PAYMENT_RECONCILIATION', check.paidAt, tx.gateway_reference);
+      handleVerifiedPaymentPaid(tx.transaction_id, 'PAYMENT_RECONCILIATION', check.paidAt, effectiveGatewayRef);
       recoveredPaid++;
     } else if (check.mappedStatus === 'PENDING' && tx.transaction_status === 'UNKNOWN') {
       transitionTransactionStatus(
