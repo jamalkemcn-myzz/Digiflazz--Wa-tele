@@ -1,0 +1,6 @@
+{
+  "name": "PPOB Bot Ecosystem",
+  "description": "Integrated PPOB operations console for WhatsApp & Telegram bots, MyZZStore QRIS payments, Digiflazz fulfillment, and SQLite ledger management.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
