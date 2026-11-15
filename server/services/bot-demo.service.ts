@@ -128,7 +128,13 @@ export async function runBotDemoInteraction(input: BotDemoInput): Promise<BotDem
       if (qris?.qrString) {
         imageDataUrl = await QRCode.toDataURL(qris.qrString, { width: 320, margin: 2 });
       } else if (qris?.qrUrl) {
-        imageDataUrl = qris.qrUrl;
+        try {
+          const { fetchQrisImageBuffer } = await import('../integrations/qris-image');
+          const buf = await fetchQrisImageBuffer(qris.qrUrl);
+          imageDataUrl = `data:image/png;base64,${buf.toString('base64')}`;
+        } catch {
+          imageDataUrl = qris.qrUrl;
+        }
       }
       replies.push({
         text: caption,

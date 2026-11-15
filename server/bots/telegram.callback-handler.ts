@@ -21,6 +21,7 @@ import {
   sendTelegramCategoryList,
   sendTelegramProductPage,
   promptTelegramProductDestination,
+  handleTelegramOrderCancellation,
   toMarkupKeyboard,
   clearTrackedTelegramMessages,
   TG_ADMIN_MENU_BUTTONS,
@@ -82,6 +83,24 @@ export async function dispatchTelegramCallback(
     return;
   }
 
+  if (data.startsWith('BUY_ID_')) {
+    const prodId = data.replace('BUY_ID_', '').trim();
+    if (transport.answerCbQuery) await transport.answerCbQuery();
+    await promptTelegramProductDestination(transport, input.userId || 'guest', prodId, dryRun);
+    return;
+  }
+
+  if (data.startsWith('CANCEL_TX_') && input.userId) {
+    const txId = data.replace('CANCEL_TX_', '').trim();
+    if (transport.answerCbQuery) await transport.answerCbQuery();
+    await handleTelegramOrderCancellation(transport, {
+      userId: input.userId,
+      transactionId: txId,
+      dryRun,
+    });
+    return;
+  }
+
   if (data === 'MY_LATEST_STATUS' && input.userId) {
     const resolved = dryRun
       ? findCustomerByPlatform({ platform: 'TELEGRAM', platformUserId: input.userId })
@@ -96,17 +115,21 @@ export async function dispatchTelegramCallback(
       return;
     }
     const latest = recent[0];
+    const canCancel = ['CREATED', 'PENDING_PAYMENT', 'PAYMENT_PROCESSING'].includes(latest.transaction_status);
+    const buttons: TelegramInlineButton[][] = [];
+    if (canCancel) {
+      buttons.push([{ text: 'Batalkan Pesanan', callbackData: `CANCEL_TX_${latest.transaction_id}` }]);
+    }
+    buttons.push([
+      { text: 'Riwayat Lengkap', callbackData: 'MY_HISTORY' },
+      { text: 'Menu Utama', callbackData: 'MAIN_MENU' },
+    ]);
     await transport.reply(
       `Transaksi Terakhir (${latest.transaction_id})\n` +
         `Produk: ${latest.product_name_snapshot}\n` +
         `Nominal: Rp${latest.payment_amount.toLocaleString('id-ID')}\n` +
         `Status: ${latest.transaction_status}`,
-      [
-        [
-          { text: 'Riwayat Lengkap', callbackData: 'MY_HISTORY' },
-          { text: 'Menu Utama', callbackData: 'MAIN_MENU' },
-        ],
-      ]
+      buttons
     );
     return;
   }
@@ -188,11 +211,18 @@ export async function dispatchTelegramCallback(
       return;
     }
     const t = detail.transaction;
+    const canCancel = ['CREATED', 'PENDING_PAYMENT', 'PAYMENT_PROCESSING'].includes(t.transaction_status);
+    const buttons: TelegramInlineButton[][] = canCancel
+      ? [
+          [{ text: 'Batalkan Pesanan', callbackData: `CANCEL_TX_${t.transaction_id}` }],
+          ...TG_NAV_BACK_BUTTONS,
+        ]
+      : TG_NAV_BACK_BUTTONS;
     await transport.reply(
       `Status ${t.transaction_id}: ${t.transaction_status}\n` +
         `Pembayaran: ${t.payment_status} | Supplier: ${t.supplier_status}` +
         (t.supplier_sn ? `\nSN / Token: ${t.supplier_sn}` : ''),
-      TG_NAV_BACK_BUTTONS
+      buttons
     );
     return;
   }

@@ -28,7 +28,7 @@ export function registerQrMessageDeleter(
   }
 }
 
-async function deleteQrMessagesForTransaction(tx: TransactionRow): Promise<void> {
+export async function deleteQrMessagesForTransaction(tx: TransactionRow): Promise<void> {
   if (!tx.qr_message_ref_json) return;
   try {
     const refs = JSON.parse(tx.qr_message_ref_json) as Array<{

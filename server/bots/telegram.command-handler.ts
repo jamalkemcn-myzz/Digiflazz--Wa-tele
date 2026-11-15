@@ -14,6 +14,7 @@ import {
 import {
   createOrder,
   previewOrderDryRun,
+  cancelCustomerTransaction,
   getCustomerTransactions,
   getTransactionDetail,
   saveQrMessageReference,
@@ -146,6 +147,15 @@ function friendlyName(username?: string | null): string {
   return clean ? `Halo Kak ${clean}` : 'Halo Kak';
 }
 
+function formatProductButtonLabel(name: string, sellingPrice: number): string {
+  const priceText = `Rp${sellingPrice.toLocaleString('id-ID')}`;
+  const maxNameLen = 38;
+  const cleanName = name.trim();
+  const shortName =
+    cleanName.length > maxNameLen ? `${cleanName.slice(0, maxNameLen - 1).trimEnd()}…` : cleanName;
+  return `${shortName} · ${priceText}`;
+}
+
 export async function sendTelegramMainMenu(
   transport: TelegramReplyTransport,
   userId: string,
@@ -210,18 +220,19 @@ export async function sendTelegramProductPage(
   }
 
   const lines = res.items.map(
-    (p, idx) => `${idx + 1}. ${p.name} (${p.sku}) — Rp${p.selling_price.toLocaleString('id-ID')}`
+    (p, idx) => `${idx + 1}. ${p.name} — Rp${p.selling_price.toLocaleString('id-ID')}`
   );
 
-  const buttons: TelegramInlineButton[][] = [];
-  for (let i = 0; i < res.items.length; i += 2) {
-    buttons.push(
-      res.items.slice(i, i + 2).map((p) => ({
-        text: `${p.sku} · Rp${p.selling_price.toLocaleString('id-ID')}`,
-        callbackData: `BUY_SKU_${p.sku}`,
-      }))
-    );
-  }
+  const buttons: TelegramInlineButton[][] = res.items.map((p) => {
+    const skuCallback = `BUY_SKU_${p.sku}`;
+    const callbackData = Buffer.byteLength(skuCallback, 'utf8') <= 64 ? skuCallback : `BUY_ID_${p.id}`;
+    return [
+      {
+        text: formatProductButtonLabel(p.name, p.selling_price),
+        callbackData,
+      },
+    ];
+  });
 
   const navRow: TelegramInlineButton[] = [];
   if (params.page > 1) {
@@ -249,7 +260,7 @@ export async function sendTelegramProductPage(
 
   await transport.reply(
     `Daftar Produk (Hal ${params.page}/${res.pagination.totalPages}):\n${lines.join('\n')}\n\n` +
-      `Tap tombol produk di bawah untuk langsung memesan tanpa mengetik SKU manual!`,
+      `Tap tombol produk di bawah untuk langsung memesan ya Kak!`,
     buttons
   );
 }
@@ -284,7 +295,7 @@ export async function promptTelegramProductDestination(
 
   await transport.reply(
     `Siap Kak! Anda memilih:\n` +
-      `${product.name} (${product.sku})\n` +
+      `${product.name}\n` +
       `Harga: Rp${product.selling_price.toLocaleString('id-ID')}\n\n` +
       `Silakan kirimkan nomor tujuan / ID pelanggan Anda sekarang (contoh: 081234567890, atau tambahkan kode kupon setelah spasi).`,
     [
@@ -333,8 +344,9 @@ export async function executeTelegramOrder(
         [
           [
             { text: 'Cek Status Invoice', callbackData: `STATUS_${a.transaction_id}` },
-            { text: 'Menu Utama', callbackData: 'MAIN_MENU' },
+            { text: 'Batalkan Pesanan', callbackData: `CANCEL_TX_${a.transaction_id}` },
           ],
+          [{ text: 'Menu Utama', callbackData: 'MAIN_MENU' }],
         ]
       );
       return;
@@ -357,14 +369,16 @@ export async function executeTelegramOrder(
     `Kode Unik: ${tx.unique_code}\n` +
     `Total Bayar: Rp${tx.payment_amount.toLocaleString('id-ID')}\n` +
     `Kedaluwarsa: ${new Date(tx.expired_at!).toLocaleTimeString('id-ID')} (${config.transaction.invoiceExpiryMinutes} menit)\n\n` +
-    `Scan QRIS dengan nominal TEPAT Rp${tx.payment_amount.toLocaleString('id-ID')} ya Kak.` +
+    `Scan QRIS dengan nominal TEPAT Rp${tx.payment_amount.toLocaleString('id-ID')} ya Kak.\n` +
+    `(Pembatalan tersedia minimal 30 detik setelah pesanan dibuat)` +
     (params.dryRun ? `\n\n[Mode Demo: pratinjau invoice & QRIS, transaksi tidak disimpan ke database]` : '');
 
   const qrisButtons: TelegramInlineButton[][] = [
     [
       { text: 'Cek Status Pembayaran', callbackData: `STATUS_${tx.transaction_id}` },
-      { text: 'Menu Utama', callbackData: 'MAIN_MENU' },
+      { text: 'Batalkan Pesanan', callbackData: `CANCEL_TX_${tx.transaction_id}` },
     ],
+    [{ text: 'Menu Utama', callbackData: 'MAIN_MENU' }],
   ];
 
   if (transport.sendQris) {
@@ -379,6 +393,47 @@ export async function executeTelegramOrder(
   } else {
     await transport.reply(caption, qrisButtons);
   }
+}
+
+export async function handleTelegramOrderCancellation(
+  transport: TelegramReplyTransport,
+  params: { userId: string; transactionId?: string; dryRun?: boolean }
+): Promise<void> {
+  if (params.dryRun) {
+    await transport.reply(
+      params.transactionId?.startsWith('TRX-DEMO-')
+        ? `Pembatalan pesanan minimal dilakukan 30 detik setelah pesanan dibuat. (Mode Demo: transaksi ${params.transactionId} tidak tersimpan di database)`
+        : '[Mode Demo] Simulasi pembatalan pesanan (minimal 30 detik setelah pesanan dibuat).',
+      TG_NAV_BACK_BUTTONS
+    );
+    return;
+  }
+
+  const res = await cancelCustomerTransaction({
+    platform: 'TELEGRAM',
+    platformUserId: params.userId,
+    transactionId: params.transactionId,
+  });
+
+  if (!res.ok) {
+    const buttons: TelegramInlineButton[][] = res.transaction
+      ? [
+          [
+            { text: 'Cek Status Pembayaran', callbackData: `STATUS_${res.transaction.transaction_id}` },
+            { text: 'Coba Batalkan Lagi', callbackData: `CANCEL_TX_${res.transaction.transaction_id}` },
+          ],
+          [{ text: 'Menu Utama', callbackData: 'MAIN_MENU' }],
+        ]
+      : TG_NAV_BACK_BUTTONS;
+    await transport.reply(res.errorMessage || 'Maaf Kak, pesanan belum dapat dibatalkan.', buttons);
+    return;
+  }
+
+  await transport.reply(
+    `Pesanan ${res.transaction!.transaction_id} (${res.transaction!.product_name_snapshot}) telah DIBATALKAN.\n` +
+      `Harap tunggu ${config.transaction.cooldownSeconds} detik sebelum membuat pesanan baru ya Kak.`,
+    TG_NAV_BACK_BUTTONS
+  );
 }
 
 export async function dispatchTelegramCommand(
@@ -397,12 +452,20 @@ export async function dispatchTelegramCommand(
   const args = parts.slice(1);
 
   if (!isSlash) {
+    const session = getBotSession('TELEGRAM', input.userId, dryRun);
     if (cmd === 'batal' || cmd === 'cancel') {
-      await sendTelegramMainMenu(transport, input.userId, input.username, dryRun);
+      if (session?.mode === 'AWAITING_DESTINATION' && !args[0]) {
+        await sendTelegramMainMenu(transport, input.userId, input.username, dryRun);
+        return;
+      }
+      await handleTelegramOrderCancellation(transport, {
+        userId: input.userId,
+        transactionId: args[0]?.trim(),
+        dryRun,
+      });
       return;
     }
 
-    const session = getBotSession('TELEGRAM', input.userId, dryRun);
     if (session?.mode === 'AWAITING_DESTINATION') {
       const [dest, coupon] = parts;
       await executeTelegramOrder(transport, {
@@ -430,6 +493,15 @@ export async function dispatchTelegramCommand(
     return;
   }
 
+  if (cmd === 'batal' || cmd === 'cancel') {
+    await handleTelegramOrderCancellation(transport, {
+      userId: input.userId,
+      transactionId: args[0]?.trim(),
+      dryRun,
+    });
+    return;
+  }
+
   if (cmd === 'start' || cmd === 'menu' || cmd === 'bantuan' || cmd === 'help') {
     if (cmd === 'bantuan' || cmd === 'help') {
       clearBotSession('TELEGRAM', input.userId, dryRun);
@@ -437,7 +509,8 @@ export async function dispatchTelegramCommand(
         `Panduan Belanja Praktis:\n` +
           `1. Tekan tombol Daftar Produk atau Kategori Produk.\n` +
           `2. Pilih produk yang diinginkan, lalu kirim nomor tujuan.\n` +
-          `3. Bayar QRIS sesuai nominal tepat sebelum batas waktu.\n\n` +
+          `3. Bayar QRIS sesuai nominal tepat sebelum batas waktu.\n` +
+          `4. Pesanan yang belum dibayar dapat dibatalkan setelah minimal 30 detik.\n\n` +
           `Atau ketik langsung: /order <SKU> <TUJUAN> [KUPON] bila sudah hafal SKU.`,
         TG_MAIN_MENU_BUTTONS
       );
@@ -835,6 +908,8 @@ export function registerTelegramCommands(bot: Telegraf): void {
       'kategori',
       'produk',
       'order',
+      'batal',
+      'cancel',
       'status',
       'riwayat',
       'hubungkan',

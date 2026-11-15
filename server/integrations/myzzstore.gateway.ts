@@ -94,6 +94,7 @@ export class MyZZStoreGateway implements PaymentGatewayPort {
     paidAmount?: number;
     paidAt?: string;
     rawStatus?: string;
+    expiresAt?: string;
   } {
     if (!raw || typeof raw !== 'object') {
       return { status: 'UNKNOWN' };
@@ -102,12 +103,16 @@ export class MyZZStoreGateway implements PaymentGatewayPort {
     const data = (obj.data && typeof obj.data === 'object' ? obj.data : obj) as Record<string, unknown>;
 
     const rawStatusStr = String(
-      data.status ?? data.payment_status ?? data.transaction_status ?? ''
+      data.status ?? data.payment_status ?? data.transaction_status ?? (typeof obj.status === 'string' ? obj.status : '')
     ).trim();
     const upper = rawStatusStr.toUpperCase();
 
     let status: GatewayPaymentState = 'UNKNOWN';
-    if (['PAID', 'SUCCESS', 'SETTLED', 'COMPLETED', 'BERHASIL'].includes(upper)) {
+    if (
+      data.paid === true ||
+      data.is_paid === true ||
+      ['PAID', 'SUCCESS', 'SETTLED', 'COMPLETED', 'BERHASIL', 'LUNAS'].includes(upper)
+    ) {
       status = 'PAID';
     } else if (['PENDING', 'UNPAID', 'WAITING', 'OPEN', 'CREATED'].includes(upper)) {
       status = 'PENDING';
@@ -119,14 +124,20 @@ export class MyZZStoreGateway implements PaymentGatewayPort {
       status = 'FAILED';
     }
 
+    const pickStringOrNumberId = (val: unknown): string | undefined => {
+      if (typeof val === 'string' && val.trim() !== '') return val.trim();
+      if (typeof val === 'number' && Number.isFinite(val)) return String(val);
+      return undefined;
+    };
+
     const gatewayReference =
-      typeof data.reference === 'string'
-        ? data.reference
-        : typeof data.ref_id === 'string'
-        ? data.ref_id
-        : typeof data.invoice_id === 'string'
-        ? data.invoice_id
-        : undefined;
+      pickStringOrNumberId(data.trx_id) ??
+      pickStringOrNumberId(data.trxId) ??
+      pickStringOrNumberId(data.reference) ??
+      pickStringOrNumberId(data.ref_id) ??
+      pickStringOrNumberId(data.invoice_id) ??
+      pickStringOrNumberId(data.transaction_id) ??
+      pickStringOrNumberId(data.id);
 
     const qrString =
       typeof data.qr_string === 'string'
@@ -135,23 +146,31 @@ export class MyZZStoreGateway implements PaymentGatewayPort {
         ? data.qris_content
         : typeof data.qr_code === 'string'
         ? data.qr_code
+        : typeof data.qris_string === 'string'
+        ? data.qris_string
         : undefined;
 
     const qrUrl =
-      typeof data.qr_url === 'string'
-        ? data.qr_url
-        : typeof data.qris_url === 'string'
-        ? data.qris_url
+      typeof data.qris_url === 'string' && data.qris_url.trim()
+        ? data.qris_url.trim()
+        : typeof data.qr_url === 'string' && data.qr_url.trim()
+        ? data.qr_url.trim()
+        : typeof data.qrisUrl === 'string' && data.qrisUrl.trim()
+        ? data.qrisUrl.trim()
+        : typeof data.qr_image === 'string' && data.qr_image.trim()
+        ? data.qr_image.trim()
         : undefined;
 
+    const paidAmountRaw = data.amount ?? data.total_amount ?? data.nominal;
     const paidAmount =
-      typeof data.amount === 'number'
-        ? data.amount
-        : typeof data.total_amount === 'number'
-        ? data.total_amount
+      typeof paidAmountRaw === 'number' && Number.isFinite(paidAmountRaw)
+        ? paidAmountRaw
+        : typeof paidAmountRaw === 'string' && paidAmountRaw.trim() !== '' && Number.isFinite(Number(paidAmountRaw))
+        ? Number(paidAmountRaw)
         : undefined;
 
     const paidAt = typeof data.paid_at === 'string' ? data.paid_at : undefined;
+    const expiresAt = typeof data.expired_at === 'string' ? data.expired_at : undefined;
 
     return {
       status,
@@ -161,6 +180,7 @@ export class MyZZStoreGateway implements PaymentGatewayPort {
       paidAmount,
       paidAt,
       rawStatus: rawStatusStr || undefined,
+      expiresAt,
     };
   }
 
@@ -175,7 +195,19 @@ export class MyZZStoreGateway implements PaymentGatewayPort {
       };
     }
 
-    const url = `${config.paymentGateway.baseUrl}${config.paymentGateway.createPath.startsWith('/') ? '' : '/'}${config.paymentGateway.createPath}`;
+    const createPath = config.paymentGateway.createPath || '/create-qris';
+    const urlObj = new URL(
+      `${config.paymentGateway.baseUrl}${createPath.startsWith('/') ? '' : '/'}${createPath}`
+    );
+    urlObj.searchParams.set('merchant_id', config.paymentGateway.merchantId);
+    urlObj.searchParams.set('order_id', input.transactionId);
+    urlObj.searchParams.set('amount', String(input.amount));
+    urlObj.searchParams.set('payment_method', 'QRIS');
+    urlObj.searchParams.set('description', input.productName);
+    urlObj.searchParams.set('customer_code', input.customerCode);
+    urlObj.searchParams.set('expired_at', input.expiredAt);
+    urlObj.searchParams.set('callback_url', input.callbackUrl);
+
     const timestamp = Math.floor(Date.now() / 1000).toString();
     const signature = crypto
       .createHmac('sha256', config.paymentGateway.secret)
@@ -183,25 +215,15 @@ export class MyZZStoreGateway implements PaymentGatewayPort {
       .digest('hex');
 
     try {
-      const response = await fetch(url, {
-        method: 'POST',
+      const response = await fetch(urlObj.toString(), {
+        method: 'GET',
         headers: {
-          'Content-Type': 'application/json',
+          Accept: 'application/json',
           'X-Api-Key': config.paymentGateway.apiKey,
           'X-Merchant-Id': config.paymentGateway.merchantId,
           'X-Timestamp': timestamp,
           'X-Signature': signature,
         },
-        body: JSON.stringify({
-          merchant_id: config.paymentGateway.merchantId,
-          order_id: input.transactionId,
-          amount: input.amount,
-          payment_method: 'QRIS',
-          description: input.productName,
-          customer_code: input.customerCode,
-          expired_at: input.expiredAt,
-          callback_url: input.callbackUrl,
-        }),
         signal: AbortSignal.timeout(config.paymentGateway.timeoutMs),
       });
 
@@ -226,7 +248,7 @@ export class MyZZStoreGateway implements PaymentGatewayPort {
           ok: false,
           mappedStatus: 'UNKNOWN',
           errorCode: 'INVALID_RESPONSE',
-          errorMessage: 'Respons gateway tidak menyertakan reference atau QRIS resmi',
+          errorMessage: 'Respons gateway tidak menyertakan trx_id atau qris_url resmi',
         };
       }
 
@@ -237,7 +259,7 @@ export class MyZZStoreGateway implements PaymentGatewayPort {
         qrUrl: parsed.qrUrl,
         rawStatus: parsed.rawStatus,
         mappedStatus: parsed.status === 'UNKNOWN' ? 'PENDING' : parsed.status,
-        expiresAt: input.expiredAt,
+        expiresAt: parsed.expiresAt || input.expiredAt,
         safeMetadata: {
           gatewayReference: parsed.gatewayReference,
           rawStatus: parsed.rawStatus,
@@ -269,15 +291,29 @@ export class MyZZStoreGateway implements PaymentGatewayPort {
       };
     }
 
-    const rawPath = config.paymentGateway.statusPath
+    const statusPath = config.paymentGateway.statusPath || '/check-payment';
+    const hasPathPlaceholder =
+      statusPath.includes(':trx_id') ||
+      statusPath.includes(':reference') ||
+      statusPath.includes(':order_id');
+    const rawPath = statusPath
+      .replace(':trx_id', encodeURIComponent(gatewayReference))
       .replace(':reference', encodeURIComponent(gatewayReference))
       .replace(':order_id', encodeURIComponent(transactionId));
-    const url = `${config.paymentGateway.baseUrl}${rawPath.startsWith('/') ? '' : '/'}${rawPath}`;
+    const urlObj = new URL(`${config.paymentGateway.baseUrl}${rawPath.startsWith('/') ? '' : '/'}${rawPath}`);
+    if (!hasPathPlaceholder) {
+      if (gatewayReference) {
+        urlObj.searchParams.set('trx_id', gatewayReference);
+      } else if (transactionId) {
+        urlObj.searchParams.set('order_id', transactionId);
+      }
+    }
 
     try {
-      const response = await fetch(url, {
+      const response = await fetch(urlObj.toString(), {
         method: 'GET',
         headers: {
+          Accept: 'application/json',
           'X-Api-Key': config.paymentGateway.apiKey,
           'X-Merchant-Id': config.paymentGateway.merchantId,
         },
@@ -413,20 +449,24 @@ export class MyZZStoreGateway implements PaymentGatewayPort {
       };
     }
 
-    const url = `${config.paymentGateway.baseUrl}${config.paymentGateway.cancelPath.startsWith('/') ? '' : '/'}${config.paymentGateway.cancelPath}`;
+    const cancelUrlObj = new URL(
+      `${config.paymentGateway.baseUrl}${config.paymentGateway.cancelPath.startsWith('/') ? '' : '/'}${config.paymentGateway.cancelPath}`
+    );
+    cancelUrlObj.searchParams.set('merchant_id', config.paymentGateway.merchantId);
+    if (gatewayReference) {
+      cancelUrlObj.searchParams.set('trx_id', gatewayReference);
+    }
+    if (transactionId) {
+      cancelUrlObj.searchParams.set('order_id', transactionId);
+    }
     try {
-      const response = await fetch(url, {
-        method: 'POST',
+      const response = await fetch(cancelUrlObj.toString(), {
+        method: 'GET',
         headers: {
-          'Content-Type': 'application/json',
+          Accept: 'application/json',
           'X-Api-Key': config.paymentGateway.apiKey,
           'X-Merchant-Id': config.paymentGateway.merchantId,
         },
-        body: JSON.stringify({
-          merchant_id: config.paymentGateway.merchantId,
-          reference: gatewayReference,
-          order_id: transactionId,
-        }),
         signal: AbortSignal.timeout(config.paymentGateway.timeoutMs),
       });
 

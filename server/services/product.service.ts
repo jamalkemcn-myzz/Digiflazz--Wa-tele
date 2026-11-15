@@ -316,7 +316,7 @@ export function upsertProduct(
       txDb
         .prepare(
           `UPDATE products
-           SET name = ?, category_id = ?, brand = ?, type = ?, supplier_price = ?, selling_price = ?, margin_type = ?, margin_value = ?, max_margin = ?, status = ?, updated_at = ?
+           SET name = ?, category_id = ?, brand = ?, type = ?, supplier_price = ?, selling_price = ?, margin_type = ?, margin_value = ?, max_margin = ?, status = ?, is_available = 1, updated_at = ?
            WHERE id = ?`
         )
         .run(
@@ -384,7 +384,11 @@ export function updateProductStatus(
   const updated = withTransaction((txDb) => {
     const existing = txDb.prepare('SELECT * FROM products WHERE id = ?').get(id) as ProductRow | undefined;
     if (!existing) throw new Error('Produk tidak ditemukan');
-    txDb.prepare('UPDATE products SET status = ?, updated_at = ? WHERE id = ?').run(status, now, id);
+    if (status === 'ACTIVE') {
+      txDb.prepare('UPDATE products SET status = ?, is_available = 1, updated_at = ? WHERE id = ?').run(status, now, id);
+    } else {
+      txDb.prepare('UPDATE products SET status = ?, updated_at = ? WHERE id = ?').run(status, now, id);
+    }
     return txDb.prepare('SELECT * FROM products WHERE id = ?').get(id) as ProductRow;
   });
 
@@ -398,4 +402,38 @@ export function updateProductStatus(
   });
 
   return updated;
+}
+
+export function deleteProductSafely(
+  id: number,
+  actor: { id: string; role: string }
+): { deleted: boolean; sku: string; message: string } {
+  const db = getDb();
+  const existing = db.prepare('SELECT * FROM products WHERE id = ?').get(id) as ProductRow | undefined;
+  if (!existing) throw new Error('Produk tidak ditemukan');
+
+  const txCount = (
+    db.prepare('SELECT COUNT(*) as cnt FROM transactions WHERE product_id = ?').get(id) as { cnt: number }
+  ).cnt;
+
+  if (txCount > 0) {
+    throw new Error(
+      `Produk ${existing.sku} memiliki ${txCount} transaksi terkait dan tidak dapat dihapus permanen. Gunakan tombol Nonaktifkan.`
+    );
+  }
+
+  withTransaction((txDb) => {
+    txDb.prepare('DELETE FROM products WHERE id = ?').run(id);
+  });
+
+  recordAuditLog({
+    actorId: actor.id,
+    actorRole: actor.role,
+    action: 'PRODUCT_DELETED',
+    targetType: 'PRODUCT',
+    targetId: existing.sku,
+    details: { name: existing.name },
+  });
+
+  return { deleted: true, sku: existing.sku, message: `Produk ${existing.name} (${existing.sku}) berhasil dihapus.` };
 }

@@ -109,6 +109,10 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify({ status }),
     }),
+  deleteProduct: (id: number) =>
+    requestJson<{ ok: true; data: { id: number; sku: string; name: string } }>(`/api/admin/products/${id}`, {
+      method: 'DELETE',
+    }),
   syncDigiflazz: () =>
     requestJson<{ ok: true; data: any }>('/api/admin/products/sync-digiflazz', {
       method: 'POST',
@@ -174,6 +178,13 @@ export const api = {
 
   getRefunds: (page = 1) => requestJson<{ ok: true; data: any }>(`/api/admin/refunds?page=${page}`),
   getCustomers: () => requestJson<{ ok: true; data: any[] }>('/api/admin/customers'),
+  getUsers: (params: Record<string, string | number | undefined>) => {
+    const qs = new URLSearchParams();
+    for (const [k, v] of Object.entries(params)) {
+      if (v !== undefined && v !== '') qs.set(k, String(v));
+    }
+    return requestJson<{ ok: true; data: any }>(`/api/admin/users?${qs.toString()}`);
+  },
   adjustRefundLedger: (payload: Record<string, unknown>) =>
     requestJson<{ ok: true; data: any }>('/api/admin/refunds/adjust', {
       method: 'POST',

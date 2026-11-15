@@ -364,3 +364,90 @@ export function getCustomerRefundCreditTotal(customerId: number): number {
     .get(customerId) as { balance: number };
   return row.balance;
 }
+
+export function listCustomersDetailed(params: { page?: number; limit?: number; search?: string }) {
+  const db = getDb();
+  const page = Math.max(1, params.page ?? 1);
+  const limit = Math.min(100, Math.max(1, params.limit ?? 25));
+  const offset = (page - 1) * limit;
+  const search = (params.search || '').trim();
+
+  const where: string[] = [];
+  const args: unknown[] = [];
+
+  if (search) {
+    const q = `%${search}%`;
+    where.push(
+      `(c.customer_code LIKE ? OR EXISTS (
+         SELECT 1 FROM customer_identities ci
+         WHERE ci.customer_id = c.id
+           AND (ci.platform_user_id LIKE ? OR COALESCE(ci.platform_username, '') LIKE ?)
+       ))`
+    );
+    args.push(q, q, q);
+  }
+
+  const whereSql = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
+  const total = (
+    db.prepare(`SELECT COUNT(*) as cnt FROM customers c ${whereSql}`).get(...args) as { cnt: number }
+  ).cnt;
+
+  const customers = db
+    .prepare(
+      `SELECT
+         c.id,
+         c.customer_code,
+         c.status,
+         c.created_at,
+         c.updated_at,
+         (SELECT COUNT(*) FROM transactions t WHERE t.customer_id = c.id) as total_transactions,
+         (SELECT COUNT(*) FROM transactions t WHERE t.customer_id = c.id AND t.transaction_status = 'SUCCESS') as success_transactions,
+         (SELECT COALESCE(SUM(t.payment_amount), 0) FROM transactions t WHERE t.customer_id = c.id AND t.transaction_status = 'SUCCESS') as total_spent,
+         (SELECT MAX(t.created_at) FROM transactions t WHERE t.customer_id = c.id) as last_transaction_at,
+         (SELECT COALESCE(SUM(
+            CASE
+              WHEN rl.entry_type IN ('REFUND_CREDIT', 'MANUAL_ADJUSTMENT_CREDIT') THEN rl.amount
+              WHEN rl.entry_type = 'MANUAL_ADJUSTMENT_DEBIT' THEN -rl.amount
+              ELSE 0
+            END
+          ), 0) FROM refund_ledger rl WHERE rl.customer_id = c.id) as refund_balance
+       FROM customers c
+       ${whereSql}
+       ORDER BY c.id DESC
+       LIMIT ? OFFSET ?`
+    )
+    .all(...args, limit, offset) as Array<{
+    id: number;
+    customer_code: string;
+    status: 'ACTIVE' | 'SUSPENDED';
+    created_at: string;
+    updated_at: string;
+    total_transactions: number;
+    success_transactions: number;
+    total_spent: number;
+    last_transaction_at: string | null;
+    refund_balance: number;
+  }>;
+
+  const identityStmt = db.prepare(
+    `SELECT id, customer_id, platform, platform_user_id, platform_username, linked_at, created_at
+     FROM customer_identities
+     WHERE customer_id = ?
+     ORDER BY id ASC`
+  );
+
+  const items = customers.map((cus) => ({
+    ...cus,
+    identities: identityStmt.all(cus.id) as CustomerIdentityRow[],
+  }));
+
+  return {
+    items,
+    pagination: {
+      page,
+      limit,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / limit)),
+    },
+  };
+}

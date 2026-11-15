@@ -1,6 +1,7 @@
 import type { Telegraf } from 'telegraf';
 import QRCode from 'qrcode';
 import { logger } from '../logging/logger';
+import { fetchQrisImageBuffer } from '../integrations/qris-image';
 
 export async function sendTelegramText(bot: Telegraf, chatId: string, text: string): Promise<boolean> {
   try {
@@ -25,11 +26,12 @@ export async function sendTelegramQrisInvoice(
   try {
     if (qris?.qrString) {
       const pngBuffer = await QRCode.toBuffer(qris.qrString, { width: 360, margin: 2 });
-      const msg = await bot.telegram.sendPhoto(chatId, { source: pngBuffer }, { caption, ...replyMarkup });
+      const msg = await bot.telegram.sendPhoto(chatId, { source: pngBuffer, filename: 'qris.png' }, { caption, ...replyMarkup });
       return msg.message_id;
     }
     if (qris?.qrUrl) {
-      const msg = await bot.telegram.sendPhoto(chatId, qris.qrUrl, { caption, ...replyMarkup });
+      const imageBuffer = await fetchQrisImageBuffer(qris.qrUrl);
+      const msg = await bot.telegram.sendPhoto(chatId, { source: imageBuffer, filename: 'qris.png' }, { caption, ...replyMarkup });
       return msg.message_id;
     }
     const msg = await bot.telegram.sendMessage(chatId, caption, replyMarkup);

@@ -22,14 +22,25 @@ import { refreshConfig } from '../config/env';
 refreshConfig(process.env);
 import { getDb, closeDb } from '../database/connection';
 import { runMigrations, verifyDatabaseIntegrity } from '../database/migrate';
-import { upsertProduct, listCategories, listProducts, getGlobalMarginRule } from './product.service';
+import { upsertProduct, listCategories, listProducts, getGlobalMarginRule, deleteProductSafely } from './product.service';
 import { setGlobalMargin, setCategoryMargin, listMarginHistory } from './margin.service';
 import { createCoupon } from './coupon.service';
-import { createOrder, processSingleSupplierJob, transitionTransactionStatus } from './transaction.service';
+import {
+  createOrder,
+  processSingleSupplierJob,
+  transitionTransactionStatus,
+  cancelCustomerTransaction,
+} from './transaction.service';
 import { processGatewayCallback, finalizeExpiredInvoice } from './payment.service';
 import { reconcileUnknownAndMissedCallbacks } from './payment.reconciliation.service';
 import { processAutomaticRefund, applyManualRefundOrAdjustment } from './refund.service';
-import { requestAccountLinkCode, verifyAndLinkAccount, resolveOrCreateCustomer, getCustomerRefundCreditTotal } from './customer.service';
+import {
+  requestAccountLinkCode,
+  verifyAndLinkAccount,
+  resolveOrCreateCustomer,
+  getCustomerRefundCreditTotal,
+  listCustomersDetailed,
+} from './customer.service';
 import { setMaintenanceMode } from './settings.service';
 import { runDatabaseBackup } from './backup.service';
 import {
@@ -42,7 +53,9 @@ import {
 } from './admin.service';
 import { runBotDemoInteraction } from './bot-demo.service';
 import { createExpressApp } from '../http/app';
-import type { PaymentGatewayPort, GatewayPaymentState } from '../integrations/myzzstore.gateway';
+import { MyZZStoreGateway, type PaymentGatewayPort, type GatewayPaymentState } from '../integrations/myzzstore.gateway';
+import { fetchQrisImageBuffer } from '../integrations/qris-image';
+import { runDigiflazzPriceSync } from '../integrations/digiflazz.price-sync';
 import { DigiflazzService } from '../integrations/digiflazz.service';
 import type { DigiflazzPort, DigiflazzTxResponse } from '../integrations/digiflazz.client';
 
@@ -793,9 +806,313 @@ test('HTTP Basic Auth, RBAC, Health, and absence of deposit routes', async () =>
     const healthText = await health.text();
     assert.equal(healthText.includes('test-strong-password-999'), false);
     assert.equal(healthText.includes('test-cb-secret'), false);
+
+    // Users list endpoint returns detailed customers & stats
+    const usersRes = await fetch(`${base}/api/admin/users?page=1&limit=20`, {
+      headers: { Authorization: `Basic ${goodCreds}` },
+    });
+    assert.equal(usersRes.status, 200);
+    const usersBody = (await usersRes.json()) as {
+      ok: boolean;
+      data: { items: Array<{ customer_code: string; identities: unknown[] }>; pagination: { total: number } };
+    };
+    assert.equal(usersBody.ok, true);
+    assert.ok(usersBody.data.items.length >= 1);
+    assert.ok(usersBody.data.pagination.total >= 1);
+
+    // Delete unused product via HTTP endpoint
+    const tempProd = upsertProduct(
+      {
+        sku: 'TEMP-DEL-HTTP',
+        name: 'Produk Sementara Hapus',
+        categoryId: listCategories(true)[0].id,
+        supplierPrice: 5000,
+      },
+      { id: 'testowner', role: 'OWNER' }
+    );
+    const delRes = await fetch(`${base}/api/admin/products/${tempProd.id}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Basic ${goodCreds}` },
+    });
+    assert.equal(delRes.status, 200);
+    const delBody = (await delRes.json()) as { ok: boolean; data: { sku: string } };
+    assert.equal(delBody.ok, true);
+    assert.equal(delBody.data.sku, 'TEMP-DEL-HTTP');
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    closeDb();
-    fs.rmSync(tempDir, { recursive: true, force: true });
   }
+});
+
+test('Product sync deletes unavailable items and preserves ordered SKU safety; deleteProductSafely enforces FK guard', async () => {
+  const actor = { id: 'testowner', role: 'OWNER' as const };
+  const catId = listCategories(true)[0].id;
+
+  const unusedProd = upsertProduct(
+    { sku: 'SYNC-OBSOLETE-1', name: 'Produk Hilang Saat Sync', categoryId: catId, supplierPrice: 4000 },
+    actor
+  );
+  const unavailableProd = upsertProduct(
+    { sku: 'SYNC-OFF-2', name: 'Produk Nonaktif Supplier', categoryId: catId, supplierPrice: 5000 },
+    actor
+  );
+
+  // deleteProductSafely rejects product referenced by historical transactions (TSEL10)
+  const usedProd = listProducts({ search: 'TSEL10', onlyActive: false }).items.find((p) => p.sku === 'TSEL10')!;
+  assert.throws(() => deleteProductSafely(usedProd.id, actor), /transaksi terkait/i);
+
+  // Custom mock Digiflazz returning PLN20 + PULSA5 as available, SYNC-OFF-2 unavailable, SYNC-OBSOLETE-1 absent
+  const syncMock: DigiflazzPort = {
+    isConfigured: () => true,
+    async fetchPriceList() {
+      return {
+        ok: true,
+        items: [
+          {
+            buyer_sku_code: 'PLN20',
+            product_name: 'Token PLN 20.000',
+            category: 'PLN',
+            brand: 'PLN',
+            type: 'Umum',
+            price: 20100,
+            buyer_product_status: true,
+            seller_product_status: true,
+          },
+          {
+            buyer_sku_code: 'SYNC-OFF-2',
+            product_name: 'Produk Nonaktif Supplier',
+            category: 'Pulsa',
+            brand: 'TELKOMSEL',
+            type: 'Umum',
+            price: 5000,
+            buyer_product_status: true,
+            seller_product_status: false,
+          },
+        ],
+      };
+    },
+    async createTransaction(p) {
+      return { ok: true, mappedStatus: 'SUCCESS', refId: p.refId };
+    },
+    async inquireTransaction(p) {
+      return { ok: true, mappedStatus: 'SUCCESS', refId: p.refId };
+    },
+    async checkBalance() {
+      return { ok: true, balance: 100000 };
+    },
+  };
+
+  const syncRes = await runDigiflazzPriceSync(syncMock, 'MANUAL');
+  assert.equal(syncRes.ok, true);
+  assert.equal(syncRes.successCount, 1);
+  assert.ok(syncRes.deletedCount >= 2);
+
+  const afterList = listProducts({ onlyActive: false, limit: 100 }).items;
+  assert.equal(afterList.some((p) => p.id === unusedProd.id), false);
+  assert.equal(afterList.some((p) => p.id === unavailableProd.id), false);
+  // Historically ordered TSEL10 kept intact as INACTIVE for FK safety
+  const tselAfter = afterList.find((p) => p.id === usedProd.id)!;
+  assert.equal(tselAfter.status, 'INACTIVE');
+  assert.equal(tselAfter.is_available, 0);
+
+  // Re-activate TSEL10 for subsequent tests
+  upsertProduct(
+    {
+      sku: 'TSEL10',
+      name: 'Pulsa Telkomsel 10.000',
+      categoryId: catId,
+      supplierPrice: 10200,
+      marginType: 'FIXED',
+      marginValue: 1000,
+    },
+    actor
+  );
+});
+
+test('Customer cancel enforces 30s delay rule after creation and succeeds once elapsed', async () => {
+  const gw = new TestPaymentGateway();
+  const order = await createOrder(
+    {
+      platform: 'TELEGRAM',
+      platformUserId: '77665544',
+      productSkuOrId: 'TSEL10',
+      destination: '081299988877',
+    },
+    gw
+  );
+  assert.equal(order.ok, true);
+  const txId = order.transaction!.transaction_id;
+
+  // Immediate cancel (< 30s) must be rejected with TOO_EARLY
+  const tooEarly = await cancelCustomerTransaction(
+    { platform: 'TELEGRAM', platformUserId: '77665544', transactionId: txId },
+    gw
+  );
+  assert.equal(tooEarly.ok, false);
+  assert.equal(tooEarly.code, 'TOO_EARLY');
+  assert.ok((tooEarly.remainingWaitSeconds ?? 0) >= 1);
+
+  // Backdate created_at by 35 seconds
+  const db = getDb();
+  const backdated = new Date(Date.now() - 35_000).toISOString();
+  db.prepare('UPDATE transactions SET created_at = ? WHERE transaction_id = ?').run(backdated, txId);
+
+  const cancelled = await cancelCustomerTransaction(
+    { platform: 'TELEGRAM', platformUserId: '77665544', transactionId: txId },
+    gw
+  );
+  assert.equal(cancelled.ok, true);
+  assert.equal(cancelled.transaction?.transaction_status, 'CANCELLED');
+  assert.equal(gw.cancelCalls, 1);
+});
+
+test('Product buttons display friendly product names instead of raw Digiflazz SKUs', async () => {
+  const actor = { id: 'testowner', role: 'OWNER' as const };
+  const catId = listCategories(true)[0].id;
+  upsertProduct(
+    {
+      sku: 'pre35866129',
+      name: 'Paket Data Freedom 10GB',
+      categoryId: catId,
+      supplierPrice: 25000,
+    },
+    actor
+  );
+
+  // Telegram category listing should display "Paket Data Freedom 10GB" on button, NOT raw "pre35866129"
+  const tgCat = await runBotDemoInteraction({
+    platform: 'TELEGRAM',
+    senderRole: 'CUSTOMER',
+    inputType: 'CALLBACK',
+    callbackData: `CAT_${catId}`,
+    actor,
+  });
+  const tgBtnTexts = (tgCat.replies[0].buttons || []).flat().map((b) => b.text);
+  assert.ok(tgBtnTexts.some((t) => t.includes('Paket Data Freedom 10GB')));
+  assert.equal(tgBtnTexts.some((t) => t.toLowerCase().includes('pre35866129')), false);
+
+  // WhatsApp product listing should also avoid raw SKU on interactive buttons
+  const waList = await runBotDemoInteraction({
+    platform: 'WHATSAPP',
+    senderRole: 'CUSTOMER',
+    inputType: 'TEXT',
+    text: 'produk',
+    actor,
+  });
+  const waBtnTexts = (waList.replies[0].buttons || []).flat().map((b) => b.text);
+  assert.ok(waBtnTexts.some((t) => t.includes('Paket Data Freedom 10GB')));
+  assert.equal(waBtnTexts.some((t) => t.toLowerCase().includes('pre35866129')), false);
+
+  // Verify detailed user list includes customers with identities
+  const users = listCustomersDetailed({ page: 1, limit: 20 });
+  assert.ok(users.items.length >= 1);
+  assert.ok(Array.isArray(users.items[0].identities));
+});
+
+test('MyZZStoreGateway uses GET /create-qris and /check-payment, extracts data.trx_id & data.qris_url, and fetches QRIS buffer', async () => {
+  const pngBytes = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+    'base64'
+  );
+  const capturedRequests: Array<{ method?: string; path?: string; query: URLSearchParams }> = [];
+
+  const mockGatewayServer = http.createServer((req, res) => {
+    const parsedUrl = new URL(req.url || '/', 'http://127.0.0.1');
+    capturedRequests.push({
+      method: req.method,
+      path: parsedUrl.pathname,
+      query: parsedUrl.searchParams,
+    });
+
+    if (parsedUrl.pathname === '/create-qris') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          status: 'success',
+          data: {
+            trx_id: 'MZ-TRX-889900',
+            qris_url: `http://127.0.0.1:${(mockGatewayServer.address() as { port: number }).port}/qris-image.png`,
+            amount: 11245,
+            status: 'PENDING',
+          },
+        })
+      );
+      return;
+    }
+
+    if (parsedUrl.pathname === '/check-payment') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          status: 'success',
+          data: {
+            trx_id: parsedUrl.searchParams.get('trx_id'),
+            status: 'LUNAS',
+            amount: 11245,
+            paid_at: '2026-11-15T10:00:00.000Z',
+          },
+        })
+      );
+      return;
+    }
+
+    if (parsedUrl.pathname === '/qris-image.png') {
+      res.writeHead(200, { 'Content-Type': 'image/png' });
+      res.end(pngBytes);
+      return;
+    }
+
+    res.writeHead(404);
+    res.end();
+  });
+
+  await new Promise<void>((resolve) => mockGatewayServer.listen(0, '127.0.0.1', resolve));
+  const port = (mockGatewayServer.address() as { port: number }).port;
+
+  process.env.PAYMENT_GATEWAY_BASE_URL = `http://127.0.0.1:${port}`;
+  process.env.PAYMENT_GATEWAY_API_KEY = 'test-api-key';
+  process.env.PAYMENT_GATEWAY_SECRET = 'test-secret';
+  process.env.PAYMENT_GATEWAY_MERCHANT_ID = 'MERCHANT01';
+  process.env.PAYMENT_GATEWAY_CREATE_PATH = '/create-qris';
+  process.env.PAYMENT_GATEWAY_STATUS_PATH = '/check-payment';
+  refreshConfig(process.env);
+
+  try {
+    const gateway = new MyZZStoreGateway();
+    const created = await gateway.createPayment({
+      transactionId: 'TRX-TEST-GW-1',
+      amount: 11245,
+      productName: 'Pulsa 10.000',
+      customerCode: 'CUS-1234',
+      expiredAt: '2026-11-15T10:05:00.000Z',
+      callbackUrl: 'https://example.com/callback',
+    });
+
+    assert.equal(created.ok, true);
+    assert.equal(created.gatewayReference, 'MZ-TRX-889900');
+    assert.equal(created.qrUrl, `http://127.0.0.1:${port}/qris-image.png`);
+    assert.equal(capturedRequests[0].method, 'GET');
+    assert.equal(capturedRequests[0].path, '/create-qris');
+    assert.equal(capturedRequests[0].query.get('amount'), '11245');
+
+    // Verify QRIS image downloads cleanly into Buffer
+    const imgBuf = await fetchQrisImageBuffer(created.qrUrl!);
+    assert.equal(Buffer.isBuffer(imgBuf), true);
+    assert.equal(imgBuf.equals(pngBytes), true);
+
+    // Verify checkPaymentStatus sends GET /check-payment?trx_id=MZ-TRX-889900 and recognizes LUNAS
+    const statusRes = await gateway.checkPaymentStatus(created.gatewayReference!, 'TRX-TEST-GW-1');
+    assert.equal(statusRes.ok, true);
+    assert.equal(statusRes.mappedStatus, 'PAID');
+    assert.equal(statusRes.gatewayReference, 'MZ-TRX-889900');
+    assert.equal(capturedRequests[2].method, 'GET');
+    assert.equal(capturedRequests[2].path, '/check-payment');
+    assert.equal(capturedRequests[2].query.get('trx_id'), 'MZ-TRX-889900');
+  } finally {
+    await new Promise<void>((resolve) => mockGatewayServer.close(() => resolve()));
+  }
+});
+
+test.after(() => {
+  closeDb();
+  fs.rmSync(tempDir, { recursive: true, force: true });
 });

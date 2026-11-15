@@ -15,10 +15,12 @@ import {
 import {
   createOrder,
   previewOrderDryRun,
+  cancelCustomerTransaction,
   getCustomerTransactions,
   getTransactionDetail,
   saveQrMessageReference,
 } from '../services/transaction.service';
+import { fetchQrisImageBuffer } from '../integrations/qris-image';
 import {
   resolveAdminByPlatform,
   checkAdminPermission,
@@ -94,6 +96,13 @@ function checkRateLimit(jid: string, max = 20, windowMs = 60_000): boolean {
 function greetingPrefix(pushName?: string): string {
   const clean = (pushName || '').trim();
   return clean ? `Halo Kak *${clean}*` : 'Halo Kak';
+}
+
+function formatWaProductButtonLabel(name: string, sellingPrice: number, num: number): string {
+  const maxNameLen = 36;
+  const clean = name.trim();
+  const shortName = clean.length > maxNameLen ? `${clean.slice(0, maxNameLen - 1).trimEnd()}…` : clean;
+  return `${num}. ${shortName} · Rp${sellingPrice.toLocaleString('id-ID')}`;
 }
 
 async function sendMainMenu(sock: WhatsappReplyTransport, jid: string, pushName?: string, dryRun?: boolean) {
@@ -198,17 +207,15 @@ async function sendProductPage(
   );
 
   const lines = res.items.map(
-    (p, idx) => `${idx + 1}. *${p.name}* (${p.sku})\n    Rp${p.selling_price.toLocaleString('id-ID')}`
+    (p, idx) => `${idx + 1}. *${p.name}*\n    Rp${p.selling_price.toLocaleString('id-ID')}`
   );
 
-  const buttonRows: WhatsappQuickButton[][] = [];
-  for (let i = 0; i < res.items.length; i += 2) {
-    const row = res.items.slice(i, i + 2).map((p, offset) => ({
-      text: `${i + offset + 1}. ${p.sku} · Rp${p.selling_price.toLocaleString('id-ID')}`,
+  const buttonRows: WhatsappQuickButton[][] = res.items.map((p, idx) => [
+    {
+      text: formatWaProductButtonLabel(p.name, p.selling_price, idx + 1),
       replyText: `pilih ${p.sku}`,
-    }));
-    buttonRows.push(row);
-  }
+    },
+  ]);
 
   const navRow: WhatsappQuickButton[] = [];
   if (params.page > 1) {
@@ -238,7 +245,7 @@ async function sendProductPage(
     text:
       `*Daftar Produk (Hal ${params.page}/${res.pagination.totalPages})*\n` +
       `${lines.join('\n')}\n\n` +
-      `Tap tombol produk di bawah (atau balas angkanya) untuk langsung memesan tanpa mengetik SKU manual!`,
+      `Tap tombol produk di bawah (atau balas angkanya) untuk langsung memesan ya Kak!`,
     quickReplies: buttonRows,
   });
 }
@@ -274,7 +281,7 @@ async function promptProductDestination(
   await sock.sendMessage(jid, {
     text:
       `Pilihan tepat! Anda memilih:\n` +
-      `*${product.name}* (${product.sku})\n` +
+      `*${product.name}*\n` +
       `Harga: *Rp${product.selling_price.toLocaleString('id-ID')}*\n\n` +
       `Silakan ketik *nomor tujuan / ID pelanggan* Anda sekarang ya Kak (contoh: \`081234567890\`, atau tambahkan kode kupon setelah spasi).`,
     quickReplies: [
@@ -321,8 +328,9 @@ async function executeWhatsappOrder(
         quickReplies: [
           [
             { text: 'Cek Status Invoice', replyText: `status ${a.transaction_id}` },
-            { text: 'Menu Utama', replyText: 'menu' },
+            { text: 'Batalkan Pesanan', replyText: `batal ${a.transaction_id}` },
           ],
+          [{ text: 'Menu Utama', replyText: 'menu' }],
         ],
       });
       return;
@@ -345,14 +353,16 @@ async function executeWhatsappOrder(
     `Kode Unik: ${tx.unique_code}\n` +
     `*Total Bayar: Rp${tx.payment_amount.toLocaleString('id-ID')}*\n` +
     `Berlaku hingga: ${new Date(tx.expired_at!).toLocaleTimeString('id-ID')} (${config.transaction.invoiceExpiryMinutes} menit)\n\n` +
-    `Silakan scan QRIS di atas dengan nominal TEPAT Rp${tx.payment_amount.toLocaleString('id-ID')} ya Kak.` +
+    `Silakan scan QRIS di atas dengan nominal TEPAT Rp${tx.payment_amount.toLocaleString('id-ID')} ya Kak.\n` +
+    `_(Pembatalan tersedia minimal 30 detik setelah pesanan dibuat)_` +
     (params.dryRun ? `\n\n_[Mode Demo: pratinjau invoice & QRIS, transaksi tidak disimpan ke database]_` : '');
 
   const invoiceButtons: WhatsappQuickButton[][] = [
     [
       { text: 'Cek Status Pembayaran', replyText: `status ${tx.transaction_id}` },
-      { text: 'Menu Utama', replyText: 'menu' },
+      { text: 'Batalkan Pesanan', replyText: `batal ${tx.transaction_id}` },
     ],
+    [{ text: 'Menu Utama', replyText: 'menu' }],
   ];
 
   try {
@@ -367,8 +377,9 @@ async function executeWhatsappOrder(
         });
       }
     } else if (result.qris?.qrUrl) {
+      const imageBuffer = await fetchQrisImageBuffer(result.qris.qrUrl);
       const sent = await sock.sendMessage(jid, {
-        image: { url: result.qris.qrUrl },
+        image: imageBuffer,
         caption,
         quickReplies: invoiceButtons,
       });
@@ -390,6 +401,56 @@ async function executeWhatsappOrder(
     });
     await sock.sendMessage(jid, { text: caption, quickReplies: invoiceButtons });
   }
+}
+
+async function handleWhatsappOrderCancellation(
+  sock: WhatsappReplyTransport,
+  jid: string,
+  params: { transactionId?: string; dryRun?: boolean; pushName?: string }
+) {
+  if (params.dryRun) {
+    await sock.sendMessage(jid, {
+      text: params.transactionId?.startsWith('TRX-DEMO-')
+        ? `Pembatalan pesanan minimal dilakukan 30 detik setelah pesanan dibuat. (Mode Demo: transaksi ${params.transactionId} tidak tersimpan di database)`
+        : '[Mode Demo] Simulasi pembatalan pesanan (minimal 30 detik setelah pesanan dibuat).',
+      quickReplies: NAV_BACK_BUTTONS,
+    });
+    return;
+  }
+
+  const res = await cancelCustomerTransaction({
+    platform: 'WHATSAPP',
+    platformUserId: jid,
+    transactionId: params.transactionId,
+  });
+
+  if (!res.ok) {
+    if (res.code === 'NOT_FOUND' && !params.transactionId) {
+      await sendMainMenu(sock, jid, params.pushName, params.dryRun);
+      return;
+    }
+    const buttons: WhatsappQuickButton[][] = res.transaction
+      ? [
+          [
+            { text: 'Cek Status Pembayaran', replyText: `status ${res.transaction.transaction_id}` },
+            { text: 'Coba Batalkan Lagi', replyText: `batal ${res.transaction.transaction_id}` },
+          ],
+          [{ text: 'Menu Utama', replyText: 'menu' }],
+        ]
+      : NAV_BACK_BUTTONS;
+    await sock.sendMessage(jid, {
+      text: res.errorMessage || 'Maaf Kak, pesanan belum dapat dibatalkan.',
+      quickReplies: buttons,
+    });
+    return;
+  }
+
+  await sock.sendMessage(jid, {
+    text:
+      `Pesanan *${res.transaction!.transaction_id}* (${res.transaction!.product_name_snapshot}) telah *DIBATALKAN*.\n` +
+      `Harap tunggu ${config.transaction.cooldownSeconds} detik sebelum membuat pesanan baru ya Kak.`,
+    quickReplies: NAV_BACK_BUTTONS,
+  });
 }
 
 export async function handleWhatsappCommand(
@@ -561,8 +622,18 @@ export async function handleWhatsappCommand(
 
   // Known Customer Commands (reset or update conversational flow cleanly)
   if (cmd === 'batal' || cmd === 'cancel' || trimmed === '0') {
+    const activeSession = getBotSession('WHATSAPP', jid, dryRun);
+    if ((activeSession?.mode === 'AWAITING_DESTINATION' && !args[0]) || trimmed === '0') {
+      clearBotSession('WHATSAPP', jid, dryRun);
+      await sendMainMenu(sock, jid, pushName, dryRun);
+      return;
+    }
     clearBotSession('WHATSAPP', jid, dryRun);
-    await sendMainMenu(sock, jid, pushName, dryRun);
+    await handleWhatsappOrderCancellation(sock, jid, {
+      transactionId: args[0]?.trim(),
+      dryRun,
+      pushName,
+    });
     return;
   }
 
@@ -658,6 +729,10 @@ export async function handleWhatsappCommand(
         return;
       }
       const t = detail.transaction;
+      const canCancel = ['CREATED', 'PENDING_PAYMENT', 'PAYMENT_PROCESSING'].includes(t.transaction_status);
+      const buttons: WhatsappQuickButton[][] = canCancel
+        ? [[{ text: 'Batalkan Pesanan', replyText: `batal ${t.transaction_id}` }], ...NAV_BACK_BUTTONS]
+        : NAV_BACK_BUTTONS;
       await sock.sendMessage(jid, {
         text:
           `*Status Transaksi ${t.transaction_id}*\n` +
@@ -666,7 +741,7 @@ export async function handleWhatsappCommand(
           `Nominal: Rp${t.payment_amount.toLocaleString('id-ID')}\n` +
           `Status: *${t.transaction_status}*\n` +
           (t.supplier_sn ? `SN / Token: ${t.supplier_sn}\n` : ''),
-        quickReplies: NAV_BACK_BUTTONS,
+        quickReplies: buttons,
       });
       return;
     }
@@ -680,18 +755,22 @@ export async function handleWhatsappCommand(
       return;
     }
     const latest = recent[0];
+    const canCancel = ['CREATED', 'PENDING_PAYMENT', 'PAYMENT_PROCESSING'].includes(latest.transaction_status);
+    const buttons: WhatsappQuickButton[][] = [];
+    if (canCancel) {
+      buttons.push([{ text: 'Batalkan Pesanan', replyText: `batal ${latest.transaction_id}` }]);
+    }
+    buttons.push([
+      { text: 'Lihat Semua Riwayat', replyText: 'riwayat' },
+      { text: 'Menu Utama', replyText: 'menu' },
+    ]);
     await sock.sendMessage(jid, {
       text:
         `*Transaksi Terakhir (${latest.transaction_id})*\n` +
         `Produk: ${latest.product_name_snapshot}\n` +
         `Nominal: Rp${latest.payment_amount.toLocaleString('id-ID')}\n` +
         `Status: *${latest.transaction_status}*`,
-      quickReplies: [
-        [
-          { text: 'Lihat Semua Riwayat', replyText: 'riwayat' },
-          { text: 'Menu Utama', replyText: 'menu' },
-        ],
-      ],
+      quickReplies: buttons,
     });
     return;
   }

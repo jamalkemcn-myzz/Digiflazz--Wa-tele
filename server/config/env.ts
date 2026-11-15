@@ -268,8 +268,8 @@ export function validateAndLoadConfig(env: NodeJS.ProcessEnv = process.env): App
       merchantId: (env.PAYMENT_GATEWAY_MERCHANT_ID || '').trim(),
       callbackSecret: (env.PAYMENT_GATEWAY_CALLBACK_SECRET || '').trim(),
       timeoutMs: gatewayTimeoutMs,
-      createPath: (env.PAYMENT_GATEWAY_CREATE_PATH || '').trim(),
-      statusPath: (env.PAYMENT_GATEWAY_STATUS_PATH || '').trim(),
+      createPath: (env.PAYMENT_GATEWAY_CREATE_PATH || '/create-qris').trim(),
+      statusPath: (env.PAYMENT_GATEWAY_STATUS_PATH || '/check-payment').trim(),
       cancelPath: (env.PAYMENT_GATEWAY_CANCEL_PATH || '').trim(),
     },
     digiflazz: {

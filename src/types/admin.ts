@@ -231,3 +231,28 @@ export interface RefundLedgerItem {
   actor_source: string;
   created_at: string;
 }
+
+export interface CustomerIdentityItem {
+  id: number;
+  customer_id: number;
+  platform: 'WHATSAPP' | 'TELEGRAM' | 'DASHBOARD';
+  platform_user_id: string;
+  platform_username: string | null;
+  linked_at: string;
+  created_at: string;
+}
+
+export interface CustomerUserItem {
+  id: number;
+  customer_code: string;
+  status: 'ACTIVE' | 'SUSPENDED';
+  created_at: string;
+  updated_at: string;
+  total_transactions: number;
+  success_transactions: number;
+  total_spent: number;
+  last_transaction_at: string | null;
+  refund_balance: number;
+  identities: CustomerIdentityItem[];
+}
+

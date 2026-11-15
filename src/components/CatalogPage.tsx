@@ -39,6 +39,7 @@ export function CatalogPage({ initialTab = 'products', permissions }: { initialT
   // Forms (numeric fields stored as sanitized strings to avoid leading-zero input glitches like "030")
   const [newCatName, setNewCatName] = useState('');
   const [editingSku, setEditingSku] = useState<string | null>(null);
+  const [confirmDeleteProductId, setConfirmDeleteProductId] = useState<number | null>(null);
   const [newProd, setNewProd] = useState({
     sku: '',
     name: '',
@@ -96,7 +97,7 @@ export function CatalogPage({ initialTab = 'products', permissions }: { initialT
       const res = await api.syncDigiflazz();
       setMessage({
         type: 'ok',
-        text: `Sinkronisasi selesai: ${res.data.successCount} produk diperbarui, ${res.data.failureCount} gagal.`,
+        text: `Sinkronisasi selesai: ${res.data.successCount} produk diperbarui, ${res.data.deletedCount ?? 0} tidak tersedia dihapus, ${res.data.failureCount} gagal.`,
       });
       await loadAll();
     } catch (err) {
@@ -164,6 +165,25 @@ export function CatalogPage({ initialTab = 'products', permissions }: { initialT
       await loadAll();
     } catch (err) {
       setMessage({ type: 'err', text: err instanceof Error ? err.message : 'Gagal mengubah status produk' });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleDeleteProduct(p: ProductItem) {
+    setBusy(true);
+    setMessage(null);
+    try {
+      await api.deleteProduct(p.id);
+      setConfirmDeleteProductId(null);
+      if (editingSku === p.sku) {
+        resetProductForm();
+      }
+      setMessage({ type: 'ok', text: `Produk ${p.name} (${p.sku}) berhasil dihapus.` });
+      await loadAll();
+    } catch (err) {
+      setConfirmDeleteProductId(null);
+      setMessage({ type: 'err', text: err instanceof Error ? err.message : 'Gagal menghapus produk' });
     } finally {
       setBusy(false);
     }
@@ -540,7 +560,7 @@ export function CatalogPage({ initialTab = 'products', permissions }: { initialT
                         </td>
                         <td className="py-3 px-4 text-right">
                           {permissions.includes('products:write') && (
-                            <div className="inline-flex items-center gap-1.5">
+                            <div className="inline-flex items-center gap-1.5 flex-wrap justify-end">
                               <button
                                 onClick={() => startEditProduct(p)}
                                 aria-label={`Edit produk ${p.sku}`}
@@ -555,6 +575,38 @@ export function CatalogPage({ initialTab = 'products', permissions }: { initialT
                               >
                                 {p.status === 'ACTIVE' ? 'Nonaktifkan' : 'Aktifkan'}
                               </button>
+                              {confirmDeleteProductId === p.id ? (
+                                <div className="inline-flex items-center gap-1">
+                                  <button
+                                    type="button"
+                                    disabled={busy}
+                                    onClick={() => void handleDeleteProduct(p)}
+                                    aria-label={`Konfirmasi hapus produk ${p.sku}`}
+                                    className="px-2.5 py-1 text-xs font-semibold text-white bg-red-600 rounded-md hover:bg-red-500 disabled:opacity-50 cursor-pointer whitespace-nowrap"
+                                  >
+                                    Konfirmasi
+                                  </button>
+                                  <button
+                                    type="button"
+                                    disabled={busy}
+                                    onClick={() => setConfirmDeleteProductId(null)}
+                                    className="px-2 py-1 text-xs text-slate-300 bg-[#192233] border border-[#2a3852] rounded-md hover:bg-[#232e42] cursor-pointer whitespace-nowrap"
+                                  >
+                                    Batal
+                                  </button>
+                                </div>
+                              ) : (
+                                <button
+                                  type="button"
+                                  disabled={busy}
+                                  onClick={() => setConfirmDeleteProductId(p.id)}
+                                  aria-label={`Hapus produk ${p.sku}`}
+                                  className="inline-flex items-center gap-1 px-2.5 py-1 text-xs text-red-400 border border-red-900/60 rounded-md hover:bg-red-950/50 disabled:opacity-50 cursor-pointer whitespace-nowrap"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                  Hapus
+                                </button>
+                              )}
                             </div>
                           )}
                         </td>

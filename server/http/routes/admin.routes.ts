@@ -16,8 +16,10 @@ import {
   listProducts,
   upsertProduct,
   updateProductStatus,
+  deleteProductSafely,
   getGlobalMarginRule,
 } from '../../services/product.service';
+import { listCustomersDetailed } from '../../services/customer.service';
 import {
   setGlobalMargin,
   setCategoryMargin,
@@ -157,6 +159,18 @@ adminRouter.patch('/products/:id/status', requirePermission('products:write'), (
       role: req.admin!.role,
     });
     res.json({ ok: true, data: updated });
+  } catch (err) {
+    next(err);
+  }
+});
+
+adminRouter.delete('/products/:id', requirePermission('products:write'), (req: Request, res: Response, next) => {
+  try {
+    const result = deleteProductSafely(Number(req.params.id), {
+      id: req.admin!.username,
+      role: req.admin!.role,
+    });
+    res.json({ ok: true, data: result });
   } catch (err) {
     next(err);
   }
@@ -358,6 +372,15 @@ adminRouter.get('/customers', requirePermission('refunds:read'), (_req: Request,
     .prepare('SELECT id, customer_code, status, created_at FROM customers ORDER BY id DESC LIMIT 100')
     .all();
   res.json({ ok: true, data: customers });
+});
+
+adminRouter.get('/users', requirePermission('overview:read'), (req: Request, res: Response) => {
+  const data = listCustomersDetailed({
+    page: Number(req.query.page) || 1,
+    limit: Number(req.query.limit) || 25,
+    search: typeof req.query.search === 'string' ? req.query.search : undefined,
+  });
+  res.json({ ok: true, data });
 });
 
 adminRouter.post('/refunds/adjust', requirePermission('refunds:adjust'), (req: Request, res: Response, next) => {

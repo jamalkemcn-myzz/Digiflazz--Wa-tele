@@ -25,6 +25,7 @@ export async function runDigiflazzPriceSync(
   syncLogId: number;
   successCount: number;
   failureCount: number;
+  deletedCount: number;
   errorMessage?: string;
 }> {
   if (syncInProgress) {
@@ -33,6 +34,7 @@ export async function runDigiflazzPriceSync(
       syncLogId: 0,
       successCount: 0,
       failureCount: 0,
+      deletedCount: 0,
       errorMessage: 'Sinkronisasi harga Digiflazz sedang berjalan',
     };
   }
@@ -66,12 +68,14 @@ export async function runDigiflazzPriceSync(
         syncLogId,
         successCount: 0,
         failureCount: 0,
+        deletedCount: 0,
         errorMessage: result.errorMessage,
       };
     }
 
     let successCount = 0;
     let failureCount = 0;
+    let deletedCount = 0;
     const now = new Date().toISOString();
 
     withTransaction((txDb) => {
@@ -110,12 +114,24 @@ export async function runDigiflazzPriceSync(
          WHERE id = ?`
       );
 
+      const availableSkus = new Set<string>();
+
       for (const item of result.items) {
         try {
           if (!item.buyer_sku_code || !item.product_name || !Number.isFinite(item.price) || item.price < 0) {
             failureCount++;
             continue;
           }
+
+          const sku = item.buyer_sku_code.trim().toUpperCase();
+          const isAvailable = Boolean(item.buyer_product_status && item.seller_product_status);
+
+          // Skip unavailable products from sync insertion; existing unavailable items will be removed below
+          if (!isAvailable) {
+            continue;
+          }
+
+          availableSkus.add(sku);
 
           const categoryName = (item.category || 'Umum').trim();
           const categorySlug = slugify(categoryName);
@@ -133,7 +149,7 @@ export async function runDigiflazzPriceSync(
             };
           }
 
-          const existing = findProduct.get(item.buyer_sku_code) as
+          const existing = findProduct.get(sku) as
             | { id: number; margin_type: MarginType | null; margin_value: number | null; max_margin: number | null }
             | undefined;
 
@@ -153,19 +169,17 @@ export async function runDigiflazzPriceSync(
             globalMargin,
           });
 
-          const isAvailable = Boolean(item.buyer_product_status && item.seller_product_status) ? 1 : 0;
-
           if (!existing) {
             insertProduct.run(
-              item.buyer_sku_code,
+              sku,
               item.product_name.trim(),
               catRow.id,
               item.brand || null,
               item.type || null,
               Math.round(item.price),
               marginCalc.sellingPrice,
-              isAvailable ? 'ACTIVE' : 'INACTIVE',
-              isAvailable,
+              'ACTIVE',
+              1,
               now,
               now,
               now
@@ -179,7 +193,7 @@ export async function runDigiflazzPriceSync(
               item.type || null,
               Math.round(item.price),
               marginCalc.sellingPrice,
-              isAvailable,
+              1,
               now,
               now,
               existing.id
@@ -189,6 +203,28 @@ export async function runDigiflazzPriceSync(
           successCount++;
         } catch {
           failureCount++;
+        }
+      }
+
+      // Delete (or deactivate if referenced by existing transactions) any product missing or unavailable in Digiflazz sync
+      if (result.items.length > 0) {
+        const allProducts = txDb.prepare('SELECT id, sku FROM products').all() as Array<{ id: number; sku: string }>;
+        const countTxStmt = txDb.prepare('SELECT COUNT(*) as cnt FROM transactions WHERE product_id = ?');
+        const deleteProductStmt = txDb.prepare('DELETE FROM products WHERE id = ?');
+        const deactivateProductStmt = txDb.prepare(
+          `UPDATE products SET status = 'INACTIVE', is_available = 0, last_price_sync_at = ?, updated_at = ? WHERE id = ?`
+        );
+
+        for (const prod of allProducts) {
+          if (!availableSkus.has(prod.sku.trim().toUpperCase())) {
+            const txCount = (countTxStmt.get(prod.id) as { cnt: number }).cnt;
+            if (txCount === 0) {
+              deleteProductStmt.run(prod.id);
+              deletedCount++;
+            } else {
+              deactivateProductStmt.run(now, now, prod.id);
+            }
+          }
         }
       }
     }, db);
@@ -201,16 +237,16 @@ export async function runDigiflazzPriceSync(
       new Date().toISOString(),
       successCount,
       failureCount,
-      JSON.stringify({ triggerSource, totalReceived: result.items.length }),
+      JSON.stringify({ triggerSource, totalReceived: result.items.length, deletedCount }),
       syncLogId
     );
 
     logger.info('Digiflazz price sync completed', {
       service: 'digiflazz-price-sync',
-      details: { triggerSource, successCount, failureCount },
+      details: { triggerSource, successCount, failureCount, deletedCount },
     });
 
-    return { ok: true, syncLogId, successCount, failureCount };
+    return { ok: true, syncLogId, successCount, failureCount, deletedCount };
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unexpected price sync error';
     db.prepare(
@@ -224,7 +260,7 @@ export async function runDigiflazzPriceSync(
       details: { error: msg },
     });
 
-    return { ok: false, syncLogId, successCount: 0, failureCount: 0, errorMessage: msg };
+    return { ok: false, syncLogId, successCount: 0, failureCount: 0, deletedCount: 0, errorMessage: msg };
   } finally {
     syncInProgress = false;
   }

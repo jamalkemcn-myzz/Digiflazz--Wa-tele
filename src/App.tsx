@@ -14,6 +14,7 @@ import {
   Menu,
   X,
   MessageSquareCode,
+  Users,
 } from 'lucide-react';
 import { getAuthStatus, logoutSession } from './api/client';
 import type { AdminSession } from './types/admin';
@@ -27,6 +28,7 @@ import { BotsPage } from './components/BotsPage';
 import { BotDemoPage } from './components/BotDemoPage';
 import { LogsPage } from './components/LogsPage';
 import { SettingsPage } from './components/SettingsPage';
+import { CustomersPage } from './components/CustomersPage';
 
 type NavKey =
   | 'overview'
@@ -38,6 +40,7 @@ type NavKey =
   | 'refunds'
   | 'bots'
   | 'bot-demo'
+  | 'customers'
   | 'logs'
   | 'settings';
 
@@ -49,6 +52,7 @@ const NAV_ITEMS: Array<{ key: NavKey; label: string; icon: React.ComponentType<{
   { key: 'margins', label: 'Margin Settings', icon: Percent },
   { key: 'coupons', label: 'Coupons', icon: TicketPercent },
   { key: 'refunds', label: 'Refund Ledger', icon: RotateCcw },
+  { key: 'customers', label: 'Users', icon: Users },
   { key: 'bots', label: 'Bot Management', icon: Bot },
   { key: 'bot-demo', label: 'Demo Bot', icon: MessageSquareCode },
   { key: 'logs', label: 'Logs', icon: ScrollText },
@@ -213,6 +217,7 @@ export default function App() {
           {activeNav === 'margins' && <CatalogPage initialTab="margins" permissions={admin.permissions} />}
           {activeNav === 'coupons' && <CouponsPage permissions={admin.permissions} />}
           {activeNav === 'refunds' && <RefundsPage permissions={admin.permissions} />}
+          {activeNav === 'customers' && <CustomersPage />}
           {activeNav === 'bots' && <BotsPage permissions={admin.permissions} />}
           {activeNav === 'bot-demo' && <BotDemoPage admin={admin} />}
           {activeNav === 'logs' && <LogsPage />}

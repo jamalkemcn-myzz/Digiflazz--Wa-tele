@@ -1194,3 +1194,127 @@ export function previewOrderDryRun(input: {
   };
 }
 
+export const MIN_CUSTOMER_CANCEL_DELAY_MS = 30_000;
+
+export async function cancelCustomerTransaction(
+  input: {
+    platform: CustomerPlatform;
+    platformUserId: string;
+    transactionId?: string;
+  },
+  gateway: PaymentGatewayPort = defaultPaymentGateway
+): Promise<{
+  ok: boolean;
+  code?: 'NOT_FOUND' | 'TOO_EARLY' | 'NOT_CANCELLABLE' | 'ALREADY_PAID';
+  remainingWaitSeconds?: number;
+  errorMessage?: string;
+  transaction?: TransactionRow;
+}> {
+  const resolved = findCustomerByPlatform({
+    platform: input.platform,
+    platformUserId: input.platformUserId,
+  });
+
+  if (!resolved) {
+    return {
+      ok: false,
+      code: 'NOT_FOUND',
+      errorMessage: 'Belum ada pesanan aktif yang dapat dibatalkan saat ini.',
+    };
+  }
+
+  const db = getDb();
+  const tx = input.transactionId
+    ? (db
+        .prepare('SELECT * FROM transactions WHERE transaction_id = ? AND customer_id = ?')
+        .get(input.transactionId.trim(), resolved.customer.id) as TransactionRow | undefined)
+    : (db
+        .prepare(
+          `SELECT * FROM transactions
+           WHERE customer_id = ? AND transaction_status IN ('CREATED', 'PENDING_PAYMENT', 'PAYMENT_PROCESSING')
+           ORDER BY id DESC LIMIT 1`
+        )
+        .get(resolved.customer.id) as TransactionRow | undefined);
+
+  if (!tx) {
+    return {
+      ok: false,
+      code: 'NOT_FOUND',
+      errorMessage: input.transactionId
+        ? `Pesanan ${input.transactionId} tidak ditemukan pada akun Anda.`
+        : 'Tidak ada pesanan yang menunggu pembayaran untuk dibatalkan.',
+    };
+  }
+
+  if (
+    tx.payment_status === 'PAID' ||
+    !['CREATED', 'PENDING_PAYMENT', 'PAYMENT_PROCESSING'].includes(tx.transaction_status)
+  ) {
+    return {
+      ok: false,
+      code: 'NOT_CANCELLABLE',
+      errorMessage: `Pesanan ${tx.transaction_id} tidak dapat dibatalkan karena status saat ini sudah ${tx.transaction_status}.`,
+    };
+  }
+
+  const elapsedMs = Date.now() - new Date(tx.created_at).getTime();
+  if (elapsedMs < MIN_CUSTOMER_CANCEL_DELAY_MS) {
+    const remainingWaitSeconds = Math.max(1, Math.ceil((MIN_CUSTOMER_CANCEL_DELAY_MS - elapsedMs) / 1000));
+    return {
+      ok: false,
+      code: 'TOO_EARLY',
+      remainingWaitSeconds,
+      errorMessage: `Pembatalan pesanan minimal dilakukan 30 detik setelah pesanan dibuat. Mohon tunggu ${remainingWaitSeconds} detik lagi ya Kak.`,
+      transaction: tx,
+    };
+  }
+
+  if (tx.gateway_reference) {
+    const check = await gateway.checkPaymentStatus(tx.gateway_reference, tx.transaction_id);
+    if (check.mappedStatus === 'PAID') {
+      handleVerifiedPaymentPaid(
+        tx.transaction_id,
+        'CUSTOMER_CANCEL_VERIFY',
+        check.paidAt,
+        tx.gateway_reference
+      );
+      return {
+        ok: false,
+        code: 'ALREADY_PAID',
+        errorMessage: `Pembayaran untuk ${tx.transaction_id} sudah diterima LUNAS sehingga pesanan sedang diproses.`,
+      };
+    }
+    await gateway.cancelPayment(tx.gateway_reference, tx.transaction_id).catch(() => undefined);
+  }
+
+  const now = new Date().toISOString();
+  const cancelled = transitionTransactionStatus(
+    tx.transaction_id,
+    'CANCELLED',
+    `${input.platform}_CUSTOMER_CANCEL`,
+    'Pesanan dibatalkan oleh pelanggan',
+    { paymentStatus: 'CANCELLED', completedAt: now }
+  );
+
+  setCustomerCooldown(tx.customer_id, 'CUSTOMER_CANCELLED', tx.transaction_id);
+
+  const { deleteQrMessagesForTransaction } = await import('./payment.service');
+  await deleteQrMessagesForTransaction(cancelled).catch(() => undefined);
+
+  emitTransactionLogToGroups({
+    eventKey: 'cancelled',
+    transactionId: cancelled.transaction_id,
+    customerCode: resolved.customer.customer_code,
+    productName: cancelled.product_name_snapshot,
+    amount: cancelled.payment_amount,
+    status: 'CANCELLED',
+    note: `Dibatalkan oleh pelanggan via ${input.platform}`,
+  });
+
+  return {
+    ok: true,
+    transaction: cancelled,
+  };
+}
+
+
