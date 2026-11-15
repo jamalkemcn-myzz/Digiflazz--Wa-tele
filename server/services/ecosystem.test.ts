@@ -1112,7 +1112,59 @@ test('MyZZStoreGateway uses GET /create-qris and /check-payment, extracts data.t
   }
 });
 
+test('sendTelegramQrisInvoice recovers from Telegraf sendPhoto socket hang up via direct IPv4 Content-Length upload', async () => {
+  const { sendTelegramQrisInvoice } = await import('../bots/telegram.notification.service');
+  let receivedContentLength: string | undefined;
+  let receivedRawBody = '';
+
+  const mockTgServer = http.createServer((req, res) => {
+    receivedContentLength = req.headers['content-length'];
+    const chunks: Buffer[] = [];
+    req.on('data', (c: Buffer) => chunks.push(c));
+    req.on('end', () => {
+      receivedRawBody = Buffer.concat(chunks).toString('utf8');
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, result: { message_id: 4242 } }));
+    });
+  });
+
+  await new Promise<void>((resolve) => mockTgServer.listen(0, '127.0.0.1', resolve));
+  const port = (mockTgServer.address() as { port: number }).port;
+
+  let textFallbackCalled = false;
+  const fakeBot = {
+    telegram: {
+      token: '999999:testtoken',
+      options: { apiRoot: `http://127.0.0.1:${port}` },
+      async sendPhoto() {
+        throw new Error('request to https://api.telegram.org/bot999999:[REDACTED]/sendPhoto failed, reason: socket hang up');
+      },
+      async sendMessage() {
+        textFallbackCalled = true;
+        return { message_id: 1 };
+      },
+    },
+  } as unknown as import('telegraf').Telegraf;
+
+  try {
+    const msgId = await sendTelegramQrisInvoice(
+      fakeBot,
+      '123456789',
+      'Invoice QRIS #1',
+      { qrString: '00020101021226TEST' }
+    );
+    assert.equal(msgId, 4242);
+    assert.equal(textFallbackCalled, false);
+    assert.ok(Number(receivedContentLength) > 0);
+    assert.match(receivedRawBody, /name="photo"; filename="qris\.png"/);
+    assert.match(receivedRawBody, /Invoice QRIS #1/);
+  } finally {
+    await new Promise<void>((resolve) => mockTgServer.close(() => resolve()));
+  }
+});
+
 test.after(() => {
   closeDb();
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
+

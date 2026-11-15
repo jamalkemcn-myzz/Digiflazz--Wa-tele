@@ -1,3 +1,4 @@
+import https from 'node:https';
 import { Telegraf } from 'telegraf';
 import { config } from '../config/env';
 import { logger } from '../logging/logger';
@@ -44,7 +45,17 @@ class TelegramService {
 
     this.state = 'STARTING';
     try {
-      const bot = new Telegraf(config.telegram.botToken);
+      const telegramAgent = new https.Agent({
+        keepAlive: false,
+        autoSelectFamily: true,
+        timeout: 30_000,
+      });
+      const bot = new Telegraf(config.telegram.botToken, {
+        telegram: {
+          agent: telegramAgent,
+          attachmentAgent: telegramAgent,
+        },
+      });
 
       bot.catch((err) => {
         const msg = err instanceof Error ? err.message : 'Telegram update error';
