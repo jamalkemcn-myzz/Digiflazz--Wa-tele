@@ -78,9 +78,6 @@ export class MyZZStoreGateway implements PaymentGatewayPort {
   getMissingConfiguration(): string[] {
     const missing: string[] = [];
     if (!config.paymentGateway.apiKey) missing.push('PAYMENT_GATEWAY_API_KEY');
-    if (!config.paymentGateway.secret) missing.push('PAYMENT_GATEWAY_SECRET');
-    if (!config.paymentGateway.merchantId) missing.push('PAYMENT_GATEWAY_MERCHANT_ID');
-    if (!config.paymentGateway.callbackSecret) missing.push('PAYMENT_GATEWAY_CALLBACK_SECRET');
     if (!config.paymentGateway.createPath) missing.push('PAYMENT_GATEWAY_CREATE_PATH');
     if (!config.paymentGateway.statusPath) missing.push('PAYMENT_GATEWAY_STATUS_PATH');
     return missing;
@@ -233,7 +230,9 @@ export class MyZZStoreGateway implements PaymentGatewayPort {
     const urlObj = new URL(
       `${config.paymentGateway.baseUrl}${createPath.startsWith('/') ? '' : '/'}${createPath}`
     );
-    urlObj.searchParams.set('merchant_id', config.paymentGateway.merchantId);
+    if (config.paymentGateway.merchantId) {
+      urlObj.searchParams.set('merchant_id', config.paymentGateway.merchantId);
+    }
     urlObj.searchParams.set('order_id', input.transactionId);
     urlObj.searchParams.set('amount', String(input.amount));
     if (config.paymentGateway.apiKey) {
@@ -243,24 +242,31 @@ export class MyZZStoreGateway implements PaymentGatewayPort {
     urlObj.searchParams.set('description', input.productName);
     urlObj.searchParams.set('customer_code', input.customerCode);
     urlObj.searchParams.set('expired_at', input.expiredAt);
-    urlObj.searchParams.set('callback_url', input.callbackUrl);
+    if (input.callbackUrl) {
+      urlObj.searchParams.set('callback_url', input.callbackUrl);
+    }
 
-    const timestamp = Math.floor(Date.now() / 1000).toString();
-    const signature = crypto
-      .createHmac('sha256', config.paymentGateway.secret)
-      .update(`${config.paymentGateway.merchantId}:${input.transactionId}:${input.amount}:${timestamp}`)
-      .digest('hex');
+    const headers: Record<string, string> = {
+      Accept: 'application/json',
+      'X-Api-Key': config.paymentGateway.apiKey,
+    };
+    if (config.paymentGateway.merchantId) {
+      headers['X-Merchant-Id'] = config.paymentGateway.merchantId;
+    }
+    if (config.paymentGateway.secret) {
+      const timestamp = Math.floor(Date.now() / 1000).toString();
+      const signature = crypto
+        .createHmac('sha256', config.paymentGateway.secret)
+        .update(`${config.paymentGateway.merchantId || ''}:${input.transactionId}:${input.amount}:${timestamp}`)
+        .digest('hex');
+      headers['X-Timestamp'] = timestamp;
+      headers['X-Signature'] = signature;
+    }
 
     try {
       const response = await fetch(urlObj.toString(), {
         method: 'GET',
-        headers: {
-          Accept: 'application/json',
-          'X-Api-Key': config.paymentGateway.apiKey,
-          'X-Merchant-Id': config.paymentGateway.merchantId,
-          'X-Timestamp': timestamp,
-          'X-Signature': signature,
-        },
+        headers,
         signal: AbortSignal.timeout(config.paymentGateway.timeoutMs),
       });
 
@@ -377,13 +383,16 @@ export class MyZZStoreGateway implements PaymentGatewayPort {
     );
 
     try {
+      const headers: Record<string, string> = {
+        Accept: 'application/json',
+        'X-Api-Key': config.paymentGateway.apiKey,
+      };
+      if (config.paymentGateway.merchantId) {
+        headers['X-Merchant-Id'] = config.paymentGateway.merchantId;
+      }
       const response = await fetch(urlObj.toString(), {
         method: 'GET',
-        headers: {
-          Accept: 'application/json',
-          'X-Api-Key': config.paymentGateway.apiKey,
-          'X-Merchant-Id': config.paymentGateway.merchantId,
-        },
+        headers,
         signal: AbortSignal.timeout(config.paymentGateway.timeoutMs),
       });
 
@@ -533,7 +542,12 @@ export class MyZZStoreGateway implements PaymentGatewayPort {
     const cancelUrlObj = new URL(
       `${config.paymentGateway.baseUrl}${config.paymentGateway.cancelPath.startsWith('/') ? '' : '/'}${config.paymentGateway.cancelPath}`
     );
-    cancelUrlObj.searchParams.set('merchant_id', config.paymentGateway.merchantId);
+    if (config.paymentGateway.merchantId) {
+      cancelUrlObj.searchParams.set('merchant_id', config.paymentGateway.merchantId);
+    }
+    if (config.paymentGateway.apiKey) {
+      cancelUrlObj.searchParams.set('api_key', config.paymentGateway.apiKey);
+    }
     if (gatewayReference) {
       cancelUrlObj.searchParams.set('trx_id', gatewayReference);
     }
@@ -541,13 +555,16 @@ export class MyZZStoreGateway implements PaymentGatewayPort {
       cancelUrlObj.searchParams.set('order_id', transactionId);
     }
     try {
+      const headers: Record<string, string> = {
+        Accept: 'application/json',
+        'X-Api-Key': config.paymentGateway.apiKey,
+      };
+      if (config.paymentGateway.merchantId) {
+        headers['X-Merchant-Id'] = config.paymentGateway.merchantId;
+      }
       const response = await fetch(cancelUrlObj.toString(), {
         method: 'GET',
-        headers: {
-          Accept: 'application/json',
-          'X-Api-Key': config.paymentGateway.apiKey,
-          'X-Merchant-Id': config.paymentGateway.merchantId,
-        },
+        headers,
         signal: AbortSignal.timeout(config.paymentGateway.timeoutMs),
       });
 

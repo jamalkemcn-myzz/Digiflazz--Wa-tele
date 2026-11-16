@@ -117,9 +117,8 @@ export function toMarkupKeyboard(buttons?: TelegramInlineButton[][]) {
 
 export async function clearTrackedTelegramMessages(bot: Telegraf, chatId: string | number): Promise<void> {
   const prevIds = consumeTelegramBotMessageIds(chatId);
-  for (const msgId of prevIds) {
-    await deleteTelegramMessageSafely(bot, chatId, msgId);
-  }
+  if (prevIds.length === 0) return;
+  await Promise.allSettled(prevIds.map((msgId) => deleteTelegramMessageSafely(bot, chatId, msgId)));
 }
 
 function createTelegrafTransport(bot: Telegraf, ctx: Context): TelegramReplyTransport {
@@ -1005,14 +1004,13 @@ export function registerTelegramCommands(bot: Telegraf): void {
     const text = (ctx.message && 'text' in ctx.message ? ctx.message.text : '') || '';
     if (!text.trim()) return;
     const chatId = ctx.chat?.id ?? ctx.from.id;
-    if (chatId) {
-      await clearTrackedTelegramMessages(bot, chatId);
-    }
+    const cleanupPromise = chatId ? clearTrackedTelegramMessages(bot, chatId) : Promise.resolve();
     await dispatchTelegramCommand(createTelegrafTransport(bot, ctx), {
       userId: String(ctx.from.id),
       username: ctx.from.username || ctx.from.first_name || null,
       text,
     });
+    await cleanupPromise;
   };
 
   bot.command(

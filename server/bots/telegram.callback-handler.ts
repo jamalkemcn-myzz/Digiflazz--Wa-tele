@@ -361,7 +361,19 @@ export function registerTelegramCallbacks(bot: Telegraf): void {
   bot.on('callback_query', async (ctx) => {
     const data = ctx.callbackQuery && 'data' in ctx.callbackQuery ? ctx.callbackQuery.data : '';
     const chatId = ctx.chat?.id ?? ctx.callbackQuery?.message?.chat.id ?? ctx.from?.id;
+    let answered = false;
     let deleted = false;
+
+    const answerOnce = async () => {
+      if (answered) return;
+      answered = true;
+      await ctx.answerCbQuery().catch(() => undefined);
+    };
+
+    // Immediately acknowledge callback so Telegram removes the button loading spinner right away
+    void answerOnce();
+
+    let cleanupPromise: Promise<void> | null = null;
     const transport: TelegramReplyTransport = {
       async reply(text: string, buttons?: TelegramInlineButton[][]) {
         const sent = await ctx.reply(text, toMarkupKeyboard(buttons));
@@ -371,6 +383,7 @@ export function registerTelegramCallbacks(bot: Telegraf): void {
       },
       async sendQris(caption: string, qris?: { qrString?: string; qrUrl?: string }, buttons?: TelegramInlineButton[][]) {
         if (!chatId) return null;
+        await ctx.telegram.sendChatAction(chatId, 'upload_photo').catch(() => undefined);
         const msgId = await sendTelegramQrisInvoice(bot, chatId, caption, qris, toMarkupKeyboard(buttons));
         if (msgId) {
           recordTelegramBotMessageId(chatId, msgId);
@@ -378,15 +391,15 @@ export function registerTelegramCallbacks(bot: Telegraf): void {
         return msgId;
       },
       async answerCbQuery() {
-        await ctx.answerCbQuery().catch(() => undefined);
+        await answerOnce();
       },
       async deleteSourceMessage() {
         if (deleted) return;
         deleted = true;
-        await ctx.deleteMessage().catch(() => undefined);
-        if (chatId) {
-          await clearTrackedTelegramMessages(bot, chatId);
-        }
+        cleanupPromise = Promise.allSettled([
+          ctx.deleteMessage().catch(() => undefined),
+          chatId ? clearTrackedTelegramMessages(bot, chatId) : Promise.resolve(),
+        ]).then(() => undefined);
       },
     };
     await dispatchTelegramCallback(transport, {
@@ -394,5 +407,8 @@ export function registerTelegramCallbacks(bot: Telegraf): void {
       userId: ctx.from ? String(ctx.from.id) : null,
       username: ctx.from ? ctx.from.username || ctx.from.first_name || null : null,
     });
+    if (cleanupPromise) {
+      await cleanupPromise;
+    }
   });
 }

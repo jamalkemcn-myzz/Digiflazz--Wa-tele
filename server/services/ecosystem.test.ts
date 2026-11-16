@@ -1494,6 +1494,60 @@ test('Digiflazz HTTP 400 JSON body parsing: preserves real RC/message and resolv
   }
 });
 
+test('Timezone Jakarta normalization, api_key-only MyZZStore gateway (no merchantId/secret/callbackSecret), and Telegram webhook endpoint', async () => {
+  const { validateAndLoadConfig, getIntegrationReadiness } = await import('../config/env');
+  const normalizedCfg = validateAndLoadConfig({
+    ...process.env,
+    APP_TIMEZONE: 'Jakarta',
+    PAYMENT_GATEWAY_API_KEY: 'only-api-key',
+    PAYMENT_GATEWAY_SECRET: '',
+    PAYMENT_GATEWAY_MERCHANT_ID: '',
+    PAYMENT_GATEWAY_CALLBACK_SECRET: '',
+  });
+  assert.equal(normalizedCfg.timezone, 'Asia/Jakarta');
+  const readiness = getIntegrationReadiness(normalizedCfg);
+  assert.equal(readiness.myzzstore.configured, true);
+  assert.deepEqual(readiness.myzzstore.missingFields, []);
+
+  // Verify MyZZStoreGateway works cleanly without secret, merchantId, or callbackSecret
+  process.env.PAYMENT_GATEWAY_SECRET = '';
+  process.env.PAYMENT_GATEWAY_MERCHANT_ID = '';
+  process.env.PAYMENT_GATEWAY_CALLBACK_SECRET = '';
+  process.env.PAYMENT_GATEWAY_API_KEY = 'only-api-key';
+  refreshConfig(process.env);
+  const gw = new MyZZStoreGateway();
+  assert.equal(gw.isConfigured(), true);
+  assert.deepEqual(gw.getMissingConfiguration(), []);
+
+  const app = createExpressApp();
+  const server = await new Promise<http.Server>((resolve) => {
+    const s = app.listen(0, '127.0.0.1', () => resolve(s));
+  });
+  try {
+    const port = (server.address() as { port: number }).port;
+    const webhookRes = await fetch(`http://127.0.0.1:${port}/api/telegram/webhook`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ update_id: 123456 }),
+    });
+    // Returns 503 cleanly when Telegram bot is disabled in test env (route is active and mounted)
+    assert.equal(webhookRes.status, 503);
+
+    // Verify LogsPage audit summary endpoint (limit=5) works cleanly
+    const authHeader = `Basic ${Buffer.from('testowner:test-strong-password-999').toString('base64')}`;
+    const auditRes = await fetch(`http://127.0.0.1:${port}/api/admin/logs?type=audit&page=1&limit=5`, {
+      headers: { Authorization: authHeader },
+    });
+    assert.equal(auditRes.status, 200);
+    const auditJson = (await auditRes.json()) as { ok: boolean; data: { items: unknown[] } };
+    assert.equal(auditJson.ok, true);
+    assert.ok(Array.isArray(auditJson.data.items));
+    assert.ok(auditJson.data.items.length <= 5);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
 test.after(() => {
   closeDb();
   fs.rmSync(tempDir, { recursive: true, force: true });

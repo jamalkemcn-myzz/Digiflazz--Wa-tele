@@ -200,6 +200,14 @@ export function createExpressApp() {
   // Payment Gateway Callback Endpoint
   app.post('/api/webhooks/myzzstore', webhookRateLimiter, handleMyZZStoreCallback);
 
+  // Telegram Bot Webhook Endpoint
+  app.post(config.telegram.webhookPath, webhookRateLimiter, async (req: Request, res: Response) => {
+    const secretHeader = req.headers['x-telegram-bot-api-secret-token'];
+    const tokenValue = Array.isArray(secretHeader) ? secretHeader[0] : secretHeader;
+    const result = await telegramService.handleWebhookUpdate(req.body, tokenValue);
+    res.status(result.statusCode).json(result.ok ? { ok: true } : { ok: false, error: result.error });
+  });
+
   // Admin REST API
   app.use('/api/admin', adminRouter);
 

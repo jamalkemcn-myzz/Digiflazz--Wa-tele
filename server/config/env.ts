@@ -49,6 +49,10 @@ export interface AppConfig {
   telegram: {
     enabled: boolean;
     botToken: string;
+    mode: 'webhook' | 'polling';
+    webhookUrl: string;
+    webhookSecret: string;
+    webhookPath: string;
     serviceLogChatId: string;
     transactionLogChatId: string;
   };
@@ -115,6 +119,26 @@ function parseUrl(name: string, value: string | undefined, fallback: string): st
     return raw.replace(/\/+$/, '');
   } catch {
     throw new Error(`Environment variable ${name} is not a valid URL`);
+  }
+}
+
+function normalizeTimezone(raw?: string): string {
+  const trimmed = (raw ?? '').trim();
+  if (!trimmed) return 'Asia/Jakarta';
+  const aliasMap: Record<string, string> = {
+    jakarta: 'Asia/Jakarta',
+    wib: 'Asia/Jakarta',
+    makassar: 'Asia/Makassar',
+    wita: 'Asia/Makassar',
+    jayapura: 'Asia/Jayapura',
+    wit: 'Asia/Jayapura',
+  };
+  const candidate = aliasMap[trimmed.toLowerCase()] || trimmed;
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: candidate }).format(new Date());
+    return candidate;
+  } catch {
+    return 'Asia/Jakarta';
   }
 }
 
@@ -248,7 +272,7 @@ export function validateAndLoadConfig(env: NodeJS.ProcessEnv = process.env): App
   return {
     nodeEnv,
     port,
-    timezone: (env.APP_TIMEZONE || 'Asia/Jakarta').trim(),
+    timezone: normalizeTimezone(env.APP_TIMEZONE),
     logLevel,
     appUrl,
     database: {
@@ -290,6 +314,10 @@ export function validateAndLoadConfig(env: NodeJS.ProcessEnv = process.env): App
     telegram: {
       enabled: tgEnabled,
       botToken: (env.TELEGRAM_BOT_TOKEN || '').trim(),
+      mode: (env.TELEGRAM_MODE || 'webhook').trim().toLowerCase() === 'polling' ? 'polling' : 'webhook',
+      webhookUrl: (env.TELEGRAM_WEBHOOK_URL || '').trim().replace(/\/+$/, ''),
+      webhookSecret: (env.TELEGRAM_WEBHOOK_SECRET || '').trim(),
+      webhookPath: '/api/telegram/webhook',
       serviceLogChatId: (env.TELEGRAM_SERVICE_LOG_CHAT_ID || '').trim(),
       transactionLogChatId: (env.TELEGRAM_TRANSACTION_LOG_CHAT_ID || '').trim(),
     },
@@ -358,9 +386,6 @@ export interface IntegrationReadiness {
 export function getIntegrationReadiness(cfg: AppConfig = config): IntegrationReadiness {
   const myzzMissing: string[] = [];
   if (!cfg.paymentGateway.apiKey) myzzMissing.push('PAYMENT_GATEWAY_API_KEY');
-  if (!cfg.paymentGateway.secret) myzzMissing.push('PAYMENT_GATEWAY_SECRET');
-  if (!cfg.paymentGateway.merchantId) myzzMissing.push('PAYMENT_GATEWAY_MERCHANT_ID');
-  if (!cfg.paymentGateway.callbackSecret) myzzMissing.push('PAYMENT_GATEWAY_CALLBACK_SECRET');
   if (!cfg.paymentGateway.createPath) myzzMissing.push('PAYMENT_GATEWAY_CREATE_PATH');
   if (!cfg.paymentGateway.statusPath) myzzMissing.push('PAYMENT_GATEWAY_STATUS_PATH');
 
@@ -371,12 +396,7 @@ export function getIntegrationReadiness(cfg: AppConfig = config): IntegrationRea
   return {
     dashboardAuthConfigured: Boolean(cfg.auth.dashboardUser && cfg.auth.dashboardPassword),
     myzzstore: {
-      configured: Boolean(
-        cfg.paymentGateway.apiKey &&
-          cfg.paymentGateway.secret &&
-          cfg.paymentGateway.merchantId &&
-          cfg.paymentGateway.callbackSecret
-      ),
+      configured: Boolean(cfg.paymentGateway.apiKey),
       apiSpecConfigured: Boolean(cfg.paymentGateway.createPath && cfg.paymentGateway.statusPath),
       baseUrl: cfg.paymentGateway.baseUrl,
       missingFields: myzzMissing,

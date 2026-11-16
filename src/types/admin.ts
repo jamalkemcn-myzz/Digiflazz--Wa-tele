@@ -60,6 +60,9 @@ export interface OverviewData {
       enabled: boolean;
       tokenConfigured: boolean;
       state: string;
+      mode?: string;
+      webhookUrl?: string | null;
+      webhookPath?: string;
       botUsername: string | null;
       lastError: string | null;
       startedAt: string | null;

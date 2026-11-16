@@ -101,7 +101,9 @@ export function OverviewPage() {
       name: 'Telegram Bot (Telegraf)',
       ok: services.telegram.state === 'CONNECTED',
       stateText: services.telegram.state,
-      detail: services.telegram.botUsername ? `@${services.telegram.botUsername}` : services.telegram.lastError || 'Nonaktif / token belum diisi',
+      detail: services.telegram.botUsername
+        ? `@${services.telegram.botUsername} (${services.telegram.mode || 'WEBHOOK'})`
+        : services.telegram.lastError || 'Nonaktif / token belum diisi',
     },
     {
       name: 'Payment Gateway MyZZStore',
