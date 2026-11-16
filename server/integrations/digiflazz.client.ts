@@ -53,6 +53,34 @@ export function mapDigiflazzStatus(rawStatus?: string): DigiflazzMappedStatus {
   return 'UNKNOWN';
 }
 
+// Digiflazz definitive pre-execution / validation rejection response codes (never 03=Pending, 47=Duplicate/Exists, 99=Router Issue)
+const DEFINITIVE_DIGIFLAZZ_REJECTION_RCS = new Set([
+  '40', '41', '42', '43', '44', '45', '46', '49',
+  '50', '51', '52', '53', '54', '55', '56', '57', '58', '59',
+  '60', '61', '62', '63', '64', '65', '66', '67', '68', '69',
+  '70', '71', '72', '73', '74',
+  '80', '81', '82', '83', '84', '85', '86',
+]);
+
+function formatDigiflazzErrorMessage(params: {
+  httpStatus: number;
+  rc?: string;
+  message?: string;
+}): string {
+  const rcPart = params.rc ? `RC ${params.rc}` : '';
+  const msgPart = (params.message || '').trim();
+  if (rcPart && msgPart) {
+    return `[${rcPart}] ${msgPart}`;
+  }
+  if (msgPart) {
+    return params.httpStatus >= 400 ? `Digiflazz HTTP ${params.httpStatus}: ${msgPart}` : msgPart;
+  }
+  if (rcPart) {
+    return `Digiflazz HTTP ${params.httpStatus} [${rcPart}]`;
+  }
+  return `Digiflazz HTTP ${params.httpStatus}`;
+}
+
 export class DigiflazzClient implements DigiflazzPort {
   isConfigured(): boolean {
     return Boolean(config.digiflazz.username && config.digiflazz.apiKey);
@@ -65,7 +93,10 @@ export class DigiflazzClient implements DigiflazzPort {
       .digest('hex');
   }
 
-  private async postJson<T>(endpointPath: string, payload: Record<string, unknown>): Promise<T> {
+  private async postJsonRaw<T>(
+    endpointPath: string,
+    payload: Record<string, unknown>
+  ): Promise<{ httpOk: boolean; httpStatus: number; body: T | null; rawText?: string }> {
     const url = `${config.digiflazz.baseUrl}${endpointPath}`;
     const response = await fetch(url, {
       method: 'POST',
@@ -76,11 +107,22 @@ export class DigiflazzClient implements DigiflazzPort {
       signal: AbortSignal.timeout(config.digiflazz.timeoutMs),
     });
 
-    const data = await response.json().catch(() => null);
-    if (!response.ok || !data) {
-      throw new Error(`Digiflazz HTTP ${response.status}`);
+    const rawText = await response.text().catch(() => '');
+    let parsed: T | null = null;
+    if (rawText) {
+      try {
+        parsed = JSON.parse(rawText) as T;
+      } catch {
+        parsed = null;
+      }
     }
-    return data as T;
+
+    return {
+      httpOk: response.ok,
+      httpStatus: response.status,
+      body: parsed,
+      rawText: rawText ? rawText.slice(0, 300) : undefined,
+    };
   }
 
   async fetchPriceList(): Promise<{ ok: boolean; items: DigiflazzPriceItem[]; errorMessage?: string }> {
@@ -93,18 +135,31 @@ export class DigiflazzClient implements DigiflazzPort {
     }
 
     try {
-      const res = await this.postJson<{ data?: DigiflazzPriceItem[] | { message?: string } }>('/price-list', {
+      const res = await this.postJsonRaw<{
+        message?: string;
+        data?: DigiflazzPriceItem[] | { message?: string; rc?: string };
+      }>('/price-list', {
         cmd: 'prepaid',
         username: config.digiflazz.username,
         sign: this.sign('pricelist'),
       });
 
-      if (!Array.isArray(res.data)) {
-        const msg = (res.data as { message?: string } | undefined)?.message || 'Format respons price-list Digiflazz tidak valid';
+      if (!res.httpOk || !res.body || !Array.isArray(res.body.data)) {
+        const dataObj =
+          res.body?.data && !Array.isArray(res.body.data) ? res.body.data : undefined;
+        const msg = formatDigiflazzErrorMessage({
+          httpStatus: res.httpStatus,
+          rc: dataObj?.rc,
+          message: dataObj?.message || res.body?.message || res.rawText || 'Format respons price-list Digiflazz tidak valid',
+        });
+        logger.warn('Digiflazz fetchPriceList failed', {
+          service: 'digiflazz',
+          details: { httpStatus: res.httpStatus, error: msg },
+        });
         return { ok: false, items: [], errorMessage: msg };
       }
 
-      return { ok: true, items: res.data };
+      return { ok: true, items: res.body.data };
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Gagal mengambil price list Digiflazz';
       logger.error('Digiflazz fetchPriceList failed', {
@@ -130,7 +185,10 @@ export class DigiflazzClient implements DigiflazzPort {
     }
 
     try {
-      const res = await this.postJson<{
+      const res = await this.postJsonRaw<{
+        message?: string;
+        rc?: string;
+        status?: string;
         data?: {
           ref_id?: string;
           status?: string;
@@ -147,26 +205,75 @@ export class DigiflazzClient implements DigiflazzPort {
         sign: this.sign(params.refId),
       });
 
-      const d = res.data;
-      if (!d || typeof d !== 'object') {
+      const d = res.body?.data && typeof res.body.data === 'object' ? res.body.data : undefined;
+      const rc = d?.rc ?? res.body?.rc;
+      const rawStatus = d?.status ?? res.body?.status;
+      const rawMessage = d?.message ?? res.body?.message ?? (!res.body ? res.rawText : undefined);
+
+      if (!d && !res.body) {
+        const msg = formatDigiflazzErrorMessage({ httpStatus: res.httpStatus, message: rawMessage });
+        logger.warn('Digiflazz empty/non-JSON response; marking UNKNOWN', {
+          service: 'digiflazz',
+          transactionId: params.refId,
+          details: { httpStatus: res.httpStatus, error: msg },
+        });
         return {
           ok: false,
           mappedStatus: 'UNKNOWN',
           refId: params.refId,
-          errorMessage: 'Respons transaksi Digiflazz tidak valid',
+          errorMessage: msg,
         };
       }
 
-      const mappedStatus = mapDigiflazzStatus(d.status);
+      let mappedStatus = mapDigiflazzStatus(rawStatus);
+      // Guard: RC 99 = Digiflazz router/server issue (never treat as definitive FAILED); RC 03 = Pending
+      if (rc === '99') {
+        mappedStatus = 'UNKNOWN';
+      } else if (rc === '03' && mappedStatus === 'UNKNOWN') {
+        mappedStatus = 'PENDING';
+      } else if (
+        mappedStatus === 'UNKNOWN' &&
+        res.httpStatus >= 400 &&
+        res.httpStatus < 500 &&
+        rc &&
+        DEFINITIVE_DIGIFLAZZ_REJECTION_RCS.has(String(rc).trim())
+      ) {
+        mappedStatus = 'FAILED';
+      }
+
+      const formattedMsg = formatDigiflazzErrorMessage({
+        httpStatus: res.httpStatus,
+        rc,
+        message: rawMessage,
+      });
+
+      if (!res.httpOk || mappedStatus !== 'SUCCESS') {
+        logger.warn('Digiflazz transaction/inquiry response', {
+          service: 'digiflazz',
+          transactionId: params.refId,
+          details: {
+            httpStatus: res.httpStatus,
+            mappedStatus,
+            rawStatus: rawStatus || null,
+            rc: rc || null,
+            message: formattedMsg,
+          },
+        });
+      }
+
       return {
-        ok: true,
+        ok: mappedStatus !== 'UNKNOWN',
         mappedStatus,
-        refId: d.ref_id || params.refId,
-        rc: d.rc,
-        rawStatus: d.status,
-        sn: d.sn ? String(d.sn).slice(0, 200) : undefined,
-        message: d.message ? String(d.message).slice(0, 250) : undefined,
-        price: typeof d.price === 'number' ? d.price : undefined,
+        refId: d?.ref_id || params.refId,
+        rc,
+        rawStatus,
+        sn: d?.sn ? String(d.sn).slice(0, 200) : undefined,
+        message: (mappedStatus === 'FAILED' || mappedStatus === 'UNKNOWN'
+          ? formattedMsg
+          : rawMessage || 'Sukses'
+        ).slice(0, 250),
+        price: typeof d?.price === 'number' ? d.price : undefined,
+        errorMessage: mappedStatus === 'UNKNOWN' ? formattedMsg.slice(0, 250) : undefined,
       };
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Digiflazz request error';
@@ -206,15 +313,25 @@ export class DigiflazzClient implements DigiflazzPort {
       return { ok: false, errorMessage: 'Kredensial Digiflazz belum dikonfigurasi' };
     }
     try {
-      const res = await this.postJson<{ data?: { deposit?: number; message?: string } }>('/cek-saldo', {
+      const res = await this.postJsonRaw<{
+        message?: string;
+        data?: { deposit?: number; message?: string; rc?: string };
+      }>('/cek-saldo', {
         cmd: 'deposit',
         username: config.digiflazz.username,
         sign: this.sign('depo'),
       });
-      if (typeof res.data?.deposit === 'number') {
-        return { ok: true, balance: res.data.deposit };
+      if (res.httpOk && typeof res.body?.data?.deposit === 'number') {
+        return { ok: true, balance: res.body.data.deposit };
       }
-      return { ok: false, errorMessage: res.data?.message || 'Saldo tidak tersedia' };
+      return {
+        ok: false,
+        errorMessage: formatDigiflazzErrorMessage({
+          httpStatus: res.httpStatus,
+          rc: res.body?.data?.rc,
+          message: res.body?.data?.message || res.body?.message || res.rawText || 'Saldo tidak tersedia',
+        }),
+      };
     } catch (err) {
       return { ok: false, errorMessage: err instanceof Error ? err.message : 'Cek saldo gagal' };
     }

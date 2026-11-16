@@ -359,6 +359,15 @@ export function TransactionsPage({ permissions }: { permissions: string[] }) {
                   </div>
                 </div>
 
+                {selectedDetail.transaction.supplier_message && (
+                  <div className="p-3 rounded-lg bg-[#0f1727] border border-[#1f2b42] text-xs">
+                    <p className="text-slate-400 mb-0.5">Pesan Supplier</p>
+                    <p className="font-mono text-slate-200 break-words">
+                      {selectedDetail.transaction.supplier_message}
+                    </p>
+                  </div>
+                )}
+
                 {permissions.includes('transactions:reconcile') && (
                   <div className="flex items-center justify-between pt-3 border-t border-[#1f2b42]">
                     <span className="text-xs text-slate-400">

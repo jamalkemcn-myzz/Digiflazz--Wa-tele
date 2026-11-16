@@ -869,6 +869,17 @@ export async function processSingleSupplierJob(
         supplierMessage: resp.errorMessage ?? 'Status belum pasti',
       }
     );
+  } else if (resp.errorMessage || resp.message) {
+    db.prepare(
+      `UPDATE transactions
+       SET supplier_message = ?, supplier_reference = COALESCE(?, supplier_reference), updated_at = ?
+       WHERE transaction_id = ?`
+    ).run(
+      (resp.errorMessage || resp.message || 'Status belum pasti').slice(0, 250),
+      resp.refId || null,
+      finishNow,
+      tx.transaction_id
+    );
   }
 
   logger.warn('Supplier job marked UNKNOWN for safe inquiry reconciliation', {

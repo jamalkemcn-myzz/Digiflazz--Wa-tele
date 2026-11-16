@@ -57,7 +57,7 @@ import { MyZZStoreGateway, type PaymentGatewayPort, type GatewayPaymentState } f
 import { fetchQrisImageBuffer } from '../integrations/qris-image';
 import { runDigiflazzPriceSync } from '../integrations/digiflazz.price-sync';
 import { DigiflazzService } from '../integrations/digiflazz.service';
-import type { DigiflazzPort, DigiflazzTxResponse } from '../integrations/digiflazz.client';
+import { DigiflazzClient, type DigiflazzPort, type DigiflazzTxResponse } from '../integrations/digiflazz.client';
 
 class TestPaymentGateway implements PaymentGatewayPort {
   public createCalls = 0;
@@ -1413,6 +1413,84 @@ test('Gateway trx_id polling, ?format=raw QRIS download, original payment link i
     assert.ok(viteConfigRaw.includes("'127.0.0.1'"));
   } finally {
     await new Promise<void>((resolve) => mockServer.close(() => resolve()));
+  }
+});
+
+test('Digiflazz HTTP 400 JSON body parsing: preserves real RC/message and resolves Gagal/rejection RCs vs RC 99 UNKNOWN', async () => {
+  let mode: 'SALDO_GAGAL' | 'IP_NO_STATUS' | 'ROUTER_99' = 'SALDO_GAGAL';
+  const mockDigiServer = http.createServer((req, res) => {
+    if (req.url === '/transaction' && req.method === 'POST') {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      if (mode === 'SALDO_GAGAL') {
+        res.end(
+          JSON.stringify({
+            data: {
+              ref_id: 'TRX-DF-400-1',
+              status: 'Gagal',
+              rc: '44',
+              message: 'Saldo Anda tidak cukup',
+            },
+          })
+        );
+        return;
+      }
+      if (mode === 'IP_NO_STATUS') {
+        res.end(
+          JSON.stringify({
+            data: {
+              ref_id: 'TRX-DF-400-2',
+              rc: '45',
+              message: 'IP Anda tidak kami kenali: 1.2.3.4',
+            },
+          })
+        );
+        return;
+      }
+      res.end(
+        JSON.stringify({
+          data: {
+            ref_id: 'TRX-DF-400-3',
+            status: 'Gagal',
+            rc: '99',
+            message: 'DF Router Issue',
+          },
+        })
+      );
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+
+  await new Promise<void>((resolve) => mockDigiServer.listen(0, '127.0.0.1', resolve));
+  const port = (mockDigiServer.address() as { port: number }).port;
+  process.env.DIGIFLAZZ_USERNAME = 'testuser';
+  process.env.DIGIFLAZZ_API_KEY = 'test-digi-key';
+  process.env.DIGIFLAZZ_BASE_URL = `http://127.0.0.1:${port}`;
+  refreshConfig(process.env);
+
+  try {
+    const client = new DigiflazzClient();
+
+    mode = 'SALDO_GAGAL';
+    const res1 = await client.createTransaction({ sku: 'TSEL10', destination: '081234567890', refId: 'TRX-DF-400-1' });
+    assert.equal(res1.mappedStatus, 'FAILED');
+    assert.equal(res1.rc, '44');
+    assert.equal(res1.message, '[RC 44] Saldo Anda tidak cukup');
+
+    mode = 'IP_NO_STATUS';
+    const res2 = await client.createTransaction({ sku: 'TSEL10', destination: '081234567890', refId: 'TRX-DF-400-2' });
+    assert.equal(res2.mappedStatus, 'FAILED');
+    assert.equal(res2.rc, '45');
+    assert.equal(res2.message, '[RC 45] IP Anda tidak kami kenali: 1.2.3.4');
+
+    mode = 'ROUTER_99';
+    const res3 = await client.createTransaction({ sku: 'TSEL10', destination: '081234567890', refId: 'TRX-DF-400-3' });
+    assert.equal(res3.mappedStatus, 'UNKNOWN');
+    assert.equal(res3.rc, '99');
+    assert.equal(res3.errorMessage, '[RC 99] DF Router Issue');
+  } finally {
+    await new Promise<void>((resolve) => mockDigiServer.close(() => resolve()));
   }
 });
 
