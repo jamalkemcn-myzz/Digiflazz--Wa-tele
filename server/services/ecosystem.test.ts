@@ -1543,6 +1543,12 @@ test('Timezone Jakarta normalization, api_key-only MyZZStore gateway (no merchan
     assert.equal(auditJson.ok, true);
     assert.ok(Array.isArray(auditJson.data.items));
     assert.ok(auditJson.data.items.length <= 5);
+
+    // Verify WhatsApp connection config uses fetchLatestWaWebVersion and Ubuntu Chrome browser fingerprint
+    const waConnRaw = fs.readFileSync(path.resolve(process.cwd(), 'server/bots/whatsapp.connection.ts'), 'utf8');
+    assert.ok(waConnRaw.includes('fetchLatestWaWebVersion'));
+    assert.equal(waConnRaw.includes('fetchLatestBaileysVersion'), false);
+    assert.ok(waConnRaw.includes("browser: ['Ubuntu', 'Chrome', '120.0.0.0']"));
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }

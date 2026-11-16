@@ -1,6 +1,6 @@
 import makeWASocket, {
   DisconnectReason,
-  fetchLatestBaileysVersion,
+  fetchLatestWaWebVersion,
   type WASocket,
 } from '@whiskeysockets/baileys';
 import pino from 'pino';
@@ -97,9 +97,15 @@ export class WhatsappConnectionManager {
 
     try {
       const { state: authState, saveCreds } = await loadWhatsappAuthState();
-      const { version } = await fetchLatestBaileysVersion().catch(() => ({
-        version: [2, 3000, 1015901307] as [number, number, number],
+      const { version, isLatest } = await fetchLatestWaWebVersion({}).catch(() => ({
+        version: [2, 3000, 1020608496] as [number, number, number],
+        isLatest: false,
       }));
+
+      logger.info('Initializing WhatsApp socket', {
+        service: 'whatsapp',
+        details: { version: version.join('.'), isLatest },
+      });
 
       // Silent pino logger so Baileys never leaks session secrets or noise
       const silentLogger = pino({ level: 'silent' });
@@ -109,7 +115,7 @@ export class WhatsappConnectionManager {
         auth: authState,
         logger: silentLogger,
         printQRInTerminal: false,
-        browser: ['PPOB Bot Ecosystem', 'Chrome', '1.0.0'],
+        browser: ['Ubuntu', 'Chrome', '120.0.0.0'],
         syncFullHistory: false,
       });
 
