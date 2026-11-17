@@ -117,6 +117,9 @@ export class WhatsappConnectionManager {
         printQRInTerminal: false,
         browser: ['Ubuntu', 'Chrome', '120.0.0.0'],
         syncFullHistory: false,
+        shouldSyncHistoryMessage: () => false,
+        shouldIgnoreJid: (jid) =>
+          jid === 'status@broadcast' || jid.endsWith('@newsletter') || jid.endsWith('@broadcast'),
       });
 
       this.socket = sock;

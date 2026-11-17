@@ -605,34 +605,44 @@ test('Bot Demo Simulator: simulates WhatsApp & Telegram replies, inline callback
   const db = getDb();
   const txCountBefore = (db.prepare('SELECT COUNT(*) as cnt FROM transactions').get() as { cnt: number }).cnt;
 
-  // WhatsApp menu with friendly copy & clickable quick-reply buttons
+  // WhatsApp menu with friendly copy & clickable quick-reply buttons (requires ! or . prefix)
   const waMenu = await runBotDemoInteraction({
     platform: 'WHATSAPP',
     senderRole: 'CUSTOMER',
     inputType: 'TEXT',
-    text: 'menu',
+    text: '!menu',
     actor: { id: 'testowner', role: 'OWNER' },
   });
   assert.equal(waMenu.replies.length, 1);
-  assert.match(waMenu.replies[0].text, /Menu Utama/);
-  assert.ok(waMenu.replies[0].buttons && waMenu.replies[0].buttons.length >= 2);
+  assert.match(waMenu.replies[0].text, /Selamat datang di/i);
+  assert.ok(waMenu.replies[0].buttons && waMenu.replies[0].buttons.length === 3);
 
-  // Unknown input returns warm message + clickable menu buttons
-  const waUnknown = await runBotDemoInteraction({
+  // Input without prefix must be silently ignored on WhatsApp
+  const waNoPrefix = await runBotDemoInteraction({
     platform: 'WHATSAPP',
     senderRole: 'CUSTOMER',
     inputType: 'TEXT',
     text: 'halo apakabar',
     actor: { id: 'testowner', role: 'OWNER' },
   });
+  assert.equal(waNoPrefix.replies.length, 0);
+
+  // Unknown prefixed command returns warm message + clickable menu buttons
+  const waUnknown = await runBotDemoInteraction({
+    platform: 'WHATSAPP',
+    senderRole: 'CUSTOMER',
+    inputType: 'TEXT',
+    text: '!tidakada',
+    actor: { id: 'testowner', role: 'OWNER' },
+  });
   assert.ok(waUnknown.replies[0].buttons && waUnknown.replies[0].buttons.length >= 2);
 
-  // Guided WhatsApp product selection -> destination entry without typing "order"
+  // Guided WhatsApp product selection -> destination entry with prefix
   const waSelectProd = await runBotDemoInteraction({
     platform: 'WHATSAPP',
     senderRole: 'CUSTOMER',
     inputType: 'TEXT',
-    text: 'pilih TSEL10',
+    text: '!pilih TSEL10',
     senderId: '628111222333',
     actor: { id: 'testowner', role: 'OWNER' },
   });
@@ -642,22 +652,22 @@ test('Bot Demo Simulator: simulates WhatsApp & Telegram replies, inline callback
     platform: 'WHATSAPP',
     senderRole: 'CUSTOMER',
     inputType: 'TEXT',
-    text: '081234567890',
+    text: '!081234567890',
     senderId: '628111222333',
     actor: { id: 'testowner', role: 'OWNER' },
   });
   assert.equal(waConfirmPrompt.replies.length, 1);
   assert.match(waConfirmPrompt.replies[0].text, /Konfirmasi Pesanan/i);
   const waConfirmBtns = (waConfirmPrompt.replies[0].buttons || []).flat().map((b) => b.replyText);
-  assert.ok(waConfirmBtns.includes('ya'));
-  assert.ok(waConfirmBtns.includes('batal'));
+  assert.ok(waConfirmBtns.includes('!ya'));
+  assert.ok(waConfirmBtns.includes('!batal'));
 
-  // Confirming with "ya" proceeds to generate the QRIS invoice
+  // Confirming with "!ya" proceeds to generate the QRIS invoice
   const waOrder = await runBotDemoInteraction({
     platform: 'WHATSAPP',
     senderRole: 'CUSTOMER',
     inputType: 'TEXT',
-    text: 'ya',
+    text: '!ya',
     senderId: '628111222333',
     actor: { id: 'testowner', role: 'OWNER' },
   });
@@ -671,7 +681,7 @@ test('Bot Demo Simulator: simulates WhatsApp & Telegram replies, inline callback
     platform: 'WHATSAPP',
     senderRole: 'CUSTOMER',
     inputType: 'TEXT',
-    text: 'order TSEL10 081234567899',
+    text: '!order TSEL10 081234567899',
     senderId: '628111222444',
     actor: { id: 'testowner', role: 'OWNER' },
   });
@@ -679,7 +689,7 @@ test('Bot Demo Simulator: simulates WhatsApp & Telegram replies, inline callback
     platform: 'WHATSAPP',
     senderRole: 'CUSTOMER',
     inputType: 'TEXT',
-    text: 'batal',
+    text: '!batal',
     senderId: '628111222444',
     actor: { id: 'testowner', role: 'OWNER' },
   });
@@ -845,7 +855,7 @@ test('HTTP Basic Auth, RBAC, Health, and absence of deposit routes', async () =>
     assert.equal(demoRes.status, 200);
     const demoBody = (await demoRes.json()) as { ok: boolean; data: { replies: Array<{ text: string }> } };
     assert.equal(demoBody.ok, true);
-    assert.match(demoBody.data.replies[0].text, /PPOB Bot Ecosystem/);
+    assert.match(demoBody.data.replies[0].text, /Layanan Pelanggan/);
 
     // Health endpoint exposes safe status without secrets
     const health = await fetch(`${base}/api/health`);
@@ -1042,7 +1052,7 @@ test('Product buttons display friendly product names instead of raw Digiflazz SK
     platform: 'WHATSAPP',
     senderRole: 'CUSTOMER',
     inputType: 'TEXT',
-    text: 'produk',
+    text: '!produk',
     actor,
   });
   const waBtnTexts = (waList.replies[0].buttons || []).flat().map((b) => b.text);
@@ -1347,7 +1357,8 @@ test('Gateway trx_id polling, ?format=raw QRIS download, original payment link i
     assert.match(tgReplies[0], /DIBATALKAN/);
 
     // Verify WhatsApp batal on customer with NO pending order returns explicit feedback (not silent main menu)
-    const { handleWhatsappCommand } = await import('../bots/whatsapp.command-handler');
+    const { handleWhatsappCommand, clearWhatsappCooldown } = await import('../bots/whatsapp.command-handler');
+    clearWhatsappCooldown();
     const waReplies: Array<{ text?: string }> = [];
     await handleWhatsappCommand(
       {
@@ -1357,7 +1368,7 @@ test('Gateway trx_id polling, ?format=raw QRIS download, original payment link i
         },
       },
       '628999000111',
-      'batal',
+      '!batal',
       'NoPending'
     );
     assert.match(waReplies[0].text || '', /belum ada pesanan aktif yang dapat dibatalkan|tidak ada pesanan/i);
@@ -1378,8 +1389,9 @@ test('Gateway trx_id polling, ?format=raw QRIS download, original payment link i
         },
       },
       '628999000222',
-      'order TSEL10 081288889999',
-      'BuyerWA'
+      '!order TSEL10 081288889999',
+      'BuyerWA',
+      { now: 1_000_000 }
     );
     assert.match(waOrderReplies[0].text || '', /Konfirmasi Pesanan/);
     await handleWhatsappCommand(
@@ -1393,8 +1405,9 @@ test('Gateway trx_id polling, ?format=raw QRIS download, original payment link i
         },
       },
       '628999000222',
-      'ya',
-      'BuyerWA'
+      '!ya',
+      'BuyerWA',
+      { now: 1_004_000 }
     );
     const invoiceReply = waOrderReplies[1];
     assert.ok(Buffer.isBuffer(invoiceReply.image));
@@ -1549,6 +1562,276 @@ test('Timezone Jakarta normalization, api_key-only MyZZStore gateway (no merchan
     assert.ok(waConnRaw.includes('fetchLatestWaWebVersion'));
     assert.equal(waConnRaw.includes('fetchLatestBaileysVersion'), false);
     assert.ok(waConnRaw.includes("browser: ['Ubuntu', 'Chrome', '120.0.0.0']"));
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test('PulsaSync Bot Revision: SHOP_NAME env, /start greeting & buttons, /profil stats, WA mandatory prefix & 3s cooldown', async () => {
+  process.env.SHOP_NAME = 'Toko PulsaSync Jaya';
+  const refreshedCfg = refreshConfig(process.env);
+  assert.equal(refreshedCfg.shopName, 'Toko PulsaSync Jaya');
+
+  const envExampleRaw = fs.readFileSync(path.resolve(process.cwd(), '.env.example'), 'utf8');
+  assert.ok(envExampleRaw.includes('SHOP_NAME='));
+
+  const { dispatchTelegramCommand, TG_MAIN_MENU_BUTTONS } = await import('../bots/telegram.command-handler');
+  const { handleWhatsappCommand, clearWhatsappCooldown } = await import('../bots/whatsapp.command-handler');
+  clearWhatsappCooldown();
+
+  // Verify 6 main menu buttons & absence of Deposit button on Telegram
+  const tgButtonLabels = TG_MAIN_MENU_BUTTONS.flat().map((b) => b.text);
+  assert.deepEqual(tgButtonLabels, [
+    'Kategori Produk',
+    'Daftar Produk',
+    'Profil & Saldo',
+    'Redeem Voucher',
+    'Riwayat Transaksi',
+    'Hubungi Admin',
+  ]);
+  assert.equal(tgButtonLabels.some((t) => /deposit/i.test(t)), false);
+
+  // Telegram /start renders exact greeting, SHOP_NAME, user summary & buttons
+  const tgStartReplies: Array<{ text: string; buttons?: unknown }> = [];
+  await dispatchTelegramCommand(
+    {
+      async reply(text, buttons) {
+        tgStartReplies.push({ text, buttons });
+      },
+    },
+    { userId: '910001', username: '@nadia_tg', displayName: 'Nadia Putri', text: '/start' }
+  );
+  const startMsg = tgStartReplies[0].text;
+  assert.ok(startMsg.includes('Halo Kak Nadia Putri!'));
+  assert.ok(startMsg.includes('Selamat datang di Toko PulsaSync Jaya — Layanan Pelanggan.'));
+  assert.ok(
+    startMsg.includes('Silakan pilih menu lewat tombol praktis di bawah tanpa perlu mengetik perintah manual:')
+  );
+  assert.match(startMsg, /ID User:/);
+  assert.match(startMsg, /Status:\s*Member/);
+  assert.match(startMsg, /Total Pengguna Bot:\s*\d+/);
+
+  // Telegram /profil renders Akun & Keuangan sections cleanly
+  const tgProfileReplies: string[] = [];
+  await dispatchTelegramCommand(
+    {
+      async reply(text) {
+        tgProfileReplies.push(text);
+      },
+    },
+    { userId: '910001', username: '@nadia_tg', displayName: 'Nadia Putri', text: '/profil' }
+  );
+  const profMsg = tgProfileReplies[0];
+  assert.match(profMsg, /Profil Pengguna/);
+  assert.match(profMsg, /Akun/);
+  assert.match(profMsg, /ID:\s*CUS-/);
+  assert.match(profMsg, /Username:\s*@nadia_tg/);
+  assert.match(profMsg, /Bergabung:/);
+  assert.match(profMsg, /Keuangan/);
+  assert.match(profMsg, /Saldo:\s*Rp\s*[\d.]+/);
+  assert.match(profMsg, /Poin Loyalitas:\s*\d+/);
+  assert.match(profMsg, /Tier:\s*(Bronze|Silver|Gold|Platinum)/);
+  assert.match(profMsg, /Total Belanja:\s*Rp\s*[\d.]+/);
+
+  // WhatsApp ignores messages without ! or . prefix completely
+  const waSent: Array<{ text: string; buttons?: Array<Array<{ text: string; replyText: string }>> }> = [];
+  const waTransport = {
+    async sendMessage(_jid: string, content: { text?: string; caption?: string; quickReplies?: Array<Array<{ text: string; replyText: string }>> }) {
+      waSent.push({
+        text: content.text || content.caption || '',
+        buttons: content.quickReplies,
+      });
+      return undefined;
+    },
+  };
+
+  await handleWhatsappCommand(waTransport, '628777000111', 'start', 'Andi WA', { now: 10_000 });
+  await handleWhatsappCommand(waTransport, '628777000111', 'profil', 'Andi WA', { now: 15_000 });
+  await handleWhatsappCommand(waTransport, '628777000111', 'halo kak', 'Andi WA', { now: 20_000 });
+  assert.equal(waSent.length, 0);
+
+  // WhatsApp responds to .start and renders exact greeting, SHOP_NAME, 6 buttons (no Deposit), and prefixed .profil
+  await handleWhatsappCommand(waTransport, '628777000111', '.start', 'Andi WA', { now: 25_000 });
+  assert.equal(waSent.length, 1);
+  assert.ok(waSent[0].text.includes('Halo Kak Andi WA!'));
+  assert.ok(waSent[0].text.includes('Selamat datang di Toko PulsaSync Jaya — Layanan Pelanggan.'));
+  const waBtns = (waSent[0].buttons || []).flat().map((b) => b.text);
+  assert.deepEqual(waBtns, [
+    'Kategori Produk',
+    'Daftar Produk',
+    'Profil & Saldo',
+    'Redeem Voucher',
+    'Riwayat Transaksi',
+    'Hubungi Admin',
+  ]);
+  assert.equal(waBtns.some((t) => /deposit/i.test(t)), false);
+
+  // Within 3s cooldown (25_000 -> 27_000 = 2s), second prefixed command MUST be ignored silently
+  await handleWhatsappCommand(waTransport, '628777000111', '!profil', 'Andi WA', { now: 27_000 });
+  assert.equal(waSent.length, 1);
+
+  // Different user at 27_000 is NOT blocked by first user's cooldown
+  await handleWhatsappCommand(waTransport, '628777000222', '!kontak', 'Budi WA', { now: 27_000 });
+  assert.equal(waSent.length, 2);
+  assert.match(waSent[1].text, /Hubungi Admin — Toko PulsaSync Jaya/);
+
+  // After 3s elapsed (25_000 -> 28_000 = 3s), first user responds to !profil again
+  await handleWhatsappCommand(waTransport, '628777000111', '!profil', 'Andi WA', { now: 28_000 });
+  assert.equal(waSent.length, 3);
+  assert.match(waSent[2].text, /Profil Pengguna/);
+  assert.match(waSent[2].text, /Tier:\s*(Bronze|Silver|Gold|Platinum)/);
+});
+
+test('Production config boots cleanly without SESSION_SECRET and derives strong deterministic/ephemeral secret', async () => {
+  const { validateAndLoadConfig } = await import('../config/env');
+
+  // With DASHBOARD_AUTH_USER + DASHBOARD_AUTH_PASSWORD set but SESSION_SECRET omitted in Cloud Run production
+  const prodCfg1 = validateAndLoadConfig({
+    NODE_ENV: 'production',
+    PORT: '8080',
+    K_SERVICE: 'pulsasync-cloud-run',
+    DASHBOARD_AUTH_USER: 'owner',
+    DASHBOARD_AUTH_PASSWORD: 'super-secret-dashboard-pw',
+    SESSION_SECRET: '',
+  });
+  const prodCfg1Repeat = validateAndLoadConfig({
+    NODE_ENV: 'production',
+    PORT: '8080',
+    K_SERVICE: 'pulsasync-cloud-run',
+    DASHBOARD_AUTH_USER: 'owner',
+    DASHBOARD_AUTH_PASSWORD: 'super-secret-dashboard-pw',
+    SESSION_SECRET: '',
+  });
+  const prodCfgShort = validateAndLoadConfig({
+    NODE_ENV: 'production',
+    PORT: '8080',
+    K_SERVICE: 'pulsasync-cloud-run',
+    DASHBOARD_AUTH_USER: 'owner',
+    DASHBOARD_AUTH_PASSWORD: 'super-secret-dashboard-pw',
+    SESSION_SECRET: 'short',
+  });
+  assert.equal(prodCfg1.nodeEnv, 'production');
+  assert.equal(prodCfg1.port, 8080);
+  assert.equal(prodCfg1.security.trustProxy, true);
+  assert.ok(prodCfg1.auth.sessionSecret.length >= 32);
+  assert.equal(prodCfg1.auth.sessionSecret, prodCfg1Repeat.auth.sessionSecret);
+  assert.ok(prodCfgShort.auth.sessionSecret.length >= 32);
+
+  // Even if DASHBOARD_AUTH_* and SESSION_SECRET are both unset, config loads safely (dashboard returns 503)
+  const prodNoAuthCfg = validateAndLoadConfig({
+    NODE_ENV: 'production',
+    SESSION_SECRET: '',
+  });
+  assert.ok(prodNoAuthCfg.auth.sessionSecret.length >= 32);
+});
+
+test('Automatic RAM & cache cleanup prunes expired bot sessions/cooldowns/vouchers and shrinks SQLite memory', async () => {
+  const {
+    setBotSession,
+    setPendingVoucher,
+    recordTelegramBotMessageId,
+    getBotSessionMemoryStats,
+  } = await import('../bots/bot-session');
+  const { handleWhatsappCommand, clearWhatsappCooldown } = await import('../bots/whatsapp.command-handler');
+  const { runAutomaticMemoryCleanup, getMemoryCleanupStatus } = await import('./memory-cleanup.service');
+
+  clearWhatsappCooldown();
+  const staleAt = Date.now() - 40 * 60 * 1000; // 40 minutes ago (past 10m & 30m TTLs)
+
+  setBotSession('TELEGRAM', 'stale-tg-user-1', { mode: 'MAIN_MENU', updatedAt: staleAt });
+  setPendingVoucher('WHATSAPP', '628111999000', 'PROMO10');
+  recordTelegramBotMessageId('stale-chat-1', 777);
+
+  // Trigger a WhatsApp command with timestamp > 3s in the past so cooldown entry expires immediately
+  const dummyWaTransport = { async sendMessage() { return undefined; } };
+  await handleWhatsappCommand(dummyWaTransport, '628111888777', '!kontak', 'Mem Tester', {
+    now: staleAt,
+    enforceCooldown: true,
+  });
+
+  // Run cleanup with "future" timestamp beyond 40 mins from staleAt & > 10 mins from now
+  const cleanupResult = runAutomaticMemoryCleanup('AUTO', Date.now() + 35 * 60 * 1000);
+  assert.ok(cleanupResult.evicted.botSessions >= 1);
+  assert.ok(cleanupResult.evicted.pendingVouchers >= 1);
+  assert.ok(cleanupResult.evicted.telegramMessageRefs >= 1);
+  assert.ok(cleanupResult.evicted.whatsappCooldowns >= 1);
+  assert.ok(cleanupResult.evicted.total >= 4);
+  assert.equal(cleanupResult.sqlite.ran, true);
+  assert.equal(cleanupResult.sqlite.memoryShrunk, true);
+  assert.ok(cleanupResult.after.rssMb > 0);
+
+  const statsAfter = getBotSessionMemoryStats();
+  assert.equal(statsAfter.sessions, 0);
+  assert.equal(statsAfter.pendingVouchers, 0);
+  assert.equal(statsAfter.telegramMessageRefs, 0);
+
+  const status = getMemoryCleanupStatus();
+  assert.ok(status.totalRuns >= 1);
+  assert.ok(status.totalEvictedEntries >= 4);
+  assert.ok(status.lastRunAt !== null);
+});
+
+test('Product Auto-Refresh supports interval, daily time, cron, and disabled modes via settings, scheduler & API', async () => {
+  const { validateAndLoadConfig } = await import('../config/env');
+  const { resolveProductRefreshCron } = await import('./settings.service');
+  const { centralScheduler } = await import('../workers/scheduler');
+
+  const envIntervalCfg = validateAndLoadConfig({
+    ...process.env,
+    DIGIFLAZZ_PRICE_SYNC_INTERVAL_MINUTES: '45',
+  });
+  assert.equal(envIntervalCfg.digiflazz.priceSyncIntervalMinutes, 45);
+
+  const app = createExpressApp();
+  const server = await new Promise<http.Server>((resolve) => {
+    const s = app.listen(0, '127.0.0.1', () => resolve(s));
+  });
+  try {
+    const port = (server.address() as { port: number }).port;
+    const authHeader = `Basic ${Buffer.from('testowner:test-strong-password-999').toString('base64')}`;
+
+    // 1. Save INTERVAL mode (every 30 minutes)
+    const resInterval = await fetch(`http://127.0.0.1:${port}/api/admin/products/auto-refresh`, {
+      method: 'PUT',
+      headers: { Authorization: authHeader, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'INTERVAL', intervalMinutes: 30 }),
+    });
+    assert.equal(resInterval.status, 200);
+    const jsonInterval = (await resInterval.json()) as { ok: boolean; data: any };
+    assert.equal(jsonInterval.ok, true);
+    assert.equal(jsonInterval.data.config.mode, 'INTERVAL');
+    assert.equal(jsonInterval.data.config.intervalMinutes, 30);
+    assert.match(jsonInterval.data.summary, /Setiap 30 menit/);
+    assert.match(centralScheduler.getStatus().productAutoRefreshSummary, /Setiap 30 menit/);
+
+    // 2. Save DAILY_TIME mode (04:30)
+    const resDaily = await fetch(`http://127.0.0.1:${port}/api/admin/products/auto-refresh`, {
+      method: 'PUT',
+      headers: { Authorization: authHeader, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'DAILY_TIME', dailyTime: '04:30' }),
+    });
+    assert.equal(resDaily.status, 200);
+    const jsonDaily = (await resDaily.json()) as { ok: boolean; data: any };
+    assert.equal(jsonDaily.data.config.mode, 'DAILY_TIME');
+    assert.equal(jsonDaily.data.config.dailyTime, '04:30');
+    assert.equal(resolveProductRefreshCron(jsonDaily.data.config), '30 4 * * *');
+
+    // 3. Reject invalid interval (< 5 mins)
+    const resBad = await fetch(`http://127.0.0.1:${port}/api/admin/products/auto-refresh`, {
+      method: 'PUT',
+      headers: { Authorization: authHeader, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'INTERVAL', intervalMinutes: 2 }),
+    });
+    assert.equal(resBad.status, 400);
+
+    // 4. GET reflects persisted config
+    const resGet = await fetch(`http://127.0.0.1:${port}/api/admin/products/auto-refresh`, {
+      headers: { Authorization: authHeader },
+    });
+    assert.equal(resGet.status, 200);
+    const jsonGet = (await resGet.json()) as { ok: boolean; data: any };
+    assert.equal(jsonGet.data.config.mode, 'DAILY_TIME');
+    assert.equal(jsonGet.data.config.dailyTime, '04:30');
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }

@@ -261,7 +261,7 @@ export function SettingsPage({ permissions }: { permissions: string[] }) {
             <div className="flex justify-between gap-2"><span className="text-slate-400">Rentang Kode Unik</span><span className="font-mono text-slate-200 text-right shrink-0">{cfg.transaction.uniqueCodeMin}–{cfg.transaction.uniqueCodeMax}</span></div>
             <div className="flex justify-between gap-2"><span className="text-slate-400">Polling Pembayaran</span><span className="font-mono text-slate-200 text-right shrink-0">setiap {cfg.scheduler.paymentPollIntervalSeconds} detik</span></div>
             <div className="flex justify-between gap-2"><span className="text-slate-400">Polling Supplier</span><span className="font-mono text-slate-200 text-right shrink-0">setiap {cfg.scheduler.supplierPollIntervalSeconds} detik</span></div>
-            <div className="flex justify-between gap-2"><span className="text-slate-400">Cron Sinkronisasi Harga</span><span className="font-mono text-slate-200 text-right shrink-0">{cfg.digiflazz.priceSyncCron}</span></div>
+            <div className="flex justify-between gap-2"><span className="text-slate-400">Auto Refresh Produk</span><span className="font-mono text-slate-200 text-right shrink-0">{data.productAutoRefresh?.summary || cfg.digiflazz.priceSyncCron}</span></div>
           </div>
           <div className="p-5 space-y-2.5 min-w-0">
             <p className="font-semibold text-slate-100">Kesiapan Integrasi Eksternal</p>

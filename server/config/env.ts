@@ -7,6 +7,7 @@ dotenv.config({ quiet: true } as any);
 export interface AppConfig {
   nodeEnv: 'development' | 'production' | 'test';
   port: number;
+  shopName: string;
   timezone: string;
   logLevel: 'debug' | 'info' | 'warn' | 'error';
   appUrl: string;
@@ -37,6 +38,7 @@ export interface AppConfig {
     baseUrl: string;
     timeoutMs: number;
     priceSyncCron: string;
+    priceSyncIntervalMinutes: number | null;
   };
   whatsapp: {
     enabled: boolean;
@@ -161,6 +163,7 @@ export function validateAndLoadConfig(env: NodeJS.ProcessEnv = process.env): App
   let digiflazzBaseUrl = 'https://api.digiflazz.com/v1';
   let gatewayTimeoutMs = 30000;
   let digiflazzTimeoutMs = 30000;
+  let priceSyncIntervalMinutes: number | null = null;
   let waMinDelay = 3000;
   let waMaxDelay = 60000;
   let invoiceExpiryMinutes = 5;
@@ -197,6 +200,19 @@ export function validateAndLoadConfig(env: NodeJS.ProcessEnv = process.env): App
     );
     gatewayTimeoutMs = parseIntBounded('PAYMENT_GATEWAY_TIMEOUT', env.PAYMENT_GATEWAY_TIMEOUT, 30000, 1000, 120000);
     digiflazzTimeoutMs = parseIntBounded('DIGIFLAZZ_TIMEOUT', env.DIGIFLAZZ_TIMEOUT, 30000, 1000, 120000);
+    if ((env.DIGIFLAZZ_PRICE_SYNC_INTERVAL_MINUTES || '').trim() !== '') {
+      const parsedInterval = parseIntBounded(
+        'DIGIFLAZZ_PRICE_SYNC_INTERVAL_MINUTES',
+        env.DIGIFLAZZ_PRICE_SYNC_INTERVAL_MINUTES,
+        0,
+        0,
+        1440
+      );
+      if (parsedInterval > 0 && parsedInterval < 5) {
+        errors.push('DIGIFLAZZ_PRICE_SYNC_INTERVAL_MINUTES must be 0 or between 5 and 1440');
+      }
+      priceSyncIntervalMinutes = parsedInterval > 0 ? parsedInterval : null;
+    }
     waMinDelay = parseIntBounded('WHATSAPP_RECONNECT_MIN_DELAY', env.WHATSAPP_RECONNECT_MIN_DELAY, 3000, 1000, 60000);
     waMaxDelay = parseIntBounded('WHATSAPP_RECONNECT_MAX_DELAY', env.WHATSAPP_RECONNECT_MAX_DELAY, 60000, 5000, 600000);
     if (waMaxDelay < waMinDelay) {
@@ -238,10 +254,27 @@ export function validateAndLoadConfig(env: NodeJS.ProcessEnv = process.env): App
   const rawSessionSecret = (env.SESSION_SECRET || '').trim();
 
   if (nodeEnv === 'production') {
-    if (!dashboardUser) errors.push('Missing required production variable: DASHBOARD_AUTH_USER');
-    if (!dashboardPassword) errors.push('Missing required production variable: DASHBOARD_AUTH_PASSWORD');
+    if (!dashboardUser || !dashboardPassword) {
+      console.warn(
+        JSON.stringify({
+          timestamp: new Date().toISOString(),
+          level: 'warn',
+          service: 'config',
+          message:
+            'DASHBOARD_AUTH_USER or DASHBOARD_AUTH_PASSWORD is not set; admin dashboard endpoints will stay locked (HTTP 503) until configured.',
+        })
+      );
+    }
     if (!rawSessionSecret || rawSessionSecret.length < 16) {
-      errors.push('Missing or weak required production variable: SESSION_SECRET (min 16 chars)');
+      console.warn(
+        JSON.stringify({
+          timestamp: new Date().toISOString(),
+          level: 'warn',
+          service: 'config',
+          message:
+            'SESSION_SECRET is missing or shorter than 16 chars; using a cryptographically strong server-derived fallback secret.',
+        })
+      );
     }
   }
 
@@ -253,8 +286,18 @@ export function validateAndLoadConfig(env: NodeJS.ProcessEnv = process.env): App
     throw new Error(`Configuration validation failed:\n- ${errors.join('\n- ')}`);
   }
 
-  // In non-production, generate an ephemeral per-process session secret if omitted (never hardcoded)
-  const sessionSecret = rawSessionSecret || crypto.randomBytes(32).toString('hex');
+  // Use explicit SESSION_SECRET if strong (>= 16 chars); otherwise derive deterministically from
+  // server auth credentials when available (so Cloud Run restarts/replicas keep valid sessions),
+  // or fall back to an ephemeral CSPRNG secret (never hardcoded).
+  const sessionSecret =
+    rawSessionSecret.length >= 16
+      ? rawSessionSecret
+      : dashboardPassword
+        ? crypto
+            .createHmac('sha256', dashboardPassword)
+            .update(`pulsasync-session:${dashboardUser}:${env.K_SERVICE || ''}:${rawSessionSecret}`)
+            .digest('hex')
+        : crypto.randomBytes(32).toString('hex');
 
   const dbPath = (env.DATABASE_PATH || 'data/database.sqlite').trim();
   const resolvedDbPath = path.isAbsolute(dbPath) ? dbPath : path.resolve(process.cwd(), dbPath);
@@ -272,6 +315,7 @@ export function validateAndLoadConfig(env: NodeJS.ProcessEnv = process.env): App
   return {
     nodeEnv,
     port,
+    shopName: (env.SHOP_NAME || 'PulsaSync Store').trim() || 'PulsaSync Store',
     timezone: normalizeTimezone(env.APP_TIMEZONE),
     logLevel,
     appUrl,
@@ -302,6 +346,7 @@ export function validateAndLoadConfig(env: NodeJS.ProcessEnv = process.env): App
       baseUrl: digiflazzBaseUrl,
       timeoutMs: digiflazzTimeoutMs,
       priceSyncCron: (env.DIGIFLAZZ_PRICE_SYNC_CRON || '0 */6 * * *').trim(),
+      priceSyncIntervalMinutes,
     },
     whatsapp: {
       enabled: waEnabled,
@@ -421,6 +466,7 @@ export function getSafeConfigSummary(cfg: AppConfig = config) {
   return {
     nodeEnv: cfg.nodeEnv,
     port: cfg.port,
+    shopName: cfg.shopName,
     timezone: cfg.timezone,
     logLevel: cfg.logLevel,
     transaction: cfg.transaction,
@@ -440,6 +486,7 @@ export function getSafeConfigSummary(cfg: AppConfig = config) {
       baseUrl: cfg.digiflazz.baseUrl,
       timeoutMs: cfg.digiflazz.timeoutMs,
       priceSyncCron: cfg.digiflazz.priceSyncCron,
+      priceSyncIntervalMinutes: cfg.digiflazz.priceSyncIntervalMinutes,
     },
     paymentGateway: {
       baseUrl: cfg.paymentGateway.baseUrl,

@@ -118,6 +118,18 @@ export const api = {
       method: 'POST',
     }),
   getSyncLogs: () => requestJson<{ ok: true; data: any[] }>('/api/admin/products/sync-logs'),
+  getProductAutoRefresh: () =>
+    requestJson<{ ok: true; data: any }>('/api/admin/products/auto-refresh'),
+  updateProductAutoRefresh: (payload: {
+    mode: 'DISABLED' | 'INTERVAL' | 'DAILY_TIME' | 'CRON';
+    intervalMinutes?: number;
+    dailyTime?: string;
+    cronExpression?: string;
+  }) =>
+    requestJson<{ ok: true; data: any }>('/api/admin/products/auto-refresh', {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    }),
 
   getCategories: () => requestJson<{ ok: true; data: any[] }>('/api/admin/categories'),
   createCategory: (payload: Record<string, unknown>) =>

@@ -18,12 +18,17 @@ import { isMaintenanceMode } from '../services/settings.service';
 import { centralScheduler } from '../workers/scheduler';
 import {
   sendTelegramMainMenu,
+  sendTelegramProfile,
+  sendTelegramContactAdmin,
+  handleTelegramVoucherCommand,
   sendTelegramCategoryList,
   sendTelegramProductPage,
   promptTelegramProductDestination,
   executeTelegramOrder,
   handleTelegramOrderCancellation,
   toMarkupKeyboard,
+  toTelegramHtml,
+  extractTelegramUserMeta,
   clearTrackedTelegramMessages,
   TG_ADMIN_MENU_BUTTONS,
   TG_MAIN_MENU_BUTTONS,
@@ -36,7 +41,7 @@ import { clearBotSession, getBotSession, recordTelegramBotMessageId } from './bo
 
 export async function dispatchTelegramCallback(
   transport: TelegramReplyTransport,
-  input: { data: string; userId?: string | null; username?: string | null },
+  input: { data: string; userId?: string | null; username?: string | null; displayName?: string | null },
   options?: { dryRun?: boolean; demoAdmin?: { role: AdminRole; platformUserId: string } | null }
 ): Promise<void> {
   const dryRun = Boolean(options?.dryRun);
@@ -51,7 +56,41 @@ export async function dispatchTelegramCallback(
 
   if (data === 'MAIN_MENU' || data === 'CANCEL_ORDER') {
     if (transport.answerCbQuery) await transport.answerCbQuery();
-    await sendTelegramMainMenu(transport, input.userId || 'guest', input.username, dryRun);
+    await sendTelegramMainMenu(
+      transport,
+      input.userId || 'guest',
+      input.username,
+      dryRun,
+      input.displayName,
+      options?.demoAdmin
+    );
+    return;
+  }
+
+  if (data === 'MY_PROFILE') {
+    if (transport.answerCbQuery) await transport.answerCbQuery();
+    await sendTelegramProfile(transport, {
+      userId: input.userId || 'guest',
+      displayName: input.displayName,
+      username: input.username,
+      dryRun,
+    });
+    return;
+  }
+
+  if (data === 'REDEEM_VOUCHER') {
+    if (transport.answerCbQuery) await transport.answerCbQuery();
+    await handleTelegramVoucherCommand(transport, {
+      userId: input.userId || 'guest',
+      username: input.username,
+      dryRun,
+    });
+    return;
+  }
+
+  if (data === 'CONTACT_ADMIN') {
+    if (transport.answerCbQuery) await transport.answerCbQuery();
+    await sendTelegramContactAdmin(transport);
     return;
   }
 
@@ -376,7 +415,16 @@ export function registerTelegramCallbacks(bot: Telegraf): void {
     let cleanupPromise: Promise<void> | null = null;
     const transport: TelegramReplyTransport = {
       async reply(text: string, buttons?: TelegramInlineButton[][]) {
-        const sent = await ctx.reply(text, toMarkupKeyboard(buttons));
+        const keyboard = toMarkupKeyboard(buttons);
+        let sent;
+        try {
+          sent = await ctx.reply(toTelegramHtml(text), {
+            parse_mode: 'HTML',
+            ...(keyboard ?? {}),
+          });
+        } catch {
+          sent = await ctx.reply(text, keyboard);
+        }
         if (chatId && sent?.message_id) {
           recordTelegramBotMessageId(chatId, sent.message_id);
         }
@@ -402,10 +450,12 @@ export function registerTelegramCallbacks(bot: Telegraf): void {
         ]).then(() => undefined);
       },
     };
+    const { displayName, username } = extractTelegramUserMeta(ctx.from);
     await dispatchTelegramCallback(transport, {
       data,
       userId: ctx.from ? String(ctx.from.id) : null,
-      username: ctx.from ? ctx.from.username || ctx.from.first_name || null : null,
+      username,
+      displayName,
     });
     if (cleanupPromise) {
       await cleanupPromise;

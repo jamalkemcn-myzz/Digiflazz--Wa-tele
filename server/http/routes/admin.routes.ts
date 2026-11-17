@@ -1,6 +1,6 @@
 import { Router, type Request, type Response } from 'express';
 import { getDb } from '../../database/connection';
-import { getSafeConfigSummary } from '../../config/env';
+import { config, getSafeConfigSummary } from '../../config/env';
 import { requireDashboardAuth, requirePermission } from '../middleware/auth';
 import { adminRateLimiter } from '../middleware/rate-limit';
 import {
@@ -39,7 +39,13 @@ import {
   applyManualRefundOrAdjustment,
   checkTransactionRefundEligibility,
 } from '../../services/refund.service';
-import { isMaintenanceMode, setMaintenanceMode } from '../../services/settings.service';
+import {
+  isMaintenanceMode,
+  setMaintenanceMode,
+  getProductAutoRefreshConfig,
+  saveProductAutoRefreshConfig,
+  formatProductAutoRefreshSummary,
+} from '../../services/settings.service';
 import { listAuditLogs } from '../../services/audit.service';
 import { getNotificationQueueStats } from '../../services/notification.service';
 import { runDatabaseBackup, listBackupFiles, listBackupLogs } from '../../services/backup.service';
@@ -58,6 +64,7 @@ import { telegramService } from '../../bots/telegram.service';
 import { centralScheduler } from '../../workers/scheduler';
 import { recordAuditLog } from '../../services/audit.service';
 import { runBotDemoInteraction } from '../../services/bot-demo.service';
+import { runAutomaticMemoryCleanup } from '../../services/memory-cleanup.service';
 
 export const adminRouter = Router();
 
@@ -192,6 +199,53 @@ adminRouter.get('/products/sync-logs', requirePermission('products:read'), (_req
   const db = getDb();
   const logs = db.prepare('SELECT * FROM price_sync_logs ORDER BY id DESC LIMIT 20').all();
   res.json({ ok: true, data: logs });
+});
+
+adminRouter.get('/products/auto-refresh', requirePermission('products:read'), (_req: Request, res: Response) => {
+  const autoCfg = getProductAutoRefreshConfig();
+  const sched = centralScheduler.getStatus();
+  res.json({
+    ok: true,
+    data: {
+      config: autoCfg,
+      summary: formatProductAutoRefreshSummary(autoCfg, config.timezone),
+      timezone: config.timezone,
+      digiflazzConfigured: digiflazzService.isConfigured(),
+      syncRunning: digiflazzService.isPriceSyncRunning(),
+      lastProductSyncAt: sched.lastProductSyncAt,
+    },
+  });
+});
+
+adminRouter.put('/products/auto-refresh', requirePermission('products:write'), (req: Request, res: Response, next) => {
+  try {
+    const saved = saveProductAutoRefreshConfig(
+      {
+        mode: String(req.body?.mode || ''),
+        intervalMinutes:
+          req.body?.intervalMinutes !== undefined && req.body?.intervalMinutes !== null && req.body?.intervalMinutes !== ''
+            ? Number(req.body.intervalMinutes)
+            : undefined,
+        dailyTime: typeof req.body?.dailyTime === 'string' ? req.body.dailyTime : undefined,
+        cronExpression: typeof req.body?.cronExpression === 'string' ? req.body.cronExpression : undefined,
+      },
+      { id: req.admin!.username, role: req.admin!.role }
+    );
+    centralScheduler.rescheduleProductRefresh(saved);
+    res.json({
+      ok: true,
+      data: {
+        config: saved,
+        summary: formatProductAutoRefreshSummary(saved, config.timezone),
+        timezone: config.timezone,
+        digiflazzConfigured: digiflazzService.isConfigured(),
+        syncRunning: digiflazzService.isPriceSyncRunning(),
+        lastProductSyncAt: centralScheduler.getStatus().lastProductSyncAt,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 adminRouter.get('/categories', requirePermission('products:read'), (_req: Request, res: Response) => {
@@ -554,11 +608,16 @@ adminRouter.get('/logs', requirePermission('logs:read'), (req: Request, res: Res
 
 // J. SETTINGS, MAINTENANCE, BACKUPS, ADMINS
 adminRouter.get('/settings', requirePermission('settings:read'), (_req: Request, res: Response) => {
+  const productAutoRefresh = getProductAutoRefreshConfig();
   res.json({
     ok: true,
     data: {
       maintenanceMode: isMaintenanceMode(),
       config: getSafeConfigSummary(),
+      productAutoRefresh: {
+        config: productAutoRefresh,
+        summary: formatProductAutoRefreshSummary(productAutoRefresh, config.timezone),
+      },
       backupFiles: listBackupFiles(),
       backupLogs: listBackupLogs(20),
       admins: listAdmins(),
@@ -576,6 +635,22 @@ adminRouter.put('/settings/maintenance', requirePermission('maintenance:toggle')
 adminRouter.post('/backups/run', requirePermission('backups:manage'), async (req: Request, res: Response) => {
   const result = await runDatabaseBackup('MANUAL', { id: req.admin!.username, role: req.admin!.role });
   res.status(result.ok ? 200 : 500).json({ ok: result.ok, data: result, error: result.errorMessage });
+});
+
+adminRouter.post('/system/memory-cleanup', requirePermission('backups:manage'), (req: Request, res: Response) => {
+  const result = runAutomaticMemoryCleanup('MANUAL');
+  recordAuditLog({
+    actorId: req.admin!.username,
+    actorRole: req.admin!.role,
+    action: 'MANUAL_MEMORY_CLEANUP',
+    targetType: 'SYSTEM',
+    details: {
+      evictedEntries: result.evicted.total,
+      rssBeforeMb: result.before.rssMb,
+      rssAfterMb: result.after.rssMb,
+    },
+  });
+  res.json({ ok: true, data: result });
 });
 
 adminRouter.post('/admins', requirePermission('admins:manage'), (req: Request, res: Response, next) => {

@@ -31,6 +31,8 @@ export function getDb(customPath?: string): Database.Database {
   if (targetPath !== ':memory:') {
     db.pragma('journal_mode = WAL');
     db.pragma('synchronous = NORMAL');
+    db.pragma('cache_size = -4000'); // Cap SQLite page cache at ~4 MB
+    db.pragma('journal_size_limit = 8388608'); // Cap WAL journal growth at 8 MB
   }
   db.pragma('busy_timeout = 5000');
 
@@ -40,6 +42,33 @@ export function getDb(customPath?: string): Database.Database {
     details: { mode: targetPath === ':memory:' ? 'memory' : 'persistent-wal' },
   });
   return dbInstance;
+}
+
+export function runSqliteMemoryMaintenance(): {
+  ran: boolean;
+  walCheckpointed: boolean;
+  memoryShrunk: boolean;
+} {
+  if (!dbInstance) {
+    return { ran: false, walCheckpointed: false, memoryShrunk: false };
+  }
+  let walCheckpointed = false;
+  let memoryShrunk = false;
+  if (currentDbPath && currentDbPath !== ':memory:') {
+    try {
+      dbInstance.pragma('wal_checkpoint(PASSIVE)');
+      walCheckpointed = true;
+    } catch {
+      // Non-fatal if busy
+    }
+  }
+  try {
+    dbInstance.pragma('shrink_memory');
+    memoryShrunk = true;
+  } catch {
+    // Non-fatal
+  }
+  return { ran: true, walCheckpointed, memoryShrunk };
 }
 
 export function closeDb(): void {

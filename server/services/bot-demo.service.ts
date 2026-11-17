@@ -160,7 +160,7 @@ export async function runBotDemoInteraction(input: BotDemoInput): Promise<BotDem
     }
     await dispatchTelegramCallback(
       transport,
-      { data: callbackData, userId, username: 'Kak Demo' },
+      { data: callbackData, userId, username: 'Kak Demo', displayName: 'Kak Demo' },
       { dryRun: true, demoAdmin }
     );
   } else {
@@ -170,7 +170,7 @@ export async function runBotDemoInteraction(input: BotDemoInput): Promise<BotDem
     }
     await dispatchTelegramCommand(
       transport,
-      { userId, username: 'Kak Demo', text },
+      { userId, username: 'Kak Demo', displayName: 'Kak Demo', text },
       { dryRun: true, demoAdmin }
     );
   }

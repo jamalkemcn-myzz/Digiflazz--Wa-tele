@@ -183,24 +183,26 @@ export function BotDemoPage({ admin }: { admin: AdminSession }) {
   const customerPresets =
     platform === 'WHATSAPP'
       ? [
-          { label: 'Menu Utama', cmd: 'menu' },
-          { label: 'Kategori Produk', cmd: 'kategori' },
-          { label: 'Daftar Produk', cmd: 'produk' },
-          { label: `Simulasi Order (${sampleSku})`, cmd: `order ${sampleSku} 081234567890` },
-          { label: 'Cek Status Terakhir', cmd: 'status' },
-          { label: 'Batalkan Pending (batal)', cmd: 'batal' },
-          { label: 'Riwayat & Refund', cmd: 'riwayat' },
-          { label: 'Kode Hubungkan Akun', cmd: 'hubungkan' },
+          { label: 'Menu Utama (!start)', cmd: '!start' },
+          { label: 'Kategori Produk', cmd: '!kategori' },
+          { label: 'Daftar Produk', cmd: '!produk' },
+          { label: 'Profil & Saldo (!profil)', cmd: '!profil' },
+          { label: 'Redeem Voucher (!voucher)', cmd: '!voucher' },
+          { label: 'Riwayat Transaksi', cmd: '!riwayat' },
+          { label: 'Hubungi Admin', cmd: '!kontak' },
+          { label: `Simulasi Order (${sampleSku})`, cmd: `!order ${sampleSku} 081234567890` },
+          { label: 'Batalkan Pending (!batal)', cmd: '!batal' },
         ]
       : [
-          { label: '/menu (+ Tombol Inline)', cmd: '/menu' },
+          { label: '/start (+ Tombol Inline)', cmd: '/start' },
           { label: '/kategori', cmd: '/kategori' },
           { label: '/produk', cmd: '/produk' },
-          { label: `Simulasi /order (${sampleSku})`, cmd: `/order ${sampleSku} 081234567890` },
-          { label: '/status', cmd: '/status' },
-          { label: '/batal (Batalkan Pending)', cmd: '/batal' },
+          { label: '/profil (Profil & Saldo)', cmd: '/profil' },
+          { label: '/voucher (Redeem Voucher)', cmd: '/voucher' },
           { label: '/riwayat', cmd: '/riwayat' },
-          { label: '/hubungkan', cmd: '/hubungkan' },
+          { label: '/kontak (Hubungi Admin)', cmd: '/kontak' },
+          { label: `Simulasi /order (${sampleSku})`, cmd: `/order ${sampleSku} 081234567890` },
+          { label: '/batal (Batalkan Pending)', cmd: '/batal' },
         ];
 
   const adminPresets =
@@ -379,10 +381,10 @@ export function BotDemoPage({ admin }: { admin: AdminSession }) {
           </div>
 
           <div className="pt-4 border-t border-[#1e293d] text-xs text-slate-400 leading-relaxed">
-            Perintah baca (<code className="font-mono text-slate-200">kategori</code>, <code className="font-mono text-slate-200">produk</code>,{' '}
-            <code className="font-mono text-slate-200">!transaksi</code>) membaca database nyata. Perintah{' '}
-            <code className="font-mono text-slate-200">order</code>, <code className="font-mono text-slate-200">hubungkan</code>, dan{' '}
-            <code className="font-mono text-slate-200">maintenance</code> berjalan dalam mode dry-run aman tanpa membuat transaksi atau mengubah status server.
+            Perintah WhatsApp wajib diawali prefix <code className="font-mono text-slate-200">!</code> atau{' '}
+            <code className="font-mono text-slate-200">.</code> (pesan tanpa prefix diabaikan, cooldown 3 detik per user di mode live).
+            Perintah baca (<code className="font-mono text-slate-200">!kategori</code>, <code className="font-mono text-slate-200">!profil</code>,{' '}
+            <code className="font-mono text-slate-200">!transaksi</code>) membaca database nyata secara aman.
           </div>
         </div>
 
@@ -405,21 +407,21 @@ export function BotDemoPage({ admin }: { admin: AdminSession }) {
                 <p className="text-sm font-semibold text-slate-100">Belum ada percakapan simulasi</p>
                 <p className="text-xs text-slate-400 mt-1 max-w-md">
                   Pilih salah satu skenario di sebelah kiri atau ketik perintah seperti{' '}
-                  <code className="font-mono text-[#60a5fa]">{platform === 'WHATSAPP' ? 'menu' : '/menu'}</code> di bawah untuk melihat respon asli bot.
+                  <code className="font-mono text-[#60a5fa]">{platform === 'WHATSAPP' ? '!start' : '/start'}</code> di bawah untuk melihat respon asli bot.
                 </p>
                 <button
                   type="button"
                   onClick={() =>
                     void sendInteraction({
                       inputType: 'TEXT',
-                      text: platform === 'WHATSAPP' ? 'menu' : '/menu',
-                      displayLabel: platform === 'WHATSAPP' ? 'menu' : '/menu',
+                      text: platform === 'WHATSAPP' ? '!start' : '/start',
+                      displayLabel: platform === 'WHATSAPP' ? '!start' : '/start',
                       deletePreviousOnTelegram: true,
                     })
                   }
                   className="mt-4 px-4 py-2 text-xs font-semibold text-white bg-[#1668ff] rounded-lg hover:bg-[#2574ff] cursor-pointer whitespace-nowrap"
                 >
-                  Kirim {platform === 'WHATSAPP' ? 'menu' : '/menu'} Sekarang
+                  Kirim {platform === 'WHATSAPP' ? '!start' : '/start'} Sekarang
                 </button>
               </div>
             ) : (
@@ -508,8 +510,8 @@ export function BotDemoPage({ admin }: { admin: AdminSession }) {
               disabled={sending}
               placeholder={
                 platform === 'WHATSAPP'
-                  ? `Ketik perintah WhatsApp (misal: menu, produk, order ${sampleSku} 081234567890)`
-                  : `Ketik perintah Telegram (misal: /menu, /produk, /order ${sampleSku} 081234567890)`
+                  ? `Ketik perintah berawalan ! atau . (misal: !start, !profil, !order ${sampleSku} 081234567890)`
+                  : `Ketik perintah Telegram (misal: /start, /profil, /order ${sampleSku} 081234567890)`
               }
               className="flex-1 px-3.5 py-2 text-sm bg-[#0d1422] border border-[#28354e] text-slate-100 placeholder:text-slate-500 rounded-lg font-mono focus:outline-none focus:ring-2 focus:ring-[#1668ff] focus:border-[#1668ff]"
             />

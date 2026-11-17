@@ -11,7 +11,10 @@ import {
   verifyAndLinkAccount,
   unlinkPlatformIdentity,
   getCustomerRefundCreditTotal,
+  getCustomerProfileSummary,
+  getTotalBotUsersCount,
 } from '../services/customer.service';
+import { previewVoucherRedeem } from '../services/coupon.service';
 import {
   createOrder,
   previewOrderDryRun,
@@ -29,7 +32,22 @@ import {
 } from '../services/admin.service';
 import { isMaintenanceMode, setMaintenanceMode } from '../services/settings.service';
 import { centralScheduler } from '../workers/scheduler';
-import { clearBotSession, getBotSession, setBotSession } from './bot-session';
+import {
+  clearBotSession,
+  clearPendingVoucher,
+  getBotSession,
+  getPendingVoucher,
+  setBotSession,
+  setPendingVoucher,
+} from './bot-session';
+import {
+  formatContactAdminMessage,
+  formatProfileMessage,
+  formatStartMessage,
+  formatVoucherPromptMessage,
+  formatVoucherSuccessMessage,
+  resolveDisplayName,
+} from './bot-messages';
 
 export interface WhatsappQuickButton {
   text: string;
@@ -49,6 +67,8 @@ export interface WhatsappReplyTransport {
 
 export interface WhatsappCommandOptions {
   dryRun?: boolean;
+  enforceCooldown?: boolean;
+  now?: number;
   demoAdmin?: {
     role: AdminRole;
     platformUserId: string;
@@ -57,44 +77,110 @@ export interface WhatsappCommandOptions {
 
 const MAIN_MENU_BUTTONS: WhatsappQuickButton[][] = [
   [
-    { text: '1. Kategori Produk', replyText: 'kategori' },
-    { text: '2. Daftar Produk', replyText: 'produk' },
+    { text: 'Kategori Produk', replyText: '!kategori' },
+    { text: 'Daftar Produk', replyText: '!produk' },
   ],
   [
-    { text: '3. Cek Status', replyText: 'status' },
-    { text: '4. Riwayat & Refund', replyText: 'riwayat' },
+    { text: 'Profil & Saldo', replyText: '!profil' },
+    { text: 'Redeem Voucher', replyText: '!voucher' },
   ],
   [
-    { text: '5. Hubungkan Akun', replyText: 'hubungkan' },
-    { text: '6. Panduan', replyText: 'bantuan' },
+    { text: 'Riwayat Transaksi', replyText: '!riwayat' },
+    { text: 'Hubungi Admin', replyText: '!kontak' },
   ],
 ];
 
 const NAV_BACK_BUTTONS: WhatsappQuickButton[][] = [
   [
-    { text: 'Daftar Produk', replyText: 'produk' },
-    { text: 'Menu Utama', replyText: 'menu' },
+    { text: 'Daftar Produk', replyText: '!produk' },
+    { text: 'Menu Utama', replyText: '!menu' },
   ],
 ];
 
-// Bounded in-memory rate limit for WhatsApp customer commands
-const rateMap = new Map<string, { count: number; resetAt: number }>();
+const WA_COOLDOWN_MS = 3000;
+const MAX_WA_COOLDOWN_ENTRIES = 1500;
+const waCooldownMap = new Map<string, number>();
 
-function checkRateLimit(jid: string, max = 20, windowMs = 60_000): boolean {
-  const now = Date.now();
-  const entry = rateMap.get(jid);
-  if (!entry || now > entry.resetAt) {
-    if (rateMap.size > 5000) rateMap.clear();
-    rateMap.set(jid, { count: 1, resetAt: now + windowMs });
-    return true;
+export function clearWhatsappCooldown(jid?: string): void {
+  if (jid) {
+    waCooldownMap.delete(jid);
+  } else {
+    waCooldownMap.clear();
   }
-  if (entry.count >= max) return false;
-  entry.count++;
+}
+
+export function pruneWhatsappCooldowns(now = Date.now()): number {
+  let evicted = 0;
+  for (const [jid, lastAt] of waCooldownMap) {
+    if (now - lastAt >= WA_COOLDOWN_MS) {
+      waCooldownMap.delete(jid);
+      evicted++;
+    }
+  }
+  return evicted;
+}
+
+function checkWhatsappCooldown(jid: string, now = Date.now()): boolean {
+  const lastAt = waCooldownMap.get(jid);
+  if (lastAt !== undefined && now - lastAt < WA_COOLDOWN_MS) {
+    return false;
+  }
+  if (waCooldownMap.size >= MAX_WA_COOLDOWN_ENTRIES) {
+    pruneWhatsappCooldowns(now);
+    if (waCooldownMap.size >= MAX_WA_COOLDOWN_ENTRIES) {
+      const excess = waCooldownMap.size - MAX_WA_COOLDOWN_ENTRIES + 1;
+      let removed = 0;
+      for (const k of waCooldownMap.keys()) {
+        waCooldownMap.delete(k);
+        removed++;
+        if (removed >= excess) break;
+      }
+    }
+  }
+  waCooldownMap.delete(jid);
+  waCooldownMap.set(jid, now);
   return true;
 }
 
+const WA_ADMIN_COMMANDS = new Set(['admin', 'transaksi', 'cari', 'statusbot', 'maintenance']);
+const WA_RESERVED_COMMANDS = new Set([
+  'start',
+  'menu',
+  'hai',
+  'halo',
+  'hi',
+  'bantuan',
+  'help',
+  'kategori',
+  'produk',
+  'produk_hal',
+  'produk_kat',
+  'pilih',
+  'order',
+  'profil',
+  'profile',
+  'voucher',
+  'redeem',
+  'kontak',
+  'hubungi_admin',
+  'cs',
+  'support',
+  'status',
+  'riwayat',
+  'hubungkan',
+  'unlink',
+  'batal',
+  'cancel',
+  'tujuan',
+  'admin',
+  'transaksi',
+  'cari',
+  'statusbot',
+  'maintenance',
+]);
+
 function greetingPrefix(pushName?: string): string {
-  const clean = (pushName || '').trim();
+  const clean = resolveDisplayName(pushName, null, '');
   return clean ? `Halo Kak *${clean}*` : 'Halo Kak';
 }
 
@@ -105,20 +191,130 @@ function formatWaProductButtonLabel(name: string, sellingPrice: number, num: num
   return `${num}. ${shortName} · Rp${sellingPrice.toLocaleString('id-ID')}`;
 }
 
-async function sendMainMenu(sock: WhatsappReplyTransport, jid: string, pushName?: string, dryRun?: boolean) {
+async function sendMainMenu(
+  sock: WhatsappReplyTransport,
+  jid: string,
+  pushName?: string,
+  dryRun?: boolean,
+  demoAdmin?: { role: AdminRole; platformUserId: string } | null
+) {
   setBotSession('WHATSAPP', jid, { mode: 'MAIN_MENU', updatedAt: Date.now() }, dryRun);
+  const summary = getCustomerProfileSummary({
+    platform: 'WHATSAPP',
+    platformUserId: jid,
+    platformUsername: pushName || null,
+    displayName: pushName || null,
+    dryRun,
+  });
+  const totalUsers = getTotalBotUsersCount();
+  const isAdmin = dryRun ? Boolean(demoAdmin) : Boolean(resolveAdminByPlatform('WHATSAPP', jid));
+
   await sock.sendMessage(jid, {
     text:
-      `${greetingPrefix(pushName)}! Selamat datang di *PPOB Bot Ecosystem*.\n` +
-      `Silakan pilih layanan melalui tombol menu di bawah atau balas dengan angkanya:\n\n` +
-      `1. *Kategori Produk* — Jelajahi layanan berdasarkan kategori\n` +
-      `2. *Daftar Produk* — Lihat produk aktif & harga terbaru\n` +
-      `3. *Cek Status* — Pantau status transaksi terakhir Anda\n` +
-      `4. *Riwayat & Refund* — Riwayat belanja & kredit refund\n` +
-      `5. *Hubungkan Akun* — Tautkan akun WhatsApp & Telegram\n` +
-      `6. *Panduan* — Cara pesan cepat\n\n` +
-      `_*PPOB Bot — Menu Utama*_`,
+      `${formatStartMessage({
+        displayName: pushName,
+        shopName: config.shopName,
+        userId: summary.userId,
+        isAdmin,
+        totalUsers,
+      })}\n\n` +
+      `*Menu Utama (Prefix ! / .):*\n` +
+      `• *!kategori* — Kategori Produk\n` +
+      `• *!produk* — Daftar Produk\n` +
+      `• *!profil* — Profil & Saldo\n` +
+      `• *!voucher* — Redeem Voucher\n` +
+      `• *!riwayat* — Riwayat Transaksi\n` +
+      `• *!kontak* — Hubungi Admin\n\n` +
+      `_Gunakan awalan *!* atau *.* untuk setiap perintah (misal: !menu, !profil)._`,
     quickReplies: MAIN_MENU_BUTTONS,
+  });
+}
+
+async function sendWhatsappProfile(
+  sock: WhatsappReplyTransport,
+  jid: string,
+  pushName?: string,
+  dryRun?: boolean
+) {
+  clearBotSession('WHATSAPP', jid, dryRun);
+  const summary = getCustomerProfileSummary({
+    platform: 'WHATSAPP',
+    platformUserId: jid,
+    platformUsername: pushName || null,
+    displayName: pushName || null,
+    dryRun,
+  });
+  await sock.sendMessage(jid, {
+    text: formatProfileMessage(summary, config.timezone),
+    quickReplies: [
+      [
+        { text: 'Daftar Produk', replyText: '!produk' },
+        { text: 'Riwayat Transaksi', replyText: '!riwayat' },
+      ],
+      [{ text: 'Menu Utama', replyText: '!menu' }],
+    ],
+  });
+}
+
+async function sendWhatsappContactAdmin(sock: WhatsappReplyTransport, jid: string, dryRun?: boolean) {
+  clearBotSession('WHATSAPP', jid, dryRun);
+  await sock.sendMessage(jid, {
+    text: formatContactAdminMessage(config),
+    quickReplies: [
+      [
+        { text: 'Riwayat Transaksi', replyText: '!riwayat' },
+        { text: 'Menu Utama', replyText: '!menu' },
+      ],
+    ],
+  });
+}
+
+async function handleWhatsappVoucherCommand(
+  sock: WhatsappReplyTransport,
+  jid: string,
+  code?: string | null,
+  dryRun?: boolean
+) {
+  const activeVoucher = getPendingVoucher('WHATSAPP', jid, dryRun);
+  const cleanCode = (code || '').trim();
+  if (!cleanCode) {
+    setBotSession('WHATSAPP', jid, { mode: 'AWAITING_VOUCHER_CODE', updatedAt: Date.now() }, dryRun);
+    await sock.sendMessage(jid, {
+      text: formatVoucherPromptMessage('WHATSAPP', activeVoucher),
+      quickReplies: [[{ text: 'Batal / Menu Utama', replyText: '!menu' }]],
+    });
+    return;
+  }
+
+  clearBotSession('WHATSAPP', jid, dryRun);
+  const resolved = findCustomerByPlatform({ platform: 'WHATSAPP', platformUserId: jid });
+  const check = previewVoucherRedeem({
+    code: cleanCode,
+    customerId: resolved?.customer.id ?? null,
+  });
+
+  if (!check.ok || !check.coupon) {
+    await sock.sendMessage(jid, {
+      text: `Maaf Kak, ${check.errorMessage || 'kode voucher tidak valid.'}`,
+      quickReplies: [
+        [
+          { text: 'Coba Lagi', replyText: '!voucher' },
+          { text: 'Menu Utama', replyText: '!menu' },
+        ],
+      ],
+    });
+    return;
+  }
+
+  setPendingVoucher('WHATSAPP', jid, check.coupon.code, dryRun);
+  await sock.sendMessage(jid, {
+    text: formatVoucherSuccessMessage(check.coupon, config.timezone),
+    quickReplies: [
+      [
+        { text: 'Daftar Produk', replyText: '!produk' },
+        { text: 'Menu Utama', replyText: '!menu' },
+      ],
+    ],
   });
 }
 
@@ -127,7 +323,7 @@ async function sendCategoryList(sock: WhatsappReplyTransport, jid: string, dryRu
   if (cats.length === 0) {
     await sock.sendMessage(jid, {
       text: 'Maaf Kak, belum ada kategori produk yang aktif saat ini. Silakan coba lagi nanti ya.',
-      quickReplies: [[{ text: 'Menu Utama', replyText: 'menu' }]],
+      quickReplies: [[{ text: 'Menu Utama', replyText: '!menu' }]],
     });
     return;
   }
@@ -145,20 +341,20 @@ async function sendCategoryList(sock: WhatsappReplyTransport, jid: string, dryRu
   for (let i = 0; i < shown.length; i += 2) {
     const row = shown.slice(i, i + 2).map((c, offset) => ({
       text: `${i + offset + 1}. ${c.name}`,
-      replyText: `produk_kat ${c.id} 1`,
+      replyText: `!produk_kat ${c.id} 1`,
     }));
     buttonRows.push(row);
   }
   buttonRows.push([
-    { text: 'Semua Produk', replyText: 'produk' },
-    { text: 'Menu Utama', replyText: 'menu' },
+    { text: 'Semua Produk', replyText: '!produk' },
+    { text: 'Menu Utama', replyText: '!menu' },
   ]);
 
   await sock.sendMessage(jid, {
     text:
       `*Kategori Produk Aktif*\n` +
       `${lines}\n\n` +
-      `Pilih salah satu tombol kategori di bawah atau balas dengan *angka kategori* ya Kak.`,
+      `Pilih tombol kategori atau balas dengan *!angka* kategori (misal: *!1*) ya Kak.`,
     quickReplies: buttonRows,
   });
 }
@@ -184,10 +380,10 @@ async function sendProductPage(
         : 'Maaf Kak, belum ada produk aktif di daftar ini saat ini.',
       quickReplies: [
         [
-          { text: 'Lihat Kategori', replyText: 'kategori' },
-          { text: 'Semua Produk', replyText: 'produk' },
+          { text: 'Lihat Kategori', replyText: '!kategori' },
+          { text: 'Semua Produk', replyText: '!produk' },
         ],
-        [{ text: 'Menu Utama', replyText: 'menu' }],
+        [{ text: 'Menu Utama', replyText: '!menu' }],
       ],
     });
     return;
@@ -213,7 +409,7 @@ async function sendProductPage(
   const buttonRows: WhatsappQuickButton[][] = res.items.map((p, idx) => [
     {
       text: formatWaProductButtonLabel(p.name, p.selling_price, idx + 1),
-      replyText: `pilih ${p.sku}`,
+      replyText: `!pilih ${p.sku}`,
     },
   ]);
 
@@ -222,30 +418,30 @@ async function sendProductPage(
     navRow.push({
       text: 'Sebelumnya',
       replyText: params.categoryId
-        ? `produk_kat ${params.categoryId} ${params.page - 1}`
-        : `produk_hal ${params.page - 1}`,
+        ? `!produk_kat ${params.categoryId} ${params.page - 1}`
+        : `!produk_hal ${params.page - 1}`,
     });
   }
   if (params.page < res.pagination.totalPages) {
     navRow.push({
       text: 'Berikutnya',
       replyText: params.categoryId
-        ? `produk_kat ${params.categoryId} ${params.page + 1}`
-        : `produk_hal ${params.page + 1}`,
+        ? `!produk_kat ${params.categoryId} ${params.page + 1}`
+        : `!produk_hal ${params.page + 1}`,
     });
   }
   if (navRow.length > 0) buttonRows.push(navRow);
 
   buttonRows.push([
-    { text: 'Kategori Lain', replyText: 'kategori' },
-    { text: 'Menu Utama', replyText: 'menu' },
+    { text: 'Kategori Lain', replyText: '!kategori' },
+    { text: 'Menu Utama', replyText: '!menu' },
   ]);
 
   await sock.sendMessage(jid, {
     text:
       `*Daftar Produk (Hal ${params.page}/${res.pagination.totalPages})*\n` +
       `${lines.join('\n')}\n\n` +
-      `Tap tombol produk di bawah (atau balas angkanya) untuk langsung memesan ya Kak!`,
+      `Tap tombol produk di bawah atau balas *!angka* (misal: *!1*) untuk memesan ya Kak!`,
     quickReplies: buttonRows,
   });
 }
@@ -283,11 +479,11 @@ async function promptProductDestination(
       `Pilihan tepat! Anda memilih:\n` +
       `*${product.name}*\n` +
       `Harga: *Rp${product.selling_price.toLocaleString('id-ID')}*\n\n` +
-      `Silakan ketik *nomor tujuan / ID pelanggan* Anda sekarang ya Kak (contoh: \`081234567890\`, atau tambahkan kode kupon setelah spasi).`,
+      `Silakan ketik awalan *!* atau *.* diikuti *nomor tujuan / ID pelanggan* Anda sekarang (contoh: *!081234567890*, atau tambahkan kode kupon setelah spasi).`,
     quickReplies: [
       [
-        { text: 'Pilih Produk Lain', replyText: 'produk' },
-        { text: 'Batal / Menu Utama', replyText: 'batal' },
+        { text: 'Pilih Produk Lain', replyText: '!produk' },
+        { text: 'Batal / Menu Utama', replyText: '!batal' },
       ],
     ],
   });
@@ -298,12 +494,14 @@ async function promptWhatsappOrderConfirmation(
   jid: string,
   params: { sku: string; destination: string; couponCode?: string | null; dryRun?: boolean }
 ) {
+  const resolvedCoupon =
+    params.couponCode?.trim() || getPendingVoucher('WHATSAPP', jid, params.dryRun) || null;
   const preview = previewOrderDryRun({
     platform: 'WHATSAPP',
     platformUserId: jid,
     productSkuOrId: params.sku,
     destination: params.destination,
-    couponCode: params.couponCode || null,
+    couponCode: resolvedCoupon,
   });
 
   if (!preview.ok || !preview.transaction) {
@@ -343,11 +541,11 @@ async function promptWhatsappOrderConfirmation(
       `Harga: Rp${sellingPrice.toLocaleString('id-ID')}\n` +
       (p.coupon_code_snapshot ? `Kupon: ${p.coupon_code_snapshot} (-Rp${p.discount_snapshot.toLocaleString('id-ID')})\n` : '') +
       `Estimasi Total (+ Kode Unik): *Rp${p.payment_amount.toLocaleString('id-ID')}*\n\n` +
-      `Apakah Anda yakin ingin membuat invoice QRIS sekarang?`,
+      `Balas *!ya* untuk melanjutkan atau *!batal* untuk membatalkan:`,
     quickReplies: [
       [
-        { text: 'Ya, Buat QRIS', replyText: 'ya' },
-        { text: 'Batal', replyText: 'batal' },
+        { text: 'Ya, Buat QRIS', replyText: '!ya' },
+        { text: 'Batal', replyText: '!batal' },
       ],
     ],
   });
@@ -359,13 +557,18 @@ async function executeWhatsappOrder(
   params: { sku: string; destination: string; couponCode?: string | null; pushName?: string; dryRun?: boolean }
 ) {
   clearBotSession('WHATSAPP', jid, params.dryRun);
+  const resolvedCoupon =
+    params.couponCode?.trim() || getPendingVoucher('WHATSAPP', jid, params.dryRun) || null;
+  if (resolvedCoupon) {
+    clearPendingVoucher('WHATSAPP', jid, params.dryRun);
+  }
   const result = params.dryRun
     ? previewOrderDryRun({
         platform: 'WHATSAPP',
         platformUserId: jid,
         productSkuOrId: params.sku,
         destination: params.destination,
-        couponCode: params.couponCode || null,
+        couponCode: resolvedCoupon,
       })
     : await createOrder({
         platform: 'WHATSAPP',
@@ -373,7 +576,7 @@ async function executeWhatsappOrder(
         platformUsername: params.pushName || null,
         productSkuOrId: params.sku,
         destination: params.destination,
-        couponCode: params.couponCode || null,
+        couponCode: resolvedCoupon,
       });
 
   if (!result.ok || !result.transaction) {
@@ -387,10 +590,10 @@ async function executeWhatsappOrder(
           `Total: Rp${a.payment_amount.toLocaleString('id-ID')}`,
         quickReplies: [
           [
-            { text: 'Cek Status Invoice', replyText: `status ${a.transaction_id}` },
-            { text: 'Batalkan Pesanan', replyText: `batal ${a.transaction_id}` },
+            { text: 'Cek Status Invoice', replyText: `!status ${a.transaction_id}` },
+            { text: 'Batalkan Pesanan', replyText: `!batal ${a.transaction_id}` },
           ],
-          [{ text: 'Menu Utama', replyText: 'menu' }],
+          [{ text: 'Menu Utama', replyText: '!menu' }],
         ],
       });
       return;
@@ -417,15 +620,15 @@ async function executeWhatsappOrder(
     (originalPaymentUrl ? `Link Pembayaran: ${originalPaymentUrl}\n` : '') +
     `Berlaku hingga: ${new Date(tx.expired_at!).toLocaleTimeString('id-ID')} (${config.transaction.invoiceExpiryMinutes} menit)\n\n` +
     `Silakan scan QRIS di atas atau buka Link Pembayaran dengan nominal TEPAT Rp${tx.payment_amount.toLocaleString('id-ID')} ya Kak.\n` +
-    `_Ketik *batal* atau tap Batalkan Pesanan untuk membatalkan (minimal 30 detik setelah pesanan dibuat)._` +
+    `_Ketik *!batal* atau tap Batalkan Pesanan untuk membatalkan (minimal 30 detik setelah pesanan dibuat)._` +
     (params.dryRun ? `\n\n_[Mode Demo: pratinjau invoice & QRIS, transaksi tidak disimpan ke database]_` : '');
 
   const invoiceButtons: WhatsappQuickButton[][] = [
     [
-      { text: 'Cek Status Pembayaran', replyText: `status ${tx.transaction_id}` },
-      { text: 'Batalkan Pesanan', replyText: `batal ${tx.transaction_id}` },
+      { text: 'Cek Status Pembayaran', replyText: `!status ${tx.transaction_id}` },
+      { text: 'Batalkan Pesanan', replyText: `!batal ${tx.transaction_id}` },
     ],
-    [{ text: 'Menu Utama', replyText: 'menu' }],
+    [{ text: 'Menu Utama', replyText: '!menu' }],
   ];
 
   try {
@@ -491,10 +694,10 @@ async function handleWhatsappOrderCancellation(
     const buttons: WhatsappQuickButton[][] = res.transaction
       ? [
           [
-            { text: 'Cek Status Pembayaran', replyText: `status ${res.transaction.transaction_id}` },
-            { text: 'Coba Batalkan Lagi', replyText: `batal ${res.transaction.transaction_id}` },
+            { text: 'Cek Status Pembayaran', replyText: `!status ${res.transaction.transaction_id}` },
+            { text: 'Coba Batalkan Lagi', replyText: `!batal ${res.transaction.transaction_id}` },
           ],
-          [{ text: 'Menu Utama', replyText: 'menu' }],
+          [{ text: 'Menu Utama', replyText: '!menu' }],
         ]
       : NAV_BACK_BUTTONS;
     await sock.sendMessage(jid, {
@@ -512,6 +715,44 @@ async function handleWhatsappOrderCancellation(
   });
 }
 
+async function sendWhatsappHistory(
+  sock: WhatsappReplyTransport,
+  jid: string,
+  pushName?: string,
+  dryRun?: boolean
+) {
+  clearBotSession('WHATSAPP', jid, dryRun);
+  const resolved = dryRun
+    ? findCustomerByPlatform({ platform: 'WHATSAPP', platformUserId: jid })
+    : resolveOrCreateCustomer({
+        platform: 'WHATSAPP',
+        platformUserId: jid,
+        platformUsername: pushName || null,
+      });
+  if (!resolved) {
+    await sock.sendMessage(jid, {
+      text: `*Riwayat Transaksi*\nKredit Refund Internal: Rp0\n\nBelum ada riwayat transaksi ya Kak.`,
+      quickReplies: NAV_BACK_BUTTONS,
+    });
+    return;
+  }
+  const { customer } = resolved;
+  const txs = getCustomerTransactions(customer.id, 5);
+  const refundTotal = getCustomerRefundCreditTotal(customer.id);
+
+  const lines = txs.map(
+    (t) =>
+      `• ${t.transaction_id} — ${t.product_name_snapshot} (Rp${t.payment_amount.toLocaleString('id-ID')}) [${t.transaction_status}]`
+  );
+  await sock.sendMessage(jid, {
+    text:
+      `*Riwayat Transaksi (${customer.customer_code})*\n` +
+      `Kredit Refund Internal: Rp${refundTotal.toLocaleString('id-ID')}\n\n` +
+      (lines.length > 0 ? lines.join('\n') : 'Belum ada riwayat transaksi ya Kak.'),
+    quickReplies: NAV_BACK_BUTTONS,
+  });
+}
+
 export async function handleWhatsappCommand(
   sock: WhatsappReplyTransport,
   jid: string,
@@ -519,21 +760,30 @@ export async function handleWhatsappCommand(
   pushName?: string,
   options?: WhatsappCommandOptions
 ): Promise<void> {
-  const dryRun = Boolean(options?.dryRun);
-  if (!dryRun && !checkRateLimit(jid)) {
-    await sock.sendMessage(jid, {
-      text: 'Mohon tunggu sebentar ya Kak, permintaan terlalu cepat.',
-    });
+  const trimmed = text.trim();
+  if (!trimmed) return;
+
+  // Rule: mandatory prefix (! or .). Messages without prefix are silently ignored.
+  if (!trimmed.startsWith('!') && !trimmed.startsWith('.')) {
     return;
   }
 
-  const trimmed = text.trim();
-  const parts = trimmed.split(/\s+/);
-  const cmd = parts[0].toLowerCase().replace(/^[!/]/, '');
+  const dryRun = Boolean(options?.dryRun);
+  const now = options?.now ?? Date.now();
+  // Rule: 3-second per-user cooldown. Ignore repeat messages within 3s.
+  if ((!dryRun || options?.enforceCooldown) && !checkWhatsappCooldown(jid, now)) {
+    return;
+  }
+
+  const withoutPrefix = trimmed.slice(1).trim();
+  if (!withoutPrefix) return;
+
+  const parts = withoutPrefix.split(/\s+/);
+  const cmd = parts[0].toLowerCase();
   const args = parts.slice(1);
 
   // Admin commands (require backend RBAC verification via admin_identities)
-  if (trimmed.startsWith('!')) {
+  if (WA_ADMIN_COMMANDS.has(cmd)) {
     const admin: ResolvedAdmin | null = dryRun
       ? options?.demoAdmin
         ? {
@@ -548,7 +798,7 @@ export async function handleWhatsappCommand(
     if (!admin) {
       await sock.sendMessage(jid, {
         text: 'Maaf, perintah admin ditolak atau tidak dikenali. Silakan gunakan Menu Utama untuk layanan pelanggan ya Kak.',
-        quickReplies: [[{ text: 'Buka Menu Utama', replyText: 'menu' }]],
+        quickReplies: [[{ text: 'Buka Menu Utama', replyText: '!menu' }]],
       });
       return;
     }
@@ -558,7 +808,7 @@ export async function handleWhatsappCommand(
         { text: 'Transaksi Terbaru', replyText: '!transaksi' },
         { text: 'Status Layanan', replyText: '!statusbot' },
       ],
-      [{ text: 'Menu Pelanggan', replyText: 'menu' }],
+      [{ text: 'Menu Pelanggan', replyText: '!menu' }],
     ];
 
     if (cmd === 'admin') {
@@ -680,7 +930,7 @@ export async function handleWhatsappCommand(
   }
 
   // Known Customer Commands (reset or update conversational flow cleanly)
-  if (cmd === 'batal' || cmd === 'cancel' || trimmed === '0') {
+  if (cmd === 'batal' || cmd === 'cancel' || withoutPrefix === '0') {
     const activeSession = getBotSession('WHATSAPP', jid, dryRun);
     if (activeSession?.mode === 'AWAITING_ORDER_CONFIRMATION' && !args[0]) {
       clearBotSession('WHATSAPP', jid, dryRun);
@@ -690,9 +940,13 @@ export async function handleWhatsappCommand(
       });
       return;
     }
-    if ((activeSession?.mode === 'AWAITING_DESTINATION' && !args[0]) || trimmed === '0') {
+    if (
+      ((activeSession?.mode === 'AWAITING_DESTINATION' || activeSession?.mode === 'AWAITING_VOUCHER_CODE') &&
+        !args[0]) ||
+      withoutPrefix === '0'
+    ) {
       clearBotSession('WHATSAPP', jid, dryRun);
-      await sendMainMenu(sock, jid, pushName, dryRun);
+      await sendMainMenu(sock, jid, pushName, dryRun, options?.demoAdmin);
       return;
     }
     clearBotSession('WHATSAPP', jid, dryRun);
@@ -705,7 +959,22 @@ export async function handleWhatsappCommand(
   }
 
   if (cmd === 'menu' || cmd === 'start' || cmd === 'hai' || cmd === 'halo' || cmd === 'hi') {
-    await sendMainMenu(sock, jid, pushName, dryRun);
+    await sendMainMenu(sock, jid, pushName, dryRun, options?.demoAdmin);
+    return;
+  }
+
+  if (cmd === 'profil' || cmd === 'profile') {
+    await sendWhatsappProfile(sock, jid, pushName, dryRun);
+    return;
+  }
+
+  if (cmd === 'voucher' || cmd === 'redeem') {
+    await handleWhatsappVoucherCommand(sock, jid, args[0], dryRun);
+    return;
+  }
+
+  if (cmd === 'kontak' || cmd === 'hubungi_admin' || cmd === 'cs' || cmd === 'support') {
+    await sendWhatsappContactAdmin(sock, jid, dryRun);
     return;
   }
 
@@ -715,10 +984,10 @@ export async function handleWhatsappCommand(
       text:
         `*Panduan Belanja Praktis*\n` +
         `1. Tap tombol *Daftar Produk* atau *Kategori Produk*.\n` +
-        `2. Pilih produk yang Anda inginkan, kirim nomor tujuan, lalu konfirmasi (Ya/Batal).\n` +
+        `2. Pilih produk yang Anda inginkan, kirim *!nomor_tujuan*, lalu konfirmasi (*!ya*/* !batal*).\n` +
         `3. Scan QRIS atau buka Link Pembayaran sesuai nominal tepat sebelum batas waktu.\n` +
-        `4. Balas *batal* untuk membatalkan pesanan PENDING (minimal 30 detik setelah dibuat).\n\n` +
-        `Bisa juga ketik langsung: \`order <SKU> <TUJUAN> [KUPON]\` bila sudah hafal kode SKU.`,
+        `4. Ketik *!batal* untuk membatalkan pesanan PENDING (minimal 30 detik setelah dibuat).\n\n` +
+        `Bisa juga ketik langsung: \`!order <SKU> <TUJUAN> [KUPON]\` bila sudah hafal kode SKU.`,
       quickReplies: MAIN_MENU_BUTTONS,
     });
     return;
@@ -753,12 +1022,25 @@ export async function handleWhatsappCommand(
     return;
   }
 
+  if (cmd === 'tujuan' && args[0]) {
+    const session = getBotSession('WHATSAPP', jid, dryRun);
+    if (session?.mode === 'AWAITING_DESTINATION') {
+      await promptWhatsappOrderConfirmation(sock, jid, {
+        sku: session.sku,
+        destination: args[0],
+        couponCode: args[1] || null,
+        dryRun,
+      });
+      return;
+    }
+  }
+
   if (cmd === 'order') {
     if (args.length < 2) {
       await sock.sendMessage(jid, {
         text:
           `Supaya lebih praktis, Kakak bisa tap tombol *Daftar Produk* lalu pilih produk tanpa mengetik format manual.\n` +
-          `Atau ketik: *order <SKU> <TUJUAN> [KODE_KUPON]*`,
+          `Atau ketik: *!order <SKU> <TUJUAN> [KODE_KUPON]*`,
         quickReplies: NAV_BACK_BUTTONS,
       });
       return;
@@ -799,7 +1081,7 @@ export async function handleWhatsappCommand(
       const t = detail.transaction;
       const canCancel = ['CREATED', 'PENDING_PAYMENT', 'PAYMENT_PROCESSING'].includes(t.transaction_status);
       const buttons: WhatsappQuickButton[][] = canCancel
-        ? [[{ text: 'Batalkan Pesanan', replyText: `batal ${t.transaction_id}` }], ...NAV_BACK_BUTTONS]
+        ? [[{ text: 'Batalkan Pesanan', replyText: `!batal ${t.transaction_id}` }], ...NAV_BACK_BUTTONS]
         : NAV_BACK_BUTTONS;
       await sock.sendMessage(jid, {
         text:
@@ -826,11 +1108,11 @@ export async function handleWhatsappCommand(
     const canCancel = ['CREATED', 'PENDING_PAYMENT', 'PAYMENT_PROCESSING'].includes(latest.transaction_status);
     const buttons: WhatsappQuickButton[][] = [];
     if (canCancel) {
-      buttons.push([{ text: 'Batalkan Pesanan', replyText: `batal ${latest.transaction_id}` }]);
+      buttons.push([{ text: 'Batalkan Pesanan', replyText: `!batal ${latest.transaction_id}` }]);
     }
     buttons.push([
-      { text: 'Lihat Semua Riwayat', replyText: 'riwayat' },
-      { text: 'Menu Utama', replyText: 'menu' },
+      { text: 'Lihat Semua Riwayat', replyText: '!riwayat' },
+      { text: 'Menu Utama', replyText: '!menu' },
     ]);
     await sock.sendMessage(jid, {
       text:
@@ -844,35 +1126,7 @@ export async function handleWhatsappCommand(
   }
 
   if (cmd === 'riwayat') {
-    clearBotSession('WHATSAPP', jid, dryRun);
-    const resolved = dryRun
-      ? findCustomerByPlatform({ platform: 'WHATSAPP', platformUserId: jid })
-      : resolveOrCreateCustomer({
-          platform: 'WHATSAPP',
-          platformUserId: jid,
-          platformUsername: pushName || null,
-        });
-    if (!resolved) {
-      await sock.sendMessage(jid, {
-        text: `*Riwayat Transaksi*\nKredit Refund Internal: Rp0\n\nBelum ada riwayat transaksi ya Kak.`,
-        quickReplies: NAV_BACK_BUTTONS,
-      });
-      return;
-    }
-    const { customer } = resolved;
-    const txs = getCustomerTransactions(customer.id, 5);
-    const refundTotal = getCustomerRefundCreditTotal(customer.id);
-
-    const lines = txs.map(
-      (t) => `• ${t.transaction_id} — ${t.product_name_snapshot} (Rp${t.payment_amount.toLocaleString('id-ID')}) [${t.transaction_status}]`
-    );
-    await sock.sendMessage(jid, {
-      text:
-        `*Riwayat Transaksi (${customer.customer_code})*\n` +
-        `Kredit Refund Internal: Rp${refundTotal.toLocaleString('id-ID')}\n\n` +
-        (lines.length > 0 ? lines.join('\n') : 'Belum ada riwayat transaksi ya Kak.'),
-      quickReplies: NAV_BACK_BUTTONS,
-    });
+    await sendWhatsappHistory(sock, jid, pushName, dryRun);
     return;
   }
 
@@ -884,7 +1138,7 @@ export async function handleWhatsappCommand(
         text: code
           ? `[Mode Demo] Simulasi verifikasi kode hubung "${code}" — tidak menautkan akun nyata.`
           : `*Kode Penghubung Akun (Simulasi Demo)*\nKirim perintah berikut di Bot Telegram dalam ${config.accountLinking.codeExpiryMinutes} menit:\n/hubungkan DEMO-123456\n\n_[Mode Demo: token tidak dibuat di database]_`,
-        quickReplies: [[{ text: 'Menu Utama', replyText: 'menu' }]],
+        quickReplies: [[{ text: 'Menu Utama', replyText: '!menu' }]],
       });
       return;
     }
@@ -897,7 +1151,7 @@ export async function handleWhatsappCommand(
       if (!res.ok) {
         await sock.sendMessage(jid, {
           text: res.errorMessage || 'Gagal membuat kode penghubung.',
-          quickReplies: [[{ text: 'Menu Utama', replyText: 'menu' }]],
+          quickReplies: [[{ text: 'Menu Utama', replyText: '!menu' }]],
         });
         return;
       }
@@ -907,7 +1161,7 @@ export async function handleWhatsappCommand(
           `Kirim perintah berikut di Bot Telegram dalam ${config.accountLinking.codeExpiryMinutes} menit:\n` +
           `/hubungkan ${res.code}\n\n` +
           `Jangan bagikan kode ini kepada siapa pun ya Kak.`,
-        quickReplies: [[{ text: 'Menu Utama', replyText: 'menu' }]],
+        quickReplies: [[{ text: 'Menu Utama', replyText: '!menu' }]],
       });
       return;
     }
@@ -922,7 +1176,7 @@ export async function handleWhatsappCommand(
       text: verify.ok
         ? `Yeay! Akun WhatsApp Kakak berhasil dihubungkan dengan akun ${verify.customerCode}. Riwayat transaksi kini tergabung.`
         : verify.errorMessage || 'Maaf Kak, gagal menghubungkan akun.',
-      quickReplies: [[{ text: 'Menu Utama', replyText: 'menu' }]],
+      quickReplies: [[{ text: 'Menu Utama', replyText: '!menu' }]],
     });
     return;
   }
@@ -932,7 +1186,7 @@ export async function handleWhatsappCommand(
     if (dryRun) {
       await sock.sendMessage(jid, {
         text: '[Mode Demo] Simulasi unlink WhatsApp — identitas nyata tidak diubah.',
-        quickReplies: [[{ text: 'Menu Utama', replyText: 'menu' }]],
+        quickReplies: [[{ text: 'Menu Utama', replyText: '!menu' }]],
       });
       return;
     }
@@ -941,12 +1195,12 @@ export async function handleWhatsappCommand(
       text: res.ok
         ? 'Identitas WhatsApp berhasil diputuskan dari akun gabungan.'
         : res.errorMessage || 'Maaf, gagal unlink akun.',
-      quickReplies: [[{ text: 'Menu Utama', replyText: 'menu' }]],
+      quickReplies: [[{ text: 'Menu Utama', replyText: '!menu' }]],
     });
     return;
   }
 
-  // Interactive conversation state fallback (numbered menu replies, confirmation, & guided destination entry)
+  // Interactive conversation state fallback (prefixed confirmations, destination entry, voucher code, & numeric selection)
   const session = getBotSession('WHATSAPP', jid, dryRun);
   if (session?.mode === 'AWAITING_ORDER_CONFIRMATION') {
     if (['ya', 'iya', 'ok', 'oke', 'lanjut', 'konfirmasi', 'y'].includes(cmd)) {
@@ -971,15 +1225,15 @@ export async function handleWhatsappCommand(
       text: `Pesanan *${session.productName}* (${session.destination}) menunggu konfirmasi Anda.\nTap tombol *Ya, Buat QRIS* atau *Batal* di bawah ini:`,
       quickReplies: [
         [
-          { text: 'Ya, Buat QRIS', replyText: 'ya' },
-          { text: 'Batal', replyText: 'batal' },
+          { text: 'Ya, Buat QRIS', replyText: '!ya' },
+          { text: 'Batal', replyText: '!batal' },
         ],
       ],
     });
     return;
   }
 
-  if (session?.mode === 'AWAITING_DESTINATION') {
+  if (session?.mode === 'AWAITING_DESTINATION' && !WA_RESERVED_COMMANDS.has(cmd)) {
     const [dest, coupon] = parts;
     await promptWhatsappOrderConfirmation(sock, jid, {
       sku: session.sku,
@@ -990,7 +1244,12 @@ export async function handleWhatsappCommand(
     return;
   }
 
-  const numericChoice = /^\d+$/.test(trimmed) ? Number(trimmed) : null;
+  if (session?.mode === 'AWAITING_VOUCHER_CODE' && !WA_RESERVED_COMMANDS.has(cmd)) {
+    await handleWhatsappVoucherCommand(sock, jid, parts[0], dryRun);
+    return;
+  }
+
+  const numericChoice = /^\d+$/.test(withoutPrefix) ? Number(withoutPrefix) : null;
   if (numericChoice !== null) {
     if (session?.mode === 'CATEGORY_LIST') {
       const catId = session.categoryIds[numericChoice - 1];
@@ -1007,15 +1266,15 @@ export async function handleWhatsappCommand(
     } else if (numericChoice >= 1 && numericChoice <= 6) {
       if (numericChoice === 1) return sendCategoryList(sock, jid, dryRun);
       if (numericChoice === 2) return sendProductPage(sock, jid, { page: 1 }, dryRun);
-      if (numericChoice === 3) return handleWhatsappCommand(sock, jid, 'status', pushName, options);
-      if (numericChoice === 4) return handleWhatsappCommand(sock, jid, 'riwayat', pushName, options);
-      if (numericChoice === 5) return handleWhatsappCommand(sock, jid, 'hubungkan', pushName, options);
-      if (numericChoice === 6) return handleWhatsappCommand(sock, jid, 'bantuan', pushName, options);
+      if (numericChoice === 3) return sendWhatsappProfile(sock, jid, pushName, dryRun);
+      if (numericChoice === 4) return handleWhatsappVoucherCommand(sock, jid, null, dryRun);
+      if (numericChoice === 5) return sendWhatsappHistory(sock, jid, pushName, dryRun);
+      if (numericChoice === 6) return sendWhatsappContactAdmin(sock, jid, dryRun);
     }
   }
 
   // Direct SKU lookup shortcut
-  const sampleProduct = getProductBySkuOrId(trimmed);
+  const sampleProduct = getProductBySkuOrId(withoutPrefix);
   if (sampleProduct) {
     await promptProductDestination(sock, jid, sampleProduct.sku, dryRun);
     return;
@@ -1024,7 +1283,7 @@ export async function handleWhatsappCommand(
   // Friendly fallback with clickable menu buttons
   await sock.sendMessage(jid, {
     text:
-      `${greetingPrefix(pushName)}! Maaf, saya belum memahami pesan "${trimmed}".\n` +
+      `${greetingPrefix(pushName)}! Maaf, saya belum memahami perintah "${trimmed}".\n` +
       `Silakan pilih langsung menu di bawah ini agar lebih mudah ya Kak:`,
     quickReplies: MAIN_MENU_BUTTONS,
   });

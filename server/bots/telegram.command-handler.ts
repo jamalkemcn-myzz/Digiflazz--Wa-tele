@@ -10,7 +10,10 @@ import {
   verifyAndLinkAccount,
   unlinkPlatformIdentity,
   getCustomerRefundCreditTotal,
+  getCustomerProfileSummary,
+  getTotalBotUsersCount,
 } from '../services/customer.service';
+import { previewVoucherRedeem } from '../services/coupon.service';
 import {
   createOrder,
   previewOrderDryRun,
@@ -30,11 +33,22 @@ import { centralScheduler } from '../workers/scheduler';
 import { sendTelegramQrisInvoice, deleteTelegramMessageSafely } from './telegram.notification.service';
 import {
   clearBotSession,
+  clearPendingVoucher,
   consumeTelegramBotMessageIds,
   getBotSession,
+  getPendingVoucher,
   recordTelegramBotMessageId,
   setBotSession,
+  setPendingVoucher,
 } from './bot-session';
+import {
+  formatContactAdminMessage,
+  formatProfileMessage,
+  formatStartMessage,
+  formatVoucherPromptMessage,
+  formatVoucherSuccessMessage,
+  resolveDisplayName,
+} from './bot-messages';
 
 export interface TelegramInlineButton {
   text: string;
@@ -51,6 +65,7 @@ export interface TelegramReplyTransport {
 export interface TelegramDispatchContext {
   userId: string;
   username?: string | null;
+  displayName?: string | null;
   text: string;
 }
 
@@ -68,12 +83,12 @@ export const TG_MAIN_MENU_BUTTONS: TelegramInlineButton[][] = [
     { text: 'Daftar Produk', callbackData: 'PROD_PAGE_1' },
   ],
   [
-    { text: 'Cek Status Terakhir', callbackData: 'MY_LATEST_STATUS' },
-    { text: 'Riwayat & Refund', callbackData: 'MY_HISTORY' },
+    { text: 'Profil & Saldo', callbackData: 'MY_PROFILE' },
+    { text: 'Redeem Voucher', callbackData: 'REDEEM_VOUCHER' },
   ],
   [
-    { text: 'Hubungkan WhatsApp', callbackData: 'LINK_ACCOUNT' },
-    { text: 'Panduan Belanja', callbackData: 'HELP' },
+    { text: 'Riwayat Transaksi', callbackData: 'MY_HISTORY' },
+    { text: 'Hubungi Admin', callbackData: 'CONTACT_ADMIN' },
   ],
 ];
 
@@ -95,13 +110,37 @@ export const TG_ADMIN_MENU_BUTTONS: TelegramInlineButton[][] = [
   ],
 ];
 
+const MAX_TG_RATE_ENTRIES = 1500;
 const tgRateMap = new Map<number, { count: number; resetAt: number }>();
+
+export function pruneTelegramRateLimits(now = Date.now()): number {
+  let evicted = 0;
+  for (const [userId, entry] of tgRateMap) {
+    if (now > entry.resetAt) {
+      tgRateMap.delete(userId);
+      evicted++;
+    }
+  }
+  return evicted;
+}
 
 function checkTgRateLimit(userId: number, max = 25, windowMs = 60_000): boolean {
   const now = Date.now();
   const entry = tgRateMap.get(userId);
   if (!entry || now > entry.resetAt) {
-    if (tgRateMap.size > 5000) tgRateMap.clear();
+    if (tgRateMap.size >= MAX_TG_RATE_ENTRIES) {
+      pruneTelegramRateLimits(now);
+      if (tgRateMap.size >= MAX_TG_RATE_ENTRIES) {
+        const excess = tgRateMap.size - MAX_TG_RATE_ENTRIES + 1;
+        let removed = 0;
+        for (const k of tgRateMap.keys()) {
+          tgRateMap.delete(k);
+          removed++;
+          if (removed >= excess) break;
+        }
+      }
+    }
+    tgRateMap.delete(userId);
     tgRateMap.set(userId, { count: 1, resetAt: now + windowMs });
     return true;
   }
@@ -121,11 +160,25 @@ export async function clearTrackedTelegramMessages(bot: Telegraf, chatId: string
   await Promise.allSettled(prevIds.map((msgId) => deleteTelegramMessageSafely(bot, chatId, msgId)));
 }
 
+export function toTelegramHtml(raw: string): string {
+  const escaped = raw.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return escaped.replace(/\*([^\n*]+)\*/g, '<b>$1</b>');
+}
+
 function createTelegrafTransport(bot: Telegraf, ctx: Context): TelegramReplyTransport {
   const chatId = ctx.chat?.id ?? ctx.from?.id;
   return {
     async reply(text: string, buttons?: TelegramInlineButton[][]) {
-      const sent = await ctx.reply(text, toMarkupKeyboard(buttons));
+      const keyboard = toMarkupKeyboard(buttons);
+      let sent;
+      try {
+        sent = await ctx.reply(toTelegramHtml(text), {
+          parse_mode: 'HTML',
+          ...(keyboard ?? {}),
+        });
+      } catch {
+        sent = await ctx.reply(text, keyboard);
+      }
       if (chatId && sent?.message_id) {
         recordTelegramBotMessageId(chatId, sent.message_id);
       }
@@ -141,8 +194,8 @@ function createTelegrafTransport(bot: Telegraf, ctx: Context): TelegramReplyTran
   };
 }
 
-function friendlyName(username?: string | null): string {
-  const clean = (username || '').trim();
+function friendlyName(displayName?: string | null, username?: string | null): string {
+  const clean = resolveDisplayName(displayName, username, '');
   return clean ? `Halo Kak ${clean}` : 'Halo Kak';
 }
 
@@ -159,14 +212,110 @@ export async function sendTelegramMainMenu(
   transport: TelegramReplyTransport,
   userId: string,
   username?: string | null,
-  dryRun?: boolean
+  dryRun?: boolean,
+  displayName?: string | null,
+  demoAdmin?: { role: AdminRole; platformUserId: string } | null
 ): Promise<void> {
   clearBotSession('TELEGRAM', userId, dryRun);
+  const summary = getCustomerProfileSummary({
+    platform: 'TELEGRAM',
+    platformUserId: userId,
+    platformUsername: username ?? null,
+    displayName: displayName ?? null,
+    dryRun,
+  });
+  const totalUsers = getTotalBotUsersCount();
+  const isAdmin = dryRun ? Boolean(demoAdmin) : Boolean(resolveAdminByPlatform('TELEGRAM', userId));
+
   await transport.reply(
-    `${friendlyName(username)}! Selamat datang di PPOB Bot Ecosystem — Layanan Pelanggan.\n` +
-      `Silakan pilih menu lewat tombol praktis di bawah tanpa perlu mengetik perintah manual:`,
+    formatStartMessage({
+      displayName,
+      username,
+      shopName: config.shopName,
+      userId: summary.userId,
+      isAdmin,
+      totalUsers,
+    }),
     TG_MAIN_MENU_BUTTONS
   );
+}
+
+export async function sendTelegramProfile(
+  transport: TelegramReplyTransport,
+  params: { userId: string; displayName?: string | null; username?: string | null; dryRun?: boolean }
+): Promise<void> {
+  clearBotSession('TELEGRAM', params.userId, params.dryRun);
+  const summary = getCustomerProfileSummary({
+    platform: 'TELEGRAM',
+    platformUserId: params.userId,
+    platformUsername: params.username ?? null,
+    displayName: params.displayName ?? null,
+    dryRun: params.dryRun,
+  });
+  await transport.reply(formatProfileMessage(summary, config.timezone), [
+    [
+      { text: 'Daftar Produk', callbackData: 'PROD_PAGE_1' },
+      { text: 'Riwayat Transaksi', callbackData: 'MY_HISTORY' },
+    ],
+    [{ text: 'Menu Utama', callbackData: 'MAIN_MENU' }],
+  ]);
+}
+
+export async function sendTelegramContactAdmin(transport: TelegramReplyTransport): Promise<void> {
+  await transport.reply(formatContactAdminMessage(config), [
+    [
+      { text: 'Riwayat Transaksi', callbackData: 'MY_HISTORY' },
+      { text: 'Menu Utama', callbackData: 'MAIN_MENU' },
+    ],
+  ]);
+}
+
+export async function handleTelegramVoucherCommand(
+  transport: TelegramReplyTransport,
+  params: { userId: string; username?: string | null; code?: string | null; dryRun?: boolean }
+): Promise<void> {
+  const activeVoucher = getPendingVoucher('TELEGRAM', params.userId, params.dryRun);
+  const code = (params.code || '').trim();
+  if (!code) {
+    setBotSession(
+      'TELEGRAM',
+      params.userId,
+      { mode: 'AWAITING_VOUCHER_CODE', updatedAt: Date.now() },
+      params.dryRun
+    );
+    await transport.reply(formatVoucherPromptMessage('TELEGRAM', activeVoucher), [
+      [{ text: 'Batal / Menu Utama', callbackData: 'MAIN_MENU' }],
+    ]);
+    return;
+  }
+
+  clearBotSession('TELEGRAM', params.userId, params.dryRun);
+  const resolved = findCustomerByPlatform({ platform: 'TELEGRAM', platformUserId: params.userId });
+  const check = previewVoucherRedeem({
+    code,
+    customerId: resolved?.customer.id ?? null,
+  });
+
+  if (!check.ok || !check.coupon) {
+    await transport.reply(
+      `Maaf Kak, ${check.errorMessage || 'kode voucher tidak valid.'}`,
+      [
+        [
+          { text: 'Coba Lagi', callbackData: 'REDEEM_VOUCHER' },
+          { text: 'Menu Utama', callbackData: 'MAIN_MENU' },
+        ],
+      ]
+    );
+    return;
+  }
+
+  setPendingVoucher('TELEGRAM', params.userId, check.coupon.code, params.dryRun);
+  await transport.reply(formatVoucherSuccessMessage(check.coupon, config.timezone), [
+    [
+      { text: 'Daftar Produk', callbackData: 'PROD_PAGE_1' },
+      { text: 'Menu Utama', callbackData: 'MAIN_MENU' },
+    ],
+  ]);
 }
 
 export async function sendTelegramCategoryList(transport: TelegramReplyTransport): Promise<void> {
@@ -317,12 +466,14 @@ export async function promptTelegramOrderConfirmation(
     dryRun?: boolean;
   }
 ): Promise<void> {
+  const resolvedCoupon =
+    params.couponCode?.trim() || getPendingVoucher('TELEGRAM', params.userId, params.dryRun) || null;
   const preview = previewOrderDryRun({
     platform: 'TELEGRAM',
     platformUserId: params.userId,
     productSkuOrId: params.sku,
     destination: params.destination,
-    couponCode: params.couponCode || null,
+    couponCode: resolvedCoupon,
   });
 
   if (!preview.ok || !preview.transaction) {
@@ -383,13 +534,18 @@ export async function executeTelegramOrder(
   }
 ): Promise<void> {
   clearBotSession('TELEGRAM', params.userId, params.dryRun);
+  const resolvedCoupon =
+    params.couponCode?.trim() || getPendingVoucher('TELEGRAM', params.userId, params.dryRun) || null;
+  if (resolvedCoupon) {
+    clearPendingVoucher('TELEGRAM', params.userId, params.dryRun);
+  }
   const result = params.dryRun
     ? previewOrderDryRun({
         platform: 'TELEGRAM',
         platformUserId: params.userId,
         productSkuOrId: params.sku,
         destination: params.destination,
-        couponCode: params.couponCode || null,
+        couponCode: resolvedCoupon,
       })
     : await createOrder({
         platform: 'TELEGRAM',
@@ -397,7 +553,7 @@ export async function executeTelegramOrder(
         platformUsername: params.username ?? null,
         productSkuOrId: params.sku,
         destination: params.destination,
-        couponCode: params.couponCode || null,
+        couponCode: resolvedCoupon,
       });
 
   if (!result.ok || !result.transaction) {
@@ -526,8 +682,15 @@ export async function dispatchTelegramCommand(
         await transport.reply('Pembuatan pesanan dibatalkan sebelum QRIS dibuat.', TG_NAV_BACK_BUTTONS);
         return;
       }
-      if (session?.mode === 'AWAITING_DESTINATION' && !args[0]) {
-        await sendTelegramMainMenu(transport, input.userId, input.username, dryRun);
+      if ((session?.mode === 'AWAITING_DESTINATION' || session?.mode === 'AWAITING_VOUCHER_CODE') && !args[0]) {
+        await sendTelegramMainMenu(
+          transport,
+          input.userId,
+          input.username,
+          dryRun,
+          input.displayName,
+          options?.demoAdmin
+        );
         return;
       }
       await handleTelegramOrderCancellation(transport, {
@@ -580,6 +743,26 @@ export async function dispatchTelegramCommand(
       return;
     }
 
+    if (session?.mode === 'AWAITING_VOUCHER_CODE') {
+      await handleTelegramVoucherCommand(transport, {
+        userId: input.userId,
+        username: input.username,
+        code: parts[0],
+        dryRun,
+      });
+      return;
+    }
+
+    if (cmd === 'profil' || cmd === 'profile') {
+      await sendTelegramProfile(transport, {
+        userId: input.userId,
+        displayName: input.displayName,
+        username: input.username,
+        dryRun,
+      });
+      return;
+    }
+
     const sampleProduct = getProductBySkuOrId(trimmed);
     if (sampleProduct) {
       await promptTelegramProductDestination(transport, input.userId, sampleProduct.sku, dryRun);
@@ -587,7 +770,7 @@ export async function dispatchTelegramCommand(
     }
 
     await transport.reply(
-      `${friendlyName(input.username)}! Maaf, saya belum memahami pesan "${trimmed}".\n` +
+      `${friendlyName(input.displayName, input.username)}! Maaf, saya belum memahami pesan "${trimmed}".\n` +
         `Kakak bisa langsung tekan tombol menu di bawah agar lebih mudah:`,
       TG_MAIN_MENU_BUTTONS
     );
@@ -623,7 +806,39 @@ export async function dispatchTelegramCommand(
       );
       return;
     }
-    await sendTelegramMainMenu(transport, input.userId, input.username, dryRun);
+    await sendTelegramMainMenu(
+      transport,
+      input.userId,
+      input.username,
+      dryRun,
+      input.displayName,
+      options?.demoAdmin
+    );
+    return;
+  }
+
+  if (cmd === 'profil' || cmd === 'profile') {
+    await sendTelegramProfile(transport, {
+      userId: input.userId,
+      displayName: input.displayName,
+      username: input.username,
+      dryRun,
+    });
+    return;
+  }
+
+  if (cmd === 'voucher' || cmd === 'redeem') {
+    await handleTelegramVoucherCommand(transport, {
+      userId: input.userId,
+      username: input.username,
+      code: args[0],
+      dryRun,
+    });
+    return;
+  }
+
+  if (cmd === 'kontak' || cmd === 'hubungi_admin' || cmd === 'cs' || cmd === 'support') {
+    await sendTelegramContactAdmin(transport);
     return;
   }
 
@@ -984,10 +1199,22 @@ export async function dispatchTelegramCommand(
   }
 
   await transport.reply(
-    `${friendlyName(input.username)}! Maaf, perintah "${trimmed}" belum tersedia.\n` +
+    `${friendlyName(input.displayName, input.username)}! Maaf, perintah "${trimmed}" belum tersedia.\n` +
       `Silakan gunakan tombol menu di bawah ini:`,
     TG_MAIN_MENU_BUTTONS
   );
+}
+
+export function extractTelegramUserMeta(from?: {
+  first_name?: string;
+  last_name?: string;
+  username?: string;
+}): { displayName: string | null; username: string | null } {
+  if (!from) return { displayName: null, username: null };
+  const fullName = [from.first_name, from.last_name].filter(Boolean).join(' ').trim();
+  const displayName = fullName || from.username || null;
+  const username = from.username ? `@${from.username}` : fullName || null;
+  return { displayName, username };
 }
 
 export function registerTelegramCommands(bot: Telegraf): void {
@@ -1005,9 +1232,11 @@ export function registerTelegramCommands(bot: Telegraf): void {
     if (!text.trim()) return;
     const chatId = ctx.chat?.id ?? ctx.from.id;
     const cleanupPromise = chatId ? clearTrackedTelegramMessages(bot, chatId) : Promise.resolve();
+    const { displayName, username } = extractTelegramUserMeta(ctx.from);
     await dispatchTelegramCommand(createTelegrafTransport(bot, ctx), {
       userId: String(ctx.from.id),
-      username: ctx.from.username || ctx.from.first_name || null,
+      username,
+      displayName,
       text,
     });
     await cleanupPromise;
@@ -1019,6 +1248,12 @@ export function registerTelegramCommands(bot: Telegraf): void {
       'menu',
       'bantuan',
       'help',
+      'profil',
+      'profile',
+      'voucher',
+      'redeem',
+      'kontak',
+      'hubungi_admin',
       'kategori',
       'produk',
       'order',

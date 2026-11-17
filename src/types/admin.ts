@@ -74,6 +74,9 @@ export interface OverviewData {
       lastSupplierPollAt: string | null;
       lastReconciliationAt: string | null;
       lastNotificationRunAt: string | null;
+      lastMemoryCleanupAt?: string | null;
+      lastProductSyncAt?: string | null;
+      productAutoRefreshSummary?: string;
     };
     digiflazz: { configured: boolean; syncRunning: boolean };
     notifications: { pending: number | null; sent: number | null; failed: number | null };
@@ -111,6 +114,7 @@ export interface SafeConfigSummary {
     baseUrl: string;
     timeoutMs: number;
     priceSyncCron: string;
+    priceSyncIntervalMinutes?: number | null;
   };
   paymentGateway: {
     baseUrl: string;
@@ -188,6 +192,25 @@ export interface ProductItem {
   status: 'ACTIVE' | 'INACTIVE';
   is_available: number;
   last_price_sync_at: string | null;
+}
+
+export type ProductAutoRefreshMode = 'DISABLED' | 'INTERVAL' | 'DAILY_TIME' | 'CRON';
+
+export interface ProductAutoRefreshConfig {
+  mode: ProductAutoRefreshMode;
+  intervalMinutes: number;
+  dailyTime: string;
+  cronExpression: string;
+  updatedAt: string | null;
+}
+
+export interface ProductAutoRefreshState {
+  config: ProductAutoRefreshConfig;
+  summary: string;
+  timezone: string;
+  digiflazzConfigured: boolean;
+  syncRunning: boolean;
+  lastProductSyncAt: string | null;
 }
 
 export interface CouponItem {

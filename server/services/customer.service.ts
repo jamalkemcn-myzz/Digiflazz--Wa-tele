@@ -451,3 +451,101 @@ export function listCustomersDetailed(params: { page?: number; limit?: number; s
     },
   };
 }
+
+export function getTotalBotUsersCount(): number {
+  const db = getDb();
+  const row = db.prepare('SELECT COUNT(*) as cnt FROM customers').get() as { cnt: number };
+  return row.cnt;
+}
+
+export function calculateCustomerTier(totalSpent: number): 'Bronze' | 'Silver' | 'Gold' | 'Platinum' {
+  if (totalSpent >= 5_000_000) return 'Platinum';
+  if (totalSpent >= 1_000_000) return 'Gold';
+  if (totalSpent >= 250_000) return 'Silver';
+  return 'Bronze';
+}
+
+export interface CustomerProfileSummary {
+  customerId: number | null;
+  userId: string;
+  username: string;
+  joinedAt: string;
+  balance: number;
+  loyaltyPoints: number;
+  tier: 'Bronze' | 'Silver' | 'Gold' | 'Platinum';
+  totalSpent: number;
+  successCount: number;
+}
+
+export function getCustomerProfileSummary(params: {
+  platform: 'WHATSAPP' | 'TELEGRAM';
+  platformUserId: string;
+  platformUsername?: string | null;
+  displayName?: string | null;
+  dryRun?: boolean;
+}): CustomerProfileSummary {
+  const resolved = params.dryRun
+    ? findCustomerByPlatform({
+        platform: params.platform,
+        platformUserId: params.platformUserId,
+      })
+    : resolveOrCreateCustomer({
+        platform: params.platform,
+        platformUserId: params.platformUserId,
+        platformUsername: params.platformUsername ?? params.displayName ?? null,
+      });
+
+  const cleanUsername = (params.platformUsername || '').trim();
+  const cleanDisplay = (params.displayName || '').trim();
+  const fallbackId =
+    params.platform === 'WHATSAPP'
+      ? extractWhatsappPhoneFromJid(params.platformUserId)
+      : params.platformUserId.trim();
+
+  if (!resolved) {
+    return {
+      customerId: null,
+      userId: fallbackId || '-',
+      username: cleanUsername || cleanDisplay || fallbackId || '-',
+      joinedAt: new Date().toISOString(),
+      balance: 0,
+      loyaltyPoints: 0,
+      tier: 'Bronze',
+      totalSpent: 0,
+      successCount: 0,
+    };
+  }
+
+  const db = getDb();
+  const stats = db
+    .prepare(
+      `SELECT
+         COUNT(*) as success_count,
+         COALESCE(SUM(payment_amount), 0) as total_spent
+       FROM transactions
+       WHERE customer_id = ? AND transaction_status = 'SUCCESS'`
+    )
+    .get(resolved.customer.id) as { success_count: number; total_spent: number };
+
+  const balance = getCustomerRefundCreditTotal(resolved.customer.id);
+  const totalSpent = Number(stats?.total_spent || 0);
+  const successCount = Number(stats?.success_count || 0);
+  const loyaltyPoints = Math.floor(totalSpent / 1000);
+  const tier = calculateCustomerTier(totalSpent);
+
+  const storedUsername = (resolved.identity.platform_username || '').trim();
+  const resolvedUsername = cleanUsername || storedUsername || cleanDisplay || resolved.identity.platform_user_id;
+
+  return {
+    customerId: resolved.customer.id,
+    userId: resolved.customer.customer_code,
+    username: resolvedUsername,
+    joinedAt: resolved.customer.created_at,
+    balance,
+    loyaltyPoints,
+    tier,
+    totalSpent,
+    successCount,
+  };
+}
+

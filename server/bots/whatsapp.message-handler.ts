@@ -1,14 +1,40 @@
 import type { WASocket } from '@whiskeysockets/baileys';
 import { handleWhatsappCommand, type WhatsappReplyTransport } from './whatsapp.command-handler';
 
-const processedMessages = new Set<string>();
+const DEDUP_TTL_MS = 10 * 60 * 1000;
+const MAX_PROCESSED_MESSAGES = 2000;
+const processedMessages = new Map<string, number>();
 
-function rememberMessageId(id: string): boolean {
-  if (processedMessages.has(id)) return false;
-  if (processedMessages.size > 5000) {
-    processedMessages.clear();
+export function pruneProcessedWhatsappMessages(now = Date.now()): number {
+  let evicted = 0;
+  for (const [id, rememberedAt] of processedMessages) {
+    if (now - rememberedAt > DEDUP_TTL_MS) {
+      processedMessages.delete(id);
+      evicted++;
+    }
   }
-  processedMessages.add(id);
+  return evicted;
+}
+
+function rememberMessageId(id: string, now = Date.now()): boolean {
+  const existing = processedMessages.get(id);
+  if (existing !== undefined && now - existing <= DEDUP_TTL_MS) {
+    return false;
+  }
+  if (processedMessages.size >= MAX_PROCESSED_MESSAGES) {
+    pruneProcessedWhatsappMessages(now);
+    if (processedMessages.size >= MAX_PROCESSED_MESSAGES) {
+      const excess = processedMessages.size - MAX_PROCESSED_MESSAGES + 1;
+      let removed = 0;
+      for (const k of processedMessages.keys()) {
+        processedMessages.delete(k);
+        removed++;
+        if (removed >= excess) break;
+      }
+    }
+  }
+  processedMessages.delete(id);
+  processedMessages.set(id, now);
   return true;
 }
 

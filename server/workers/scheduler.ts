@@ -7,6 +7,13 @@ import { pollPendingSupplierJobs, runFullReconciliation } from '../services/reco
 import { processPendingNotifications, emitServiceLogToGroups } from '../services/notification.service';
 import { digiflazzService } from '../integrations/digiflazz.service';
 import { runDatabaseBackup } from '../services/backup.service';
+import { runAutomaticMemoryCleanup } from '../services/memory-cleanup.service';
+import {
+  formatProductAutoRefreshSummary,
+  getProductAutoRefreshConfig,
+  resolveProductRefreshCron,
+  type ProductAutoRefreshConfig,
+} from '../services/settings.service';
 
 export interface SchedulerStatus {
   running: boolean;
@@ -15,6 +22,9 @@ export interface SchedulerStatus {
   lastSupplierPollAt: string | null;
   lastReconciliationAt: string | null;
   lastNotificationRunAt: string | null;
+  lastMemoryCleanupAt: string | null;
+  lastProductSyncAt: string | null;
+  productAutoRefreshSummary: string;
 }
 
 class CentralScheduler {
@@ -22,12 +32,16 @@ class CentralScheduler {
   private startedAt: string | null = null;
   private intervals: NodeJS.Timeout[] = [];
   private cronTasks: ScheduledTask[] = [];
+  private priceSyncInterval: NodeJS.Timeout | null = null;
+  private priceSyncCronTask: ScheduledTask | null = null;
   private locks = {
     paymentPoll: false,
     supplierPoll: false,
     reconciliation: false,
     notification: false,
     cleanup: false,
+    memoryCleanup: false,
+    productSync: false,
   };
 
   private status: SchedulerStatus = {
@@ -37,6 +51,9 @@ class CentralScheduler {
     lastSupplierPollAt: null,
     lastReconciliationAt: null,
     lastNotificationRunAt: null,
+    lastMemoryCleanupAt: null,
+    lastProductSyncAt: null,
+    productAutoRefreshSummary: `Cron: ${config.digiflazz.priceSyncCron} (${config.timezone})`,
   };
 
   start(): void {
@@ -86,7 +103,7 @@ class CentralScheduler {
     }, config.scheduler.notificationRetryIntervalSeconds * 1000);
     this.intervals.push(notifyTimer);
 
-    // 5. Temporary data cleanup every 30 minutes (NEVER deletes transactions, audit_logs, or refund_ledger)
+    // 5. Temporary database record cleanup every 30 minutes (NEVER deletes transactions, audit_logs, or refund_ledger)
     const cleanupTimer = setInterval(() => {
       void this.runGuarded('cleanup', async () => {
         this.cleanupTemporaryRecords();
@@ -94,21 +111,19 @@ class CentralScheduler {
     }, 30 * 60 * 1000);
     this.intervals.push(cleanupTimer);
 
-    // 6. Digiflazz Price Sync Cron
-    if (cron.validate(config.digiflazz.priceSyncCron)) {
-      const priceTask = cron.schedule(
-        config.digiflazz.priceSyncCron,
-        () => {
-          if (digiflazzService.isConfigured()) {
-            void digiflazzService.syncPrices('CRON');
-          }
-        },
-        { timezone: config.timezone }
-      );
-      this.cronTasks.push(priceTask);
-    }
+    // 6. Automatic RAM, in-memory cache & SQLite memory cleanup every 5 minutes
+    const memoryCleanupTimer = setInterval(() => {
+      void this.runGuarded('memoryCleanup', async () => {
+        const res = runAutomaticMemoryCleanup('AUTO');
+        this.status.lastMemoryCleanupAt = res.ranAt;
+      });
+    }, 5 * 60 * 1000);
+    this.intervals.push(memoryCleanupTimer);
 
-    // 7. SQLite Auto Backup Cron
+    // 7. Dynamic Digiflazz Product Auto-Refresh (Interval / Daily Time / Cron / Disabled)
+    this.rescheduleProductRefresh();
+
+    // 8. SQLite Auto Backup Cron
     if (config.backup.enabled && cron.validate(config.backup.cron)) {
       const backupTask = cron.schedule(
         config.backup.cron,
@@ -124,8 +139,61 @@ class CentralScheduler {
     emitServiceLogToGroups(
       `scheduler-start-${Date.now()}`,
       'Scheduler Started',
-      'Central scheduler aktif memantau pembayaran, supplier, rekonsiliasi, notifikasi, sinkronisasi harga, dan backup.'
+      'Central scheduler aktif memantau pembayaran, supplier, rekonsiliasi, notifikasi, pembersihan RAM berkala, auto-refresh produk, dan backup.'
     );
+  }
+
+  private clearProductRefreshTimers(): void {
+    if (this.priceSyncInterval) {
+      clearInterval(this.priceSyncInterval);
+      this.priceSyncInterval = null;
+    }
+    if (this.priceSyncCronTask) {
+      this.priceSyncCronTask.stop();
+      this.priceSyncCronTask = null;
+    }
+  }
+
+  rescheduleProductRefresh(overrideConfig?: ProductAutoRefreshConfig): ProductAutoRefreshConfig {
+    this.clearProductRefreshTimers();
+
+    const cfg = overrideConfig ?? getProductAutoRefreshConfig();
+    this.status.productAutoRefreshSummary = formatProductAutoRefreshSummary(cfg, config.timezone);
+
+    if (!this.running || cfg.mode === 'DISABLED') {
+      return cfg;
+    }
+
+    const executeSync = () => {
+      void this.runGuarded('productSync', async () => {
+        if (!digiflazzService.isConfigured()) return;
+        const result = await digiflazzService.syncPrices('CRON');
+        if (result.ok) {
+          this.status.lastProductSyncAt = new Date().toISOString();
+        }
+      });
+    };
+
+    if (cfg.mode === 'INTERVAL') {
+      const intervalMs = cfg.intervalMinutes * 60 * 1000;
+      this.priceSyncInterval = setInterval(executeSync, intervalMs);
+      logger.info('Product auto-refresh scheduled by interval', {
+        service: 'scheduler',
+        details: { mode: cfg.mode, intervalMinutes: cfg.intervalMinutes },
+      });
+      return cfg;
+    }
+
+    const cronExpr = resolveProductRefreshCron(cfg);
+    if (cronExpr && cron.validate(cronExpr)) {
+      this.priceSyncCronTask = cron.schedule(cronExpr, executeSync, { timezone: config.timezone });
+      logger.info('Product auto-refresh scheduled by cron', {
+        service: 'scheduler',
+        details: { mode: cfg.mode, cronExpression: cronExpr, timezone: config.timezone },
+      });
+    }
+
+    return cfg;
   }
 
   private async runGuarded(key: keyof typeof this.locks, task: () => Promise<void>): Promise<void> {
@@ -175,6 +243,8 @@ class CentralScheduler {
     if (!this.running) return;
     this.running = false;
     this.status.running = false;
+
+    this.clearProductRefreshTimers();
 
     for (const timer of this.intervals) {
       clearInterval(timer);

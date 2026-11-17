@@ -1,7 +1,7 @@
-import React, { useEffect, useState, useCallback } from 'react';
-import { RefreshCw, Plus, Trash2, Pencil, X } from 'lucide-react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
+import { RefreshCw, Plus, Trash2, Pencil, X, Clock } from 'lucide-react';
 import { api } from '../api/client';
-import type { CategoryItem, ProductItem } from '../types/admin';
+import type { CategoryItem, ProductAutoRefreshMode, ProductAutoRefreshState, ProductItem } from '../types/admin';
 
 type SubTab = 'products' | 'categories' | 'margins';
 
@@ -58,37 +58,126 @@ export function CatalogPage({ initialTab = 'products', permissions }: { initialT
   } | null>(null);
   const [previewCost, setPreviewCost] = useState('20000');
 
+  // Auto Refresh Produk (Server Schedule + Browser Table Reload)
+  const [autoRefreshState, setAutoRefreshState] = useState<ProductAutoRefreshState | null>(null);
+  const [autoRefreshForm, setAutoRefreshForm] = useState<{
+    mode: ProductAutoRefreshMode;
+    intervalMinutesStr: string;
+    dailyTime: string;
+    cronExpression: string;
+  }>({
+    mode: 'CRON',
+    intervalMinutesStr: '360',
+    dailyTime: '02:00',
+    cronExpression: '0 */6 * * *',
+  });
+  const autoRefreshInitializedRef = useRef(false);
+  const [uiRefreshSeconds, setUiRefreshSeconds] = useState<number>(0);
+  const [lastUiRefreshedAt, setLastUiRefreshedAt] = useState<string | null>(null);
+
   useEffect(() => {
     setTab(initialTab);
   }, [initialTab]);
 
-  const loadAll = useCallback(async () => {
-    setLoading(true);
-    try {
-      const [prodRes, catRes, marginRes, syncRes] = await Promise.all([
-        api.getProducts({ page: 1, limit: 50, search: search.trim() || undefined }),
-        api.getCategories(),
-        api.getMargins(),
-        api.getSyncLogs(),
-      ]);
-      setProducts(prodRes.data.items);
-      setCategories(catRes.data);
-      const gm = marginRes.data.globalMargin;
-      setGlobalMarginType(gm.type === 'PERCENT' ? 'PERCENT' : 'FIXED');
-      setGlobalMarginValueStr(String(gm.value ?? 1000));
-      setGlobalMaxMarginStr(gm.maxMargin !== null && gm.maxMargin !== undefined ? String(gm.maxMargin) : '');
-      setMarginHistory(marginRes.data.history);
-      setSyncLogs(syncRes.data);
-    } catch (err) {
-      setMessage({ type: 'err', text: err instanceof Error ? err.message : 'Gagal memuat katalog' });
-    } finally {
-      setLoading(false);
-    }
-  }, [search]);
+  const loadAll = useCallback(
+    async (silent = false) => {
+      if (!silent) setLoading(true);
+      try {
+        const [prodRes, catRes, marginRes, syncRes, autoRefreshRes] = await Promise.all([
+          api.getProducts({ page: 1, limit: 50, search: search.trim() || undefined }),
+          api.getCategories(),
+          api.getMargins(),
+          api.getSyncLogs(),
+          api.getProductAutoRefresh(),
+        ]);
+        setProducts(prodRes.data.items);
+        setCategories(catRes.data);
+        const gm = marginRes.data.globalMargin;
+        setGlobalMarginType(gm.type === 'PERCENT' ? 'PERCENT' : 'FIXED');
+        setGlobalMarginValueStr(String(gm.value ?? 1000));
+        setGlobalMaxMarginStr(gm.maxMargin !== null && gm.maxMargin !== undefined ? String(gm.maxMargin) : '');
+        setMarginHistory(marginRes.data.history);
+        setSyncLogs(syncRes.data);
+        setAutoRefreshState(autoRefreshRes.data);
+        if (!autoRefreshInitializedRef.current && autoRefreshRes.data?.config) {
+          autoRefreshInitializedRef.current = true;
+          setAutoRefreshForm({
+            mode: autoRefreshRes.data.config.mode,
+            intervalMinutesStr: String(autoRefreshRes.data.config.intervalMinutes ?? 360),
+            dailyTime: autoRefreshRes.data.config.dailyTime ?? '02:00',
+            cronExpression: autoRefreshRes.data.config.cronExpression ?? '0 */6 * * *',
+          });
+        }
+        setLastUiRefreshedAt(new Date().toLocaleTimeString('id-ID'));
+      } catch (err) {
+        if (!silent) {
+          setMessage({ type: 'err', text: err instanceof Error ? err.message : 'Gagal memuat katalog' });
+        }
+      } finally {
+        if (!silent) setLoading(false);
+      }
+    },
+    [search]
+  );
 
   useEffect(() => {
-    void loadAll();
+    void loadAll(false);
   }, [loadAll]);
+
+  useEffect(() => {
+    if (uiRefreshSeconds <= 0 || tab !== 'products') return;
+    const timer = window.setInterval(() => {
+      if (!busy && !editingSku && !confirmDeleteProductId) {
+        void loadAll(true);
+      }
+    }, uiRefreshSeconds * 1000);
+    return () => window.clearInterval(timer);
+  }, [uiRefreshSeconds, tab, busy, editingSku, confirmDeleteProductId, loadAll]);
+
+  async function handleSaveAutoRefresh(e: React.FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    setMessage(null);
+    try {
+      const payload: {
+        mode: ProductAutoRefreshMode;
+        intervalMinutes?: number;
+        dailyTime?: string;
+        cronExpression?: string;
+      } = { mode: autoRefreshForm.mode };
+
+      if (autoRefreshForm.mode === 'INTERVAL') {
+        const mins = Number(autoRefreshForm.intervalMinutesStr);
+        if (!Number.isInteger(mins) || mins < 5 || mins > 1440) {
+          setMessage({ type: 'err', text: 'Interval auto refresh wajib diisi antara 5 hingga 1440 menit.' });
+          setBusy(false);
+          return;
+        }
+        payload.intervalMinutes = mins;
+      } else if (autoRefreshForm.mode === 'DAILY_TIME') {
+        payload.dailyTime = autoRefreshForm.dailyTime;
+      } else if (autoRefreshForm.mode === 'CRON') {
+        payload.cronExpression = autoRefreshForm.cronExpression.trim();
+      }
+
+      const res = await api.updateProductAutoRefresh(payload);
+      setAutoRefreshState(res.data);
+      setAutoRefreshForm({
+        mode: res.data.config.mode,
+        intervalMinutesStr: String(res.data.config.intervalMinutes),
+        dailyTime: res.data.config.dailyTime,
+        cronExpression: res.data.config.cronExpression,
+      });
+      setMessage({
+        type: 'ok',
+        text: `Jadwal auto refresh produk disimpan: ${res.data.summary}`,
+      });
+    } catch (err) {
+      setMessage({ type: 'err', text: err instanceof Error ? err.message : 'Gagal menyimpan jadwal auto refresh' });
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function handleSyncDigiflazz() {
     setBusy(true);
@@ -347,6 +436,159 @@ export function CatalogPage({ initialTab = 'products', permissions }: { initialT
 
       {tab === 'products' && (
         <div className="space-y-5">
+          {/* Server-Side Auto Refresh Schedule */}
+          <form onSubmit={handleSaveAutoRefresh} className="bg-[#131c2e] border border-[#1f2b42] rounded-lg p-4 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <Clock className="w-4 h-4 text-[#4b8bff] shrink-0" />
+                <div>
+                  <h3 className="text-xs font-semibold text-slate-100">Auto Refresh Produk Otomatis (Digiflazz)</h3>
+                  <p className="text-[11px] text-slate-400">
+                    Jadwal aktif:{' '}
+                    <span className="font-mono text-slate-200">
+                      {autoRefreshState?.summary || 'Memuat jadwal...'}
+                    </span>
+                    {autoRefreshState && !autoRefreshState.digiflazzConfigured && (
+                      <span className="text-amber-400"> · Kredensial Digiflazz belum diisi</span>
+                    )}
+                  </p>
+                </div>
+              </div>
+              {autoRefreshState?.lastProductSyncAt && (
+                <span className="text-[11px] font-mono text-slate-400 tabular-nums">
+                  Auto-sync terakhir: {new Date(autoRefreshState.lastProductSyncAt).toLocaleString('id-ID')}
+                </span>
+              )}
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-3 items-end">
+              <div>
+                <label htmlFor="auto-refresh-mode" className="block text-xs font-medium text-slate-400 mb-1">
+                  Mode Jadwal
+                </label>
+                <select
+                  id="auto-refresh-mode"
+                  value={autoRefreshForm.mode}
+                  disabled={!permissions.includes('products:write')}
+                  onChange={(e) =>
+                    setAutoRefreshForm({
+                      ...autoRefreshForm,
+                      mode: e.target.value as ProductAutoRefreshMode,
+                    })
+                  }
+                  className="w-full px-3 py-2 text-xs bg-[#0d1422] border border-[#28354e] text-slate-100 rounded-lg"
+                >
+                  <option value="INTERVAL">Setiap Interval Tertentu</option>
+                  <option value="DAILY_TIME">Setiap Hari di Waktu Tertentu</option>
+                  <option value="CRON">Jadwal Cron Kustom</option>
+                  <option value="DISABLED">Nonaktif (Manual Saja)</option>
+                </select>
+              </div>
+
+              {autoRefreshForm.mode === 'INTERVAL' && (
+                <div className="md:col-span-2 space-y-1.5">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <label htmlFor="auto-refresh-interval" className="text-xs font-medium text-slate-400">
+                      Interval (Menit, 5–1440)
+                    </label>
+                    <div className="flex flex-wrap gap-1">
+                      {[
+                        { label: '15m', val: '15' },
+                        { label: '30m', val: '30' },
+                        { label: '1j', val: '60' },
+                        { label: '3j', val: '180' },
+                        { label: '6j', val: '360' },
+                        { label: '12j', val: '720' },
+                      ].map((preset) => (
+                        <button
+                          key={preset.val}
+                          type="button"
+                          disabled={!permissions.includes('products:write')}
+                          onClick={() =>
+                            setAutoRefreshForm({ ...autoRefreshForm, intervalMinutesStr: preset.val })
+                          }
+                          className={`px-2 py-0.5 text-[11px] font-mono rounded border cursor-pointer ${
+                            autoRefreshForm.intervalMinutesStr === preset.val
+                              ? 'bg-[#1668ff] border-[#1668ff] text-white'
+                              : 'bg-[#0d1422] border-[#28354e] text-slate-300 hover:border-slate-500'
+                          }`}
+                        >
+                          {preset.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <input
+                    id="auto-refresh-interval"
+                    type="text"
+                    inputMode="numeric"
+                    disabled={!permissions.includes('products:write')}
+                    value={autoRefreshForm.intervalMinutesStr}
+                    onChange={(e) =>
+                      setAutoRefreshForm({
+                        ...autoRefreshForm,
+                        intervalMinutesStr: sanitizeNumericInput(e.target.value, false),
+                      })
+                    }
+                    placeholder="60"
+                    className="w-full px-3 py-2 text-xs font-mono bg-[#0d1422] border border-[#28354e] text-slate-100 rounded-lg"
+                  />
+                </div>
+              )}
+
+              {autoRefreshForm.mode === 'DAILY_TIME' && (
+                <div className="md:col-span-2">
+                  <label htmlFor="auto-refresh-time" className="block text-xs font-medium text-slate-400 mb-1">
+                    Waktu Harian ({autoRefreshState?.timezone || 'Asia/Jakarta'})
+                  </label>
+                  <input
+                    id="auto-refresh-time"
+                    type="time"
+                    disabled={!permissions.includes('products:write')}
+                    value={autoRefreshForm.dailyTime}
+                    onChange={(e) => setAutoRefreshForm({ ...autoRefreshForm, dailyTime: e.target.value })}
+                    className="w-full px-3 py-2 text-xs font-mono bg-[#0d1422] border border-[#28354e] text-slate-100 rounded-lg"
+                  />
+                </div>
+              )}
+
+              {autoRefreshForm.mode === 'CRON' && (
+                <div className="md:col-span-2">
+                  <label htmlFor="auto-refresh-cron" className="block text-xs font-medium text-slate-400 mb-1">
+                    Ekspresi Cron ({autoRefreshState?.timezone || 'Asia/Jakarta'})
+                  </label>
+                  <input
+                    id="auto-refresh-cron"
+                    type="text"
+                    disabled={!permissions.includes('products:write')}
+                    value={autoRefreshForm.cronExpression}
+                    onChange={(e) =>
+                      setAutoRefreshForm({ ...autoRefreshForm, cronExpression: e.target.value })
+                    }
+                    placeholder="0 */6 * * *"
+                    className="w-full px-3 py-2 text-xs font-mono bg-[#0d1422] border border-[#28354e] text-slate-100 rounded-lg"
+                  />
+                </div>
+              )}
+
+              {autoRefreshForm.mode === 'DISABLED' && (
+                <div className="md:col-span-2 text-xs text-slate-400 pb-2">
+                  Sinkronisasi produk otomatis dimatikan. Harga hanya diperbarui saat klik Sinkronisasi Manual.
+                </div>
+              )}
+
+              {permissions.includes('products:write') && (
+                <button
+                  type="submit"
+                  disabled={busy}
+                  className="inline-flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-[#1668ff] rounded-lg hover:bg-[#2574ff] disabled:opacity-50 cursor-pointer whitespace-nowrap"
+                >
+                  Simpan Jadwal
+                </button>
+              )}
+            </div>
+          </form>
+
           {permissions.includes('products:write') && (
             <form onSubmit={handleSaveProduct} className="bg-[#131c2e] border border-[#1f2b42] rounded-lg p-4 space-y-3">
               <div className="flex items-center justify-between gap-2">
@@ -507,7 +749,28 @@ export function CatalogPage({ initialTab = 'products', permissions }: { initialT
                 placeholder="Cari SKU atau nama produk..."
                 className="w-full max-w-sm px-3 py-2 text-sm bg-[#0d1422] border border-[#28354e] text-slate-100 placeholder:text-slate-500 rounded-lg"
               />
-              <span className="text-xs text-slate-400 tabular-nums">{products.length} produk ditampilkan</span>
+              <div className="flex flex-wrap items-center gap-3">
+                <div className="flex items-center gap-2">
+                  <label htmlFor="ui-table-refresh" className="text-xs text-slate-400 whitespace-nowrap">
+                    Auto-refresh tabel:
+                  </label>
+                  <select
+                    id="ui-table-refresh"
+                    value={uiRefreshSeconds}
+                    onChange={(e) => setUiRefreshSeconds(Number(e.target.value))}
+                    className="px-2.5 py-1.5 text-xs bg-[#0d1422] border border-[#28354e] text-slate-100 rounded-md"
+                  >
+                    <option value={0}>Mati</option>
+                    <option value={30}>30 detik</option>
+                    <option value={60}>1 menit</option>
+                    <option value={300}>5 menit</option>
+                  </select>
+                </div>
+                <span className="text-xs text-slate-400 tabular-nums">
+                  {products.length} produk
+                  {lastUiRefreshedAt ? ` · update ${lastUiRefreshedAt}` : ''}
+                </span>
+              </div>
             </div>
 
             <div className="overflow-x-auto">

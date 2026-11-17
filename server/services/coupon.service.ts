@@ -354,3 +354,76 @@ export function previewCouponReadOnly(params: {
   };
 }
 
+export function previewVoucherRedeem(params: {
+  code: string;
+  customerId?: number | null;
+}): {
+  ok: boolean;
+  coupon?: {
+    code: string;
+    name: string;
+    discountType: CouponDiscountType;
+    discountValue: number;
+    minPurchase: number;
+    maxDiscount: number | null;
+    expiresAt: string;
+  };
+  errorMessage?: string;
+} {
+  const cleaned = params.code.trim();
+  if (!cleaned) {
+    return { ok: false, errorMessage: 'Kode voucher tidak boleh kosong.' };
+  }
+
+  const db = getDb();
+  const row = db
+    .prepare('SELECT * FROM coupons WHERE UPPER(code) = UPPER(?)')
+    .get(cleaned) as CouponDbRow | undefined;
+
+  if (!row) {
+    return { ok: false, errorMessage: `Kode voucher "${cleaned.toUpperCase()}" tidak ditemukan.` };
+  }
+  if (row.status !== 'ACTIVE') {
+    return { ok: false, errorMessage: `Voucher "${row.code}" sedang tidak aktif.` };
+  }
+
+  const nowMs = Date.now();
+  if (nowMs < new Date(row.starts_at).getTime()) {
+    return { ok: false, errorMessage: `Voucher "${row.code}" belum masuk masa berlaku.` };
+  }
+  if (nowMs > new Date(row.expires_at).getTime()) {
+    return { ok: false, errorMessage: `Voucher "${row.code}" sudah kedaluwarsa.` };
+  }
+  if (row.claim_limit !== null && row.claimed_count >= row.claim_limit) {
+    return { ok: false, errorMessage: `Kuota klaim voucher "${row.code}" sudah habis.` };
+  }
+
+  if (params.customerId) {
+    const usageCount = (
+      db
+        .prepare('SELECT COUNT(*) as cnt FROM coupon_usages WHERE coupon_id = ? AND customer_id = ?')
+        .get(row.id, params.customerId) as { cnt: number }
+    ).cnt;
+    if (usageCount >= row.per_customer_limit) {
+      return {
+        ok: false,
+        errorMessage: `Anda sudah mencapai batas penggunaan voucher "${row.code}".`,
+      };
+    }
+  }
+
+  return {
+    ok: true,
+    coupon: {
+      code: row.code,
+      name: row.name,
+      discountType: row.discount_type,
+      discountValue: row.discount_value,
+      minPurchase: row.min_purchase,
+      maxDiscount: row.max_discount,
+      expiresAt: row.expires_at,
+    },
+  };
+}
+
+
