@@ -235,8 +235,12 @@ export const api = {
         replies: Array<{
           text: string;
           imageDataUrl?: string;
-          buttons?: Array<Array<{ text: string; callbackData?: string; replyText?: string }>>;
+          buttons?: Array<Array<{ text: string; callbackData?: string; url?: string; replyText?: string }>>;
         }>;
+        alert?: {
+          text: string;
+          showAlert: boolean;
+        };
       };
     }>('/api/admin/bots/demo', {
       method: 'POST',

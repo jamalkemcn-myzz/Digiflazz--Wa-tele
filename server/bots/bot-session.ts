@@ -4,7 +4,28 @@ export type BotConversationState =
   | { mode: 'IDLE'; updatedAt: number }
   | { mode: 'MAIN_MENU'; updatedAt: number }
   | { mode: 'CATEGORY_LIST'; categoryIds: number[]; updatedAt: number }
-  | { mode: 'PRODUCT_LIST'; skus: string[]; page: number; categoryId?: number; updatedAt: number }
+  | {
+      mode: 'BRAND_LIST';
+      categoryId: number;
+      categoryName: string;
+      brands: string[];
+      detectedDestination?: string;
+      updatedAt: number;
+    }
+  | {
+      mode: 'PRODUCT_LIST';
+      skus: string[];
+      page: number;
+      categoryId?: number;
+      brand?: string;
+      detectedDestination?: string;
+      updatedAt: number;
+    }
+  | {
+      mode: 'AWAITING_SEARCH_QUERY';
+      categoryId?: number;
+      updatedAt: number;
+    }
   | {
       mode: 'AWAITING_DESTINATION';
       sku: string;

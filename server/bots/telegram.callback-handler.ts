@@ -17,27 +17,40 @@ import {
 import { isMaintenanceMode } from '../services/settings.service';
 import { centralScheduler } from '../workers/scheduler';
 import {
+  getProductBySkuOrId,
+  listActiveBrandsInCategory,
+} from '../services/product.service';
+import {
   sendTelegramMainMenu,
   sendTelegramProfile,
   sendTelegramContactAdmin,
   handleTelegramVoucherCommand,
   sendTelegramCategoryList,
+  sendTelegramCategorySelection,
+  promptTelegramSearch,
   sendTelegramProductPage,
   promptTelegramProductDestination,
+  promptTelegramOrderConfirmation,
   executeTelegramOrder,
   handleTelegramOrderCancellation,
+  getTelegramMainMenuButtons,
   toMarkupKeyboard,
   toTelegramHtml,
   extractTelegramUserMeta,
   clearTrackedTelegramMessages,
   TG_ADMIN_MENU_BUTTONS,
-  TG_MAIN_MENU_BUTTONS,
   TG_NAV_BACK_BUTTONS,
   type TelegramInlineButton,
   type TelegramReplyTransport,
 } from './telegram.command-handler';
 import { sendTelegramQrisInvoice } from './telegram.notification.service';
 import { clearBotSession, getBotSession, recordTelegramBotMessageId } from './bot-session';
+
+export function formatTelegramStatusAlertText(text: string): string {
+  const clean = text.trim();
+  if (clean.length <= 200) return clean;
+  return `${clean.slice(0, 197).trimEnd()}...`;
+}
 
 export async function dispatchTelegramCallback(
   transport: TelegramReplyTransport,
@@ -50,7 +63,8 @@ export async function dispatchTelegramCallback(
     if (transport.answerCbQuery) await transport.answerCbQuery();
     return;
   }
-  if (transport.deleteSourceMessage) {
+  const isAlertOnlyCallback = data.startsWith('STATUS_');
+  if (!isAlertOnlyCallback && transport.deleteSourceMessage) {
     await transport.deleteSourceMessage();
   }
 
@@ -100,33 +114,109 @@ export async function dispatchTelegramCallback(
     return;
   }
 
+  if (data === 'CARI_PRODUK') {
+    if (transport.answerCbQuery) await transport.answerCbQuery();
+    await promptTelegramSearch(transport, {
+      userId: input.userId || 'guest',
+      dryRun,
+    });
+    return;
+  }
+
+  if (data.startsWith('CATBR_')) {
+    const match = data.match(/^CATBR_(\d+)_(\d+)_(.+)$/);
+    if (transport.answerCbQuery) await transport.answerCbQuery();
+    if (match) {
+      const categoryId = Number(match[1]);
+      const page = Number(match[2]) || 1;
+      const brand = match[3];
+      const userId = input.userId || 'guest';
+      const existingSession = getBotSession('TELEGRAM', userId, dryRun);
+      const detectedDestination =
+        existingSession?.mode === 'BRAND_LIST' || existingSession?.mode === 'PRODUCT_LIST'
+          ? existingSession.detectedDestination
+          : undefined;
+      await sendTelegramProductPage(transport, {
+        page,
+        categoryId,
+        brand,
+        detectedDestination,
+        userId,
+        dryRun,
+      });
+      return;
+    }
+  }
+
+  if (data.startsWith('CATBI_')) {
+    const match = data.match(/^CATBI_(\d+)_(\d+)_(\d+)$/);
+    if (transport.answerCbQuery) await transport.answerCbQuery();
+    if (match) {
+      const categoryId = Number(match[1]);
+      const brandIdx = Number(match[2]);
+      const page = Number(match[3]) || 1;
+      const userId = input.userId || 'guest';
+      const existingSession = getBotSession('TELEGRAM', userId, dryRun);
+      const sessionBrand = existingSession?.mode === 'BRAND_LIST' ? existingSession.brands[brandIdx] : undefined;
+      const brand = sessionBrand || listActiveBrandsInCategory(categoryId)[brandIdx]?.brand;
+      const detectedDestination =
+        existingSession?.mode === 'BRAND_LIST' || existingSession?.mode === 'PRODUCT_LIST'
+          ? existingSession.detectedDestination
+          : undefined;
+      await sendTelegramProductPage(transport, {
+        page,
+        categoryId,
+        brand,
+        detectedDestination,
+        userId,
+        dryRun,
+      });
+      return;
+    }
+  }
+
   if (data.startsWith('CAT_')) {
     const [, catIdStr, pageStr] = data.split('_');
     const categoryId = Number(catIdStr);
     const page = Number(pageStr) || 1;
+    const userId = input.userId || 'guest';
     if (transport.answerCbQuery) await transport.answerCbQuery();
-    await sendTelegramProductPage(transport, { page, categoryId });
+    if (!pageStr || page === 1) {
+      await sendTelegramCategorySelection(transport, { userId, categoryId, dryRun });
+    } else {
+      await sendTelegramProductPage(transport, { page, categoryId, userId, dryRun });
+    }
     return;
   }
 
   if (data.startsWith('PROD_PAGE_')) {
     const page = Number(data.replace('PROD_PAGE_', '')) || 1;
     if (transport.answerCbQuery) await transport.answerCbQuery();
-    await sendTelegramProductPage(transport, { page });
+    await sendTelegramProductPage(transport, { page, userId: input.userId || 'guest', dryRun });
     return;
   }
 
-  if (data.startsWith('BUY_SKU_')) {
-    const sku = data.replace('BUY_SKU_', '').trim();
+  if (data.startsWith('BUY_SKU_') || data.startsWith('BUY_ID_')) {
+    const skuOrId = data.startsWith('BUY_SKU_')
+      ? data.replace('BUY_SKU_', '').trim()
+      : data.replace('BUY_ID_', '').trim();
+    const userId = input.userId || 'guest';
+    const session = getBotSession('TELEGRAM', userId, dryRun);
     if (transport.answerCbQuery) await transport.answerCbQuery();
-    await promptTelegramProductDestination(transport, input.userId || 'guest', sku, dryRun);
-    return;
-  }
-
-  if (data.startsWith('BUY_ID_')) {
-    const prodId = data.replace('BUY_ID_', '').trim();
-    if (transport.answerCbQuery) await transport.answerCbQuery();
-    await promptTelegramProductDestination(transport, input.userId || 'guest', prodId, dryRun);
+    if (session?.mode === 'PRODUCT_LIST' && session.detectedDestination) {
+      const product = getProductBySkuOrId(skuOrId);
+      if (product && product.status === 'ACTIVE' && product.is_available === 1) {
+        await promptTelegramOrderConfirmation(transport, {
+          userId,
+          username: input.username,
+          sku: product.sku,
+          destination: session.detectedDestination,
+          dryRun,
+        });
+        return;
+      }
+    }
+    await promptTelegramProductDestination(transport, userId, skuOrId, dryRun);
     return;
   }
 
@@ -259,7 +349,7 @@ export async function dispatchTelegramCallback(
   }
 
   if (data.startsWith('STATUS_') && input.userId) {
-    const txId = data.replace('STATUS_', '');
+    const txId = data.replace('STATUS_', '').trim();
     const resolved = dryRun
       ? findCustomerByPlatform({ platform: 'TELEGRAM', platformUserId: input.userId })
       : resolveOrCreateCustomer({
@@ -267,32 +357,53 @@ export async function dispatchTelegramCallback(
           platformUserId: input.userId,
         });
     const detail = resolved ? getTransactionDetail(txId) : null;
-    if (transport.answerCbQuery) await transport.answerCbQuery();
+
     if (!detail || !resolved || detail.transaction.customer_id !== resolved.customer.id) {
       if (dryRun && txId.startsWith('TRX-DEMO-')) {
-        await transport.reply(
-          `Status ${txId}: PENDING_PAYMENT (Mode Demo)\nPembayaran: PENDING | Supplier: NONE`,
-          TG_NAV_BACK_BUTTONS
+        const demoAlert = formatTelegramStatusAlertText(
+          `Status ${txId}\nStatus: PENDING_PAYMENT (Mode Demo)\nPembayaran: PENDING | Supplier: NONE`
         );
+        if (transport.answerCbQuery) {
+          await transport.answerCbQuery(demoAlert, true);
+        } else {
+          await transport.reply(demoAlert, TG_NAV_BACK_BUTTONS);
+        }
         return;
       }
-      await transport.reply('Maaf Kak, transaksi tersebut tidak ditemukan pada akun Anda.', TG_NAV_BACK_BUTTONS);
+      const notFoundAlert = 'Maaf Kak, transaksi tersebut tidak ditemukan pada akun Anda.';
+      if (transport.answerCbQuery) {
+        await transport.answerCbQuery(notFoundAlert, true);
+      } else {
+        await transport.reply(notFoundAlert, TG_NAV_BACK_BUTTONS);
+      }
       return;
     }
+
     const t = detail.transaction;
-    const canCancel = ['CREATED', 'PENDING_PAYMENT', 'PAYMENT_PROCESSING'].includes(t.transaction_status);
-    const buttons: TelegramInlineButton[][] = canCancel
-      ? [
-          [{ text: 'Batalkan Pesanan', callbackData: `CANCEL_TX_${t.transaction_id}` }],
-          ...TG_NAV_BACK_BUTTONS,
-        ]
-      : TG_NAV_BACK_BUTTONS;
-    await transport.reply(
-      `Status ${t.transaction_id}: ${t.transaction_status}\n` +
-        `Pembayaran: ${t.payment_status} | Supplier: ${t.supplier_status}` +
-        (t.supplier_sn ? `\nSN / Token: ${t.supplier_sn}` : ''),
-      buttons
+    const shortProduct =
+      t.product_name_snapshot.length > 42
+        ? `${t.product_name_snapshot.slice(0, 39).trimEnd()}...`
+        : t.product_name_snapshot;
+    const alertText = formatTelegramStatusAlertText(
+      `ID: ${t.transaction_id}\n` +
+        `Produk: ${shortProduct}\n` +
+        `Status: ${t.transaction_status}\n` +
+        `Bayar: ${t.payment_status} | Supplier: ${t.supplier_status}` +
+        (t.supplier_sn ? `\nSN: ${t.supplier_sn}` : '')
     );
+
+    if (transport.answerCbQuery) {
+      await transport.answerCbQuery(alertText, true);
+    } else {
+      const canCancel = ['CREATED', 'PENDING_PAYMENT', 'PAYMENT_PROCESSING'].includes(t.transaction_status);
+      const buttons: TelegramInlineButton[][] = canCancel
+        ? [
+            [{ text: 'Batalkan Pesanan', callbackData: `CANCEL_TX_${t.transaction_id}` }],
+            ...TG_NAV_BACK_BUTTONS,
+          ]
+        : TG_NAV_BACK_BUTTONS;
+      await transport.reply(alertText, buttons);
+    }
     return;
   }
 
@@ -300,12 +411,12 @@ export async function dispatchTelegramCallback(
     if (transport.answerCbQuery) await transport.answerCbQuery();
     await transport.reply(
       `Panduan Belanja Praktis:\n` +
-        `1. Tap tombol Daftar Produk atau Kategori Produk.\n` +
+        `1. Tap tombol Daftar Produk atau Kategori Produk (lalu pilih operator / kirim nomor HP).\n` +
         `2. Pilih produk yang Anda mau, kirim nomor tujuan, lalu konfirmasi (Ya/Batal).\n` +
         `3. Bayar QRIS atau klik Link Pembayaran sebelum 5 menit sesuai nominal tepat.\n` +
         `4. Ketik /batal untuk membatalkan pesanan PENDING (minimal 30 detik setelah dibuat).\n` +
         `5. Hubungkan akun WhatsApp melalui tombol Hubungkan WhatsApp.`,
-      TG_MAIN_MENU_BUTTONS
+      getTelegramMainMenuButtons()
     );
     return;
   }
@@ -403,14 +514,17 @@ export function registerTelegramCallbacks(bot: Telegraf): void {
     let answered = false;
     let deleted = false;
 
-    const answerOnce = async () => {
+    const answerOnce = async (text?: string, showAlert?: boolean) => {
       if (answered) return;
       answered = true;
-      await ctx.answerCbQuery().catch(() => undefined);
+      await ctx.answerCbQuery(text, showAlert ? { show_alert: true } : undefined).catch(() => undefined);
     };
 
-    // Immediately acknowledge callback so Telegram removes the button loading spinner right away
-    void answerOnce();
+    // Immediately acknowledge non-alert callbacks so Telegram removes the button loading spinner right away;
+    // for STATUS_* callbacks we wait for DB lookup so we can display the popup alert text (show_alert: true).
+    if (!data.startsWith('STATUS_')) {
+      void answerOnce();
+    }
 
     let cleanupPromise: Promise<void> | null = null;
     const transport: TelegramReplyTransport = {
@@ -438,8 +552,8 @@ export function registerTelegramCallbacks(bot: Telegraf): void {
         }
         return msgId;
       },
-      async answerCbQuery() {
-        await answerOnce();
+      async answerCbQuery(text?: string, showAlert?: boolean) {
+        await answerOnce(text, showAlert);
       },
       async deleteSourceMessage() {
         if (deleted) return;

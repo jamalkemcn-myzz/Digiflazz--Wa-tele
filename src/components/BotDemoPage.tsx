@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Send, Trash2, Smartphone, MessageSquare } from 'lucide-react';
+import { Send, Trash2, Smartphone, MessageSquare, ExternalLink } from 'lucide-react';
 import { api } from '../api/client';
 import type { AdminSession } from '../types/admin';
 
@@ -9,6 +9,7 @@ type SenderRole = 'CUSTOMER' | 'ADMIN';
 interface ChatButton {
   text: string;
   callbackData?: string;
+  url?: string;
   replyText?: string;
 }
 
@@ -52,6 +53,7 @@ export function BotDemoPage({ admin }: { admin: AdminSession }) {
   const [inputText, setInputText] = useState('');
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [callbackAlert, setCallbackAlert] = useState<{ text: string; showAlert: boolean } | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const scrollEndRef = useRef<HTMLDivElement | null>(null);
 
@@ -90,8 +92,15 @@ export function BotDemoPage({ admin }: { admin: AdminSession }) {
       second: '2-digit',
     });
     const roleLabel = senderRole === 'ADMIN' ? `Admin (${admin.role})` : 'Pelanggan';
+    const isAlertOnlyCallback =
+      platform === 'TELEGRAM' &&
+      params.inputType === 'CALLBACK' &&
+      Boolean(params.callbackData?.startsWith('STATUS_'));
+
     const isTelegramClickDelete =
-      platform === 'TELEGRAM' && (Boolean(params.deletePreviousOnTelegram) || params.inputType === 'CALLBACK');
+      platform === 'TELEGRAM' &&
+      !isAlertOnlyCallback &&
+      (Boolean(params.deletePreviousOnTelegram) || params.inputType === 'CALLBACK');
 
     setMessages((prev) => {
       const next = isTelegramClickDelete
@@ -128,6 +137,10 @@ export function BotDemoPage({ admin }: { admin: AdminSession }) {
       });
 
       const replies = res.data.replies;
+      if (res.data.alert) {
+        setCallbackAlert(res.data.alert);
+      }
+
       const replyTime = new Date().toLocaleTimeString('id-ID', {
         hour: '2-digit',
         minute: '2-digit',
@@ -135,17 +148,19 @@ export function BotDemoPage({ admin }: { admin: AdminSession }) {
       });
 
       if (replies.length === 0) {
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: `b-${Date.now()}-empty`,
-            from: 'BOT',
-            platform,
-            senderLabel: platform === 'WHATSAPP' ? 'WhatsApp Bot' : 'Telegram Bot',
-            text: '(Tidak ada balasan dari handler untuk input ini)',
-            timestamp: replyTime,
-          },
-        ]);
+        if (!res.data.alert) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `b-${Date.now()}-empty`,
+              from: 'BOT',
+              platform,
+              senderLabel: platform === 'WHATSAPP' ? 'WhatsApp Bot' : 'Telegram Bot',
+              text: '(Tidak ada balasan dari handler untuk input ini)',
+              timestamp: replyTime,
+            },
+          ]);
+        }
       } else {
         setMessages((prev) => [
           ...prev,
@@ -459,34 +474,47 @@ export function BotDemoPage({ admin }: { admin: AdminSession }) {
                       <div className="mt-3 pt-2.5 border-t border-[#26334a] space-y-1.5">
                         {msg.buttons.map((row, rIdx) => (
                           <div key={rIdx} className="flex flex-wrap gap-1.5">
-                            {row.map((btn, bIdx) => (
-                              <button
-                                key={btn.callbackData || btn.replyText || bIdx}
-                                type="button"
-                                disabled={sending}
-                                onClick={() => {
-                                  if (btn.callbackData) {
-                                    void sendInteraction({
-                                      inputType: 'CALLBACK',
-                                      callbackData: btn.callbackData,
-                                      displayLabel: `[Klik Tombol] ${btn.text}`,
-                                      sourceMessageId: msg.id,
-                                      deletePreviousOnTelegram: true,
-                                    });
-                                  } else if (btn.replyText) {
-                                    void sendInteraction({
-                                      inputType: 'TEXT',
-                                      text: btn.replyText,
-                                      displayLabel: `[Klik Menu] ${btn.text}`,
-                                      sourceMessageId: msg.id,
-                                    });
-                                  }
-                                }}
-                                className="flex-1 min-w-[120px] px-3 py-1.5 text-xs font-semibold text-[#60a5fa] bg-[#142b59] hover:bg-[#19356e] border border-[#254e9c] rounded-md transition-colors cursor-pointer whitespace-nowrap disabled:opacity-50"
-                              >
-                                {btn.text}
-                              </button>
-                            ))}
+                            {row.map((btn, bIdx) =>
+                              btn.url ? (
+                                <a
+                                  key={`${btn.url}-${bIdx}`}
+                                  href={btn.url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="flex-1 min-w-[120px] inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-[#60a5fa] bg-[#142b59] hover:bg-[#19356e] border border-[#254e9c] rounded-md transition-colors whitespace-nowrap"
+                                >
+                                  <span>{btn.text}</span>
+                                  <ExternalLink className="w-3 h-3 opacity-80" />
+                                </a>
+                              ) : (
+                                <button
+                                  key={btn.callbackData || btn.replyText || bIdx}
+                                  type="button"
+                                  disabled={sending}
+                                  onClick={() => {
+                                    if (btn.callbackData) {
+                                      void sendInteraction({
+                                        inputType: 'CALLBACK',
+                                        callbackData: btn.callbackData,
+                                        displayLabel: `[Klik Tombol] ${btn.text}`,
+                                        sourceMessageId: msg.id,
+                                        deletePreviousOnTelegram: !btn.callbackData.startsWith('STATUS_'),
+                                      });
+                                    } else if (btn.replyText) {
+                                      void sendInteraction({
+                                        inputType: 'TEXT',
+                                        text: btn.replyText,
+                                        displayLabel: `[Klik Menu] ${btn.text}`,
+                                        sourceMessageId: msg.id,
+                                      });
+                                    }
+                                  }}
+                                  className="flex-1 min-w-[120px] px-3 py-1.5 text-xs font-semibold text-[#60a5fa] bg-[#142b59] hover:bg-[#19356e] border border-[#254e9c] rounded-md transition-colors cursor-pointer whitespace-nowrap disabled:opacity-50"
+                                >
+                                  {btn.text}
+                                </button>
+                              )
+                            )}
                           </div>
                         ))}
                       </div>
@@ -526,6 +554,33 @@ export function BotDemoPage({ admin }: { admin: AdminSession }) {
           </form>
         </div>
       </div>
+
+      {callbackAlert && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Callback Query Alert Telegram"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+        >
+          <div className="w-full max-w-sm rounded-xl bg-[#162033] border border-[#2b3c5c] p-5 shadow-2xl space-y-4">
+            <div className="text-xs font-semibold uppercase tracking-wider text-[#60a5fa]">
+              Telegram Callback Alert
+            </div>
+            <div className="text-sm text-slate-100 whitespace-pre-line leading-relaxed">
+              {callbackAlert.text}
+            </div>
+            <div className="flex justify-end">
+              <button
+                type="button"
+                onClick={() => setCallbackAlert(null)}
+                className="px-4 py-1.5 text-xs font-semibold text-white bg-[#1668ff] hover:bg-[#2574ff] rounded-lg cursor-pointer"
+              >
+                OK
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

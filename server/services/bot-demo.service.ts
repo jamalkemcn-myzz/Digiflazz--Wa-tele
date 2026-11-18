@@ -18,6 +18,7 @@ export type BotDemoInputType = 'TEXT' | 'CALLBACK';
 export interface BotDemoButton {
   text: string;
   callbackData?: string;
+  url?: string;
   replyText?: string;
 }
 
@@ -45,10 +46,15 @@ export interface BotDemoResponse {
   senderRole: BotDemoSenderRole;
   dryRun: true;
   replies: BotDemoReply[];
+  alert?: {
+    text: string;
+    showAlert: boolean;
+  };
 }
 
 export async function runBotDemoInteraction(input: BotDemoInput): Promise<BotDemoResponse> {
   const replies: BotDemoReply[] = [];
+  let callbackAlert: { text: string; showAlert: boolean } | undefined;
   const demoAdmin =
     input.senderRole === 'ADMIN'
       ? { role: input.actor.role, platformUserId: input.actor.id }
@@ -118,7 +124,11 @@ export async function runBotDemoInteraction(input: BotDemoInput): Promise<BotDem
         buttons:
           buttons && buttons.length > 0
             ? buttons.map((row) =>
-                row.map((b) => ({ text: b.text, callbackData: b.callbackData }))
+                row.map((b) => ({
+                  text: b.text,
+                  callbackData: b.callbackData,
+                  url: b.url,
+                }))
               )
             : undefined,
       });
@@ -142,14 +152,23 @@ export async function runBotDemoInteraction(input: BotDemoInput): Promise<BotDem
         buttons:
           buttons && buttons.length > 0
             ? buttons.map((row) =>
-                row.map((b) => ({ text: b.text, callbackData: b.callbackData }))
+                row.map((b) => ({
+                  text: b.text,
+                  callbackData: b.callbackData,
+                  url: b.url,
+                }))
               )
             : undefined,
       });
       return null;
     },
-    async answerCbQuery() {
-      // No-op in dashboard simulator
+    async answerCbQuery(text?: string, showAlert?: boolean) {
+      if (text && text.trim()) {
+        callbackAlert = {
+          text: text.trim(),
+          showAlert: Boolean(showAlert),
+        };
+      }
     },
   };
 
@@ -180,5 +199,6 @@ export async function runBotDemoInteraction(input: BotDemoInput): Promise<BotDem
     senderRole: input.senderRole,
     dryRun: true,
     replies,
+    ...(callbackAlert ? { alert: callbackAlert } : {}),
   };
 }

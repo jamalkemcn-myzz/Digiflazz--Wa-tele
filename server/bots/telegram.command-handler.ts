@@ -2,7 +2,18 @@ import { Markup, type Telegraf, type Context } from 'telegraf';
 import { getEffectivePermissions, type AdminRole } from '../domain/rbac';
 import { config } from '../config/env';
 import { maskDestination } from '../domain/masking';
-import { listCategories, listProducts, getProductBySkuOrId } from '../services/product.service';
+import {
+  listCategories,
+  getCategoryById,
+  listActiveBrandsInCategory,
+  listProducts,
+  getProductBySkuOrId,
+} from '../services/product.service';
+import {
+  detectOperatorFromPhone,
+  matchBrandForDetectedOperator,
+  isTelecomCategoryName,
+} from '../domain/operator-prefix';
 import {
   resolveOrCreateCustomer,
   findCustomerByPlatform,
@@ -52,13 +63,14 @@ import {
 
 export interface TelegramInlineButton {
   text: string;
-  callbackData: string;
+  callbackData?: string;
+  url?: string;
 }
 
 export interface TelegramReplyTransport {
   reply(text: string, buttons?: TelegramInlineButton[][]): Promise<void>;
   sendQris?(caption: string, qris?: { qrString?: string; qrUrl?: string }, buttons?: TelegramInlineButton[][]): Promise<number | null>;
-  answerCbQuery?(): Promise<void>;
+  answerCbQuery?(text?: string, showAlert?: boolean): Promise<void>;
   deleteSourceMessage?(): Promise<void>;
 }
 
@@ -91,6 +103,38 @@ export const TG_MAIN_MENU_BUTTONS: TelegramInlineButton[][] = [
     { text: 'Hubungi Admin', callbackData: 'CONTACT_ADMIN' },
   ],
 ];
+
+export function getTelegramAdminProfileUrl(cfg = config): string | null {
+  const cleanUsername = (cfg.auth.ownerTelegramUsername || '').replace(/^@+/, '').trim();
+  if (cleanUsername && /^[a-zA-Z0-9_]{3,64}$/.test(cleanUsername)) {
+    return `https://t.me/${cleanUsername}`;
+  }
+  const cleanId = (cfg.auth.ownerTelegramId || '').trim();
+  if (cleanId && /^\d{4,20}$/.test(cleanId)) {
+    return `tg://user?id=${cleanId}`;
+  }
+  return null;
+}
+
+export function getTelegramMainMenuButtons(cfg = config): TelegramInlineButton[][] {
+  const adminUrl = getTelegramAdminProfileUrl(cfg);
+  return [
+    [
+      { text: 'Kategori Produk', callbackData: 'CAT_LIST' },
+      { text: 'Daftar Produk', callbackData: 'PROD_PAGE_1' },
+    ],
+    [
+      { text: 'Profil & Saldo', callbackData: 'MY_PROFILE' },
+      { text: 'Redeem Voucher', callbackData: 'REDEEM_VOUCHER' },
+    ],
+    [
+      { text: 'Riwayat Transaksi', callbackData: 'MY_HISTORY' },
+      adminUrl
+        ? { text: 'Hubungi Admin', url: adminUrl }
+        : { text: 'Hubungi Admin', callbackData: 'CONTACT_ADMIN' },
+    ],
+  ];
+}
 
 export const TG_NAV_BACK_BUTTONS: TelegramInlineButton[][] = [
   [
@@ -151,7 +195,25 @@ function checkTgRateLimit(userId: number, max = 25, windowMs = 60_000): boolean 
 
 export function toMarkupKeyboard(buttons?: TelegramInlineButton[][]) {
   if (!buttons || buttons.length === 0) return undefined;
-  return Markup.inlineKeyboard(buttons.map((row) => row.map((b) => Markup.button.callback(b.text, b.callbackData))));
+  return Markup.inlineKeyboard(
+    buttons.map((row) =>
+      row.map((b) =>
+        b.url
+          ? Markup.button.url(b.text, b.url)
+          : Markup.button.callback(b.text, b.callbackData || 'MAIN_MENU')
+      )
+    )
+  );
+}
+
+export function buildBrandCallbackData(
+  categoryId: number,
+  brand: string,
+  brandIndex: number,
+  page = 1
+): string {
+  const direct = `CATBR_${categoryId}_${page}_${brand}`;
+  return Buffer.byteLength(direct, 'utf8') <= 64 ? direct : `CATBI_${categoryId}_${brandIndex}_${page}`;
 }
 
 export async function clearTrackedTelegramMessages(bot: Telegraf, chatId: string | number): Promise<void> {
@@ -236,7 +298,7 @@ export async function sendTelegramMainMenu(
       isAdmin,
       totalUsers,
     }),
-    TG_MAIN_MENU_BUTTONS
+    getTelegramMainMenuButtons()
   );
 }
 
@@ -262,12 +324,16 @@ export async function sendTelegramProfile(
 }
 
 export async function sendTelegramContactAdmin(transport: TelegramReplyTransport): Promise<void> {
-  await transport.reply(formatContactAdminMessage(config), [
-    [
-      { text: 'Riwayat Transaksi', callbackData: 'MY_HISTORY' },
-      { text: 'Menu Utama', callbackData: 'MAIN_MENU' },
-    ],
+  const adminUrl = getTelegramAdminProfileUrl();
+  const rows: TelegramInlineButton[][] = [];
+  if (adminUrl) {
+    rows.push([{ text: 'Chat Admin Telegram', url: adminUrl }]);
+  }
+  rows.push([
+    { text: 'Riwayat Transaksi', callbackData: 'MY_HISTORY' },
+    { text: 'Menu Utama', callbackData: 'MAIN_MENU' },
   ]);
+  await transport.reply(formatContactAdminMessage(config), rows);
 }
 
 export async function handleTelegramVoucherCommand(
@@ -333,22 +399,129 @@ export async function sendTelegramCategoryList(transport: TelegramReplyTransport
     buttons.push(shown.slice(i, i + 2).map((c) => ({ text: c.name, callbackData: `CAT_${c.id}_1` })));
   }
   buttons.push([
+    { text: 'Cari Produk', callbackData: 'CARI_PRODUK' },
     { text: 'Semua Produk', callbackData: 'PROD_PAGE_1' },
-    { text: 'Menu Utama', callbackData: 'MAIN_MENU' },
   ]);
+  buttons.push([{ text: 'Menu Utama', callbackData: 'MAIN_MENU' }]);
   await transport.reply('Pilih kategori produk yang ingin Kakak lihat:', buttons);
+}
+
+function buildBrandPickerButtons(
+  categoryId: number,
+  brands: Array<{ brand: string; productCount: number }>
+): TelegramInlineButton[][] {
+  const shown = brands.slice(0, 16);
+  const buttons: TelegramInlineButton[][] = [];
+  for (let i = 0; i < shown.length; i += 2) {
+    buttons.push(
+      shown.slice(i, i + 2).map((b, offset) => ({
+        text: `${b.brand} (${b.productCount})`,
+        callbackData: buildBrandCallbackData(categoryId, b.brand, i + offset, 1),
+      }))
+    );
+  }
+  buttons.push([
+    { text: 'Cari Produk', callbackData: 'CARI_PRODUK' },
+    { text: 'Kategori Lain', callbackData: 'CAT_LIST' },
+  ]);
+  buttons.push([{ text: 'Menu Utama', callbackData: 'MAIN_MENU' }]);
+  return buttons;
+}
+
+export async function sendTelegramCategorySelection(
+  transport: TelegramReplyTransport,
+  params: { userId: string; categoryId: number; dryRun?: boolean }
+): Promise<void> {
+  const cat = getCategoryById(params.categoryId);
+  const brands = listActiveBrandsInCategory(params.categoryId);
+
+  if (brands.length <= 1) {
+    await sendTelegramProductPage(transport, {
+      page: 1,
+      categoryId: params.categoryId,
+      brand: brands[0]?.brand,
+      userId: params.userId,
+      dryRun: params.dryRun,
+    });
+    return;
+  }
+
+  const brandNames = brands.map((b) => b.brand);
+  const existingSession = getBotSession('TELEGRAM', params.userId, params.dryRun);
+  const preservedDestination =
+    existingSession?.mode === 'BRAND_LIST' || existingSession?.mode === 'PRODUCT_LIST'
+      ? existingSession.detectedDestination
+      : undefined;
+
+  setBotSession(
+    'TELEGRAM',
+    params.userId,
+    {
+      mode: 'BRAND_LIST',
+      categoryId: params.categoryId,
+      categoryName: cat?.name || 'Produk',
+      brands: brandNames,
+      detectedDestination: preservedDestination,
+      updatedAt: Date.now(),
+    },
+    params.dryRun
+  );
+
+  const isTelecom = isTelecomCategoryName(cat?.name);
+  const msg = isTelecom
+    ? `Kategori: *${cat?.name || 'Produk'}*\n\n` +
+      `Kirim *nomor HP tujuan* sekarang untuk deteksi operator otomatis (contoh: 081812345678), atau pilih operator/brand di bawah:`
+    : `Kategori: *${cat?.name || 'Produk'}*\n\nPilih brand / layanan yang ingin Kakak lihat:`;
+
+  await transport.reply(msg, buildBrandPickerButtons(params.categoryId, brands));
+}
+
+export async function promptTelegramSearch(
+  transport: TelegramReplyTransport,
+  params: { userId: string; categoryId?: number; dryRun?: boolean }
+): Promise<void> {
+  setBotSession(
+    'TELEGRAM',
+    params.userId,
+    {
+      mode: 'AWAITING_SEARCH_QUERY',
+      categoryId: params.categoryId,
+      updatedAt: Date.now(),
+    },
+    params.dryRun
+  );
+  await transport.reply(
+    `Ketik kata kunci produk atau nominal yang ingin dicari (contoh: xl 10, telkomsel, ml 86, pln 50):`,
+    [
+      [
+        { text: 'Kategori Produk', callbackData: 'CAT_LIST' },
+        { text: 'Batal / Menu Utama', callbackData: 'MAIN_MENU' },
+      ],
+    ]
+  );
 }
 
 export async function sendTelegramProductPage(
   transport: TelegramReplyTransport,
-  params: { page: number; categoryId?: number; search?: string }
+  params: {
+    page: number;
+    categoryId?: number;
+    brand?: string;
+    search?: string;
+    detectedDestination?: string;
+    detectedOperatorLabel?: string;
+    userId?: string;
+    dryRun?: boolean;
+  }
 ): Promise<void> {
   const res = listProducts({
     page: params.page,
     limit: 6,
     categoryId: params.categoryId,
+    brand: params.brand,
     search: params.search,
     onlyActive: true,
+    sortBy: 'PRICE_ASC',
   });
 
   if (res.items.length === 0) {
@@ -358,13 +531,33 @@ export async function sendTelegramProductPage(
         : 'Maaf Kak, belum ada produk aktif di halaman ini saat ini.',
       [
         [
+          { text: 'Cari Lagi', callbackData: 'CARI_PRODUK' },
           { text: 'Kategori Produk', callbackData: 'CAT_LIST' },
-          { text: 'Semua Produk', callbackData: 'PROD_PAGE_1' },
         ],
-        [{ text: 'Menu Utama', callbackData: 'MAIN_MENU' }],
+        [
+          { text: 'Semua Produk', callbackData: 'PROD_PAGE_1' },
+          { text: 'Menu Utama', callbackData: 'MAIN_MENU' },
+        ],
       ]
     );
     return;
+  }
+
+  if (params.userId) {
+    setBotSession(
+      'TELEGRAM',
+      params.userId,
+      {
+        mode: 'PRODUCT_LIST',
+        skus: res.items.map((p) => p.sku),
+        page: params.page,
+        categoryId: params.categoryId,
+        brand: params.brand,
+        detectedDestination: params.detectedDestination,
+        updatedAt: Date.now(),
+      },
+      params.dryRun
+    );
   }
 
   const lines = res.items.map(
@@ -382,35 +575,79 @@ export async function sendTelegramProductPage(
     ];
   });
 
+  const brandIndex =
+    params.categoryId && params.brand
+      ? listActiveBrandsInCategory(params.categoryId).findIndex(
+          (b) => b.brand.toUpperCase() === params.brand!.toUpperCase()
+        )
+      : -1;
+
+  const makePageCallback = (targetPage: number) => {
+    if (params.categoryId && params.brand) {
+      return buildBrandCallbackData(
+        params.categoryId,
+        params.brand,
+        Math.max(0, brandIndex),
+        targetPage
+      );
+    }
+    if (params.categoryId) {
+      return `CAT_${params.categoryId}_${targetPage}`;
+    }
+    return `PROD_PAGE_${targetPage}`;
+  };
+
   const navRow: TelegramInlineButton[] = [];
   if (params.page > 1) {
     navRow.push({
       text: 'Sebelumnya',
-      callbackData: params.categoryId
-        ? `CAT_${params.categoryId}_${params.page - 1}`
-        : `PROD_PAGE_${params.page - 1}`,
+      callbackData: makePageCallback(params.page - 1),
     });
   }
   if (params.page < res.pagination.totalPages) {
     navRow.push({
       text: 'Berikutnya',
-      callbackData: params.categoryId
-        ? `CAT_${params.categoryId}_${params.page + 1}`
-        : `PROD_PAGE_${params.page + 1}`,
+      callbackData: makePageCallback(params.page + 1),
     });
   }
   if (navRow.length > 0) buttons.push(navRow);
 
-  buttons.push([
-    { text: 'Kategori Lain', callbackData: 'CAT_LIST' },
-    { text: 'Menu Utama', callbackData: 'MAIN_MENU' },
-  ]);
+  if (params.categoryId && params.brand) {
+    buttons.push([
+      { text: 'Ganti Operator / Brand', callbackData: `CAT_${params.categoryId}_1` },
+      { text: 'Cari Produk', callbackData: 'CARI_PRODUK' },
+    ]);
+    buttons.push([
+      { text: 'Kategori Lain', callbackData: 'CAT_LIST' },
+      { text: 'Menu Utama', callbackData: 'MAIN_MENU' },
+    ]);
+  } else {
+    buttons.push([
+      { text: 'Cari Produk', callbackData: 'CARI_PRODUK' },
+      { text: 'Kategori Lain', callbackData: 'CAT_LIST' },
+    ]);
+    buttons.push([{ text: 'Menu Utama', callbackData: 'MAIN_MENU' }]);
+  }
 
-  await transport.reply(
-    `Daftar Produk (Hal ${params.page}/${res.pagination.totalPages}):\n${lines.join('\n')}\n\n` +
-      `Tap tombol produk di bawah untuk langsung memesan ya Kak!`,
-    buttons
-  );
+  let header: string;
+  if (params.detectedDestination) {
+    header =
+      `Nomor *${params.detectedDestination}* terdeteksi operator *${params.brand || params.detectedOperatorLabel}* (Hal ${params.page}/${res.pagination.totalPages}):\n` +
+      `${lines.join('\n')}\n\n` +
+      `Tap produk di bawah untuk langsung lanjut konfirmasi pesanan ya Kak!`;
+  } else if (params.brand) {
+    header =
+      `Daftar *${params.brand}* (Hal ${params.page}/${res.pagination.totalPages}):\n` +
+      `${lines.join('\n')}\n\n` +
+      `Tap tombol produk di bawah untuk langsung memesan ya Kak!`;
+  } else {
+    header =
+      `Daftar Produk (Hal ${params.page}/${res.pagination.totalPages}):\n` +
+      `${lines.join('\n')}\n\n` +
+      `Tap tombol produk di bawah untuk langsung memesan ya Kak!`;
+  }
+
+  await transport.reply(header, buttons);
 }
 
 export async function promptTelegramProductDestination(
@@ -682,7 +919,13 @@ export async function dispatchTelegramCommand(
         await transport.reply('Pembuatan pesanan dibatalkan sebelum QRIS dibuat.', TG_NAV_BACK_BUTTONS);
         return;
       }
-      if ((session?.mode === 'AWAITING_DESTINATION' || session?.mode === 'AWAITING_VOUCHER_CODE') && !args[0]) {
+      if (
+        (session?.mode === 'AWAITING_DESTINATION' ||
+          session?.mode === 'AWAITING_VOUCHER_CODE' ||
+          session?.mode === 'BRAND_LIST' ||
+          session?.mode === 'AWAITING_SEARCH_QUERY') &&
+        !args[0]
+      ) {
         await sendTelegramMainMenu(
           transport,
           input.userId,
@@ -743,6 +986,62 @@ export async function dispatchTelegramCommand(
       return;
     }
 
+    if (session?.mode === 'BRAND_LIST') {
+      const detected = detectOperatorFromPhone(trimmed);
+      if (detected) {
+        const matchedBrand = matchBrandForDetectedOperator(session.brands, detected);
+        if (matchedBrand) {
+          await sendTelegramProductPage(transport, {
+            page: 1,
+            categoryId: session.categoryId,
+            brand: matchedBrand,
+            detectedDestination: detected.normalizedPhone,
+            detectedOperatorLabel: detected.displayName,
+            userId: input.userId,
+            dryRun,
+          });
+          return;
+        }
+        const activeBrands = listActiveBrandsInCategory(session.categoryId);
+        setBotSession(
+          'TELEGRAM',
+          input.userId,
+          {
+            ...session,
+            detectedDestination: detected.normalizedPhone,
+            updatedAt: Date.now(),
+          },
+          dryRun
+        );
+        await transport.reply(
+          `Nomor *${detected.normalizedPhone}* terdeteksi operator *${detected.displayName}*, namun produk ${detected.displayName} aktif belum tersedia di kategori *${session.categoryName}*.\n` +
+            `Silakan pilih operator/brand lain di bawah ini (nomor tetap tersimpan):`,
+          buildBrandPickerButtons(session.categoryId, activeBrands)
+        );
+        return;
+      }
+
+      await sendTelegramProductPage(transport, {
+        page: 1,
+        categoryId: session.categoryId,
+        search: trimmed,
+        userId: input.userId,
+        dryRun,
+      });
+      return;
+    }
+
+    if (session?.mode === 'AWAITING_SEARCH_QUERY') {
+      await sendTelegramProductPage(transport, {
+        page: 1,
+        categoryId: session.categoryId,
+        search: trimmed,
+        userId: input.userId,
+        dryRun,
+      });
+      return;
+    }
+
     if (session?.mode === 'AWAITING_VOUCHER_CODE') {
       await handleTelegramVoucherCommand(transport, {
         userId: input.userId,
@@ -772,7 +1071,7 @@ export async function dispatchTelegramCommand(
     await transport.reply(
       `${friendlyName(input.displayName, input.username)}! Maaf, saya belum memahami pesan "${trimmed}".\n` +
         `Kakak bisa langsung tekan tombol menu di bawah agar lebih mudah:`,
-      TG_MAIN_MENU_BUTTONS
+      getTelegramMainMenuButtons()
     );
     return;
   }
@@ -797,12 +1096,12 @@ export async function dispatchTelegramCommand(
       clearBotSession('TELEGRAM', input.userId, dryRun);
       await transport.reply(
         `Panduan Belanja Praktis:\n` +
-          `1. Tekan tombol Daftar Produk atau Kategori Produk.\n` +
-          `2. Pilih produk yang diinginkan, lalu kirim nomor tujuan & konfirmasi (Ya/Batal).\n` +
+          `1. Tekan tombol Daftar Produk atau Kategori Produk (lalu pilih operator / kirim nomor HP untuk deteksi otomatis).\n` +
+          `2. Pilih produk yang diinginkan, kirim nomor tujuan & konfirmasi (Ya/Batal).\n` +
           `3. Bayar QRIS atau klik Link Pembayaran sesuai nominal tepat sebelum batas waktu.\n` +
           `4. Ketik /batal untuk membatalkan transaksi PENDING (minimal 30 detik setelah dibuat).\n\n` +
           `Atau ketik langsung: /order <SKU> <TUJUAN> [KUPON] bila sudah hafal SKU.`,
-        TG_MAIN_MENU_BUTTONS
+        getTelegramMainMenuButtons()
       );
       return;
     }
@@ -847,9 +1146,53 @@ export async function dispatchTelegramCommand(
     return;
   }
 
+  if (cmd === 'cari_produk') {
+    const q = args.join(' ').trim();
+    if (q) {
+      await sendTelegramProductPage(transport, { page: 1, search: q, userId: input.userId, dryRun });
+    } else {
+      await promptTelegramSearch(transport, { userId: input.userId, dryRun });
+    }
+    return;
+  }
+
+  if (cmd === 'pulsa') {
+    const pulsaCat = listCategories(true).find((c) => /pulsa/i.test(c.name));
+    if (pulsaCat) {
+      const phoneArg = args[0]?.trim();
+      if (phoneArg) {
+        const detected = detectOperatorFromPhone(phoneArg);
+        if (detected) {
+          const brands = listActiveBrandsInCategory(pulsaCat.id).map((b) => b.brand);
+          const matched = matchBrandForDetectedOperator(brands, detected);
+          if (matched) {
+            await sendTelegramProductPage(transport, {
+              page: 1,
+              categoryId: pulsaCat.id,
+              brand: matched,
+              detectedDestination: detected.normalizedPhone,
+              detectedOperatorLabel: detected.displayName,
+              userId: input.userId,
+              dryRun,
+            });
+            return;
+          }
+        }
+      }
+      await sendTelegramCategorySelection(transport, {
+        userId: input.userId,
+        categoryId: pulsaCat.id,
+        dryRun,
+      });
+      return;
+    }
+    await sendTelegramCategoryList(transport);
+    return;
+  }
+
   if (cmd === 'produk') {
     const search = args.join(' ').trim() || undefined;
-    await sendTelegramProductPage(transport, { page: 1, search });
+    await sendTelegramProductPage(transport, { page: 1, search, userId: input.userId, dryRun });
     return;
   }
 
@@ -1201,7 +1544,7 @@ export async function dispatchTelegramCommand(
   await transport.reply(
     `${friendlyName(input.displayName, input.username)}! Maaf, perintah "${trimmed}" belum tersedia.\n` +
       `Silakan gunakan tombol menu di bawah ini:`,
-    TG_MAIN_MENU_BUTTONS
+    getTelegramMainMenuButtons()
   );
 }
 
@@ -1256,6 +1599,8 @@ export function registerTelegramCommands(bot: Telegraf): void {
       'hubungi_admin',
       'kategori',
       'produk',
+      'pulsa',
+      'cari_produk',
       'order',
       'batal',
       'cancel',

@@ -1837,6 +1837,204 @@ test('Product Auto-Refresh supports interval, daily time, cron, and disabled mod
   }
 });
 
+test('Telegram & WhatsApp Category -> Brand/Operator -> Product + Phone Prefix Auto-Detect (Opsi 1 & Opsi 2)', async () => {
+  const actor = { id: 'testowner', role: 'OWNER' as const };
+  const { createCategory, listActiveBrandsInCategory } = await import('./product.service');
+  const { detectOperatorFromPhone, matchBrandForDetectedOperator } = await import('../domain/operator-prefix');
+
+  const pulsaCat = createCategory({ name: 'Pulsa Otomatis' }, actor);
+  upsertProduct(
+    { sku: 'XL25', name: 'Pulsa XL 25.000', categoryId: pulsaCat.id, brand: 'XL', supplierPrice: 25100 },
+    actor
+  );
+  upsertProduct(
+    { sku: 'XL5', name: 'Pulsa XL 5.000', categoryId: pulsaCat.id, brand: 'XL', supplierPrice: 5400 },
+    actor
+  );
+  upsertProduct(
+    { sku: 'TSEL10_B', name: 'Pulsa Telkomsel 10.000', categoryId: pulsaCat.id, brand: 'TELKOMSEL', supplierPrice: 10200 },
+    actor
+  );
+  upsertProduct(
+    { sku: 'ISAT10', name: 'Pulsa Indosat 10.000', categoryId: pulsaCat.id, brand: 'INDOSAT', supplierPrice: 10300 },
+    actor
+  );
+
+  // Prefix detection helper sanity checks
+  const xlDetected = detectOperatorFromPhone('+62 818-1234-5678')!;
+  assert.equal(xlDetected.normalizedPhone, '081812345678');
+  assert.equal(xlDetected.operatorKey, 'XL');
+  assert.equal(
+    matchBrandForDetectedOperator(
+      listActiveBrandsInCategory(pulsaCat.id).map((b) => b.brand),
+      xlDetected
+    ),
+    'XL'
+  );
+
+  // 1. Telegram Opsi 1: Selecting Pulsa Otomatis shows brand buttons + phone auto-detect prompt
+  const tgCatStep = await runBotDemoInteraction({
+    platform: 'TELEGRAM',
+    senderRole: 'CUSTOMER',
+    inputType: 'CALLBACK',
+    callbackData: `CAT_${pulsaCat.id}_1`,
+    senderId: '777888',
+    actor,
+  });
+  assert.match(tgCatStep.replies[0].text, /deteksi operator otomatis/i);
+  const tgBrandBtnTexts = (tgCatStep.replies[0].buttons || []).flat().map((b) => b.text);
+  assert.ok(tgBrandBtnTexts.some((t) => t.startsWith('XL')));
+  assert.ok(tgBrandBtnTexts.some((t) => t.startsWith('TELKOMSEL')));
+
+  // 2. Telegram Opsi 2: Sending XL phone number auto-detects XL and lists XL products cheapest first
+  const tgAutoDetect = await runBotDemoInteraction({
+    platform: 'TELEGRAM',
+    senderRole: 'CUSTOMER',
+    inputType: 'TEXT',
+    text: '081812345678',
+    senderId: '777888',
+    actor,
+  });
+  assert.match(tgAutoDetect.replies[0].text, /081812345678.*terdeteksi operator \*XL\*/i);
+  const tgProductBtns = (tgAutoDetect.replies[0].buttons || []).flat();
+  const xlProductLabels = tgProductBtns.filter((b) => b.callbackData?.startsWith('BUY_SKU_XL')).map((b) => b.text);
+  assert.equal(xlProductLabels.length, 2);
+  assert.ok(xlProductLabels[0].includes('Pulsa XL 5.000'));
+  assert.ok(xlProductLabels[1].includes('Pulsa XL 25.000'));
+
+  // Tapping BUY_SKU_XL5 after auto-detection skips phone prompt and goes straight to Order Confirmation!
+  const tgQuickConfirm = await runBotDemoInteraction({
+    platform: 'TELEGRAM',
+    senderRole: 'CUSTOMER',
+    inputType: 'CALLBACK',
+    callbackData: 'BUY_SKU_XL5',
+    senderId: '777888',
+    actor,
+  });
+  assert.match(tgQuickConfirm.replies[0].text, /Konfirmasi Pesanan Anda/i);
+  assert.ok(tgQuickConfirm.replies[0].text.includes('081812345678'));
+  assert.ok(tgQuickConfirm.replies[0].text.includes('Pulsa XL 5.000'));
+
+  // 3. WhatsApp Opsi 1 + Opsi 2 flow
+  const waCatStep = await runBotDemoInteraction({
+    platform: 'WHATSAPP',
+    senderRole: 'CUSTOMER',
+    inputType: 'TEXT',
+    text: `!produk_kat ${pulsaCat.id} 1`,
+    senderId: '6281999000111',
+    actor,
+  });
+  assert.match(waCatStep.replies[0].text, /deteksi operator otomatis/i);
+
+  const waAutoDetect = await runBotDemoInteraction({
+    platform: 'WHATSAPP',
+    senderRole: 'CUSTOMER',
+    inputType: 'TEXT',
+    text: '!081812345678',
+    senderId: '6281999000111',
+    actor,
+  });
+  assert.match(waAutoDetect.replies[0].text, /081812345678 Terdeteksi: XL/i);
+
+  // Choosing !1 picks cheapest XL product (XL5) and goes straight to Confirmation with 081812345678
+  const waQuickConfirm = await runBotDemoInteraction({
+    platform: 'WHATSAPP',
+    senderRole: 'CUSTOMER',
+    inputType: 'TEXT',
+    text: '!1',
+    senderId: '6281999000111',
+    actor,
+  });
+  assert.match(waQuickConfirm.replies[0].text, /Konfirmasi Pesanan Anda/i);
+  assert.ok(waQuickConfirm.replies[0].text.includes('081812345678'));
+});
+
+test('Telegram Hubungi Admin URL Button & Cek Status Callback Query Alert (show_alert: true)', async () => {
+  const prevUsername = process.env.OWNER_TELEGRAM_USERNAME;
+  const prevId = process.env.OWNER_TELEGRAM_ID;
+
+  try {
+    // 1. With OWNER_TELEGRAM_USERNAME configured -> https://t.me/<username>
+    process.env.OWNER_TELEGRAM_USERNAME = '@admin_pulsasync';
+    process.env.OWNER_TELEGRAM_ID = '987654321';
+    refreshConfig(process.env);
+
+    const { getTelegramMainMenuButtons } = await import('../bots/telegram.command-handler');
+    const { dispatchTelegramCallback } = await import('../bots/telegram.callback-handler');
+
+    const menuWithUsername = getTelegramMainMenuButtons().flat();
+    const adminBtnUser = menuWithUsername.find((b) => b.text === 'Hubungi Admin');
+    assert.equal(adminBtnUser?.url, 'https://t.me/admin_pulsasync');
+    assert.equal(adminBtnUser?.callbackData, undefined);
+
+    // 2. Without username, with numeric OWNER_TELEGRAM_ID -> tg://user?id=<id>
+    process.env.OWNER_TELEGRAM_USERNAME = '';
+    process.env.OWNER_TELEGRAM_ID = '987654321';
+    refreshConfig(process.env);
+    const adminBtnId = getTelegramMainMenuButtons()
+      .flat()
+      .find((b) => b.text === 'Hubungi Admin');
+    assert.equal(adminBtnId?.url, 'tg://user?id=987654321');
+
+    // 3. Without both -> fallback to CONTACT_ADMIN callback
+    process.env.OWNER_TELEGRAM_USERNAME = '';
+    process.env.OWNER_TELEGRAM_ID = '';
+    refreshConfig(process.env);
+    const adminBtnFallback = getTelegramMainMenuButtons()
+      .flat()
+      .find((b) => b.text === 'Hubungi Admin');
+    assert.equal(adminBtnFallback?.url, undefined);
+    assert.equal(adminBtnFallback?.callbackData, 'CONTACT_ADMIN');
+
+    // 4. STATUS_ callback invokes answerCbQuery(text, true) without deleting source QRIS message
+    let alertCalls: Array<{ text?: string; showAlert?: boolean }> = [];
+    let deleteCalls = 0;
+    let replyCalls = 0;
+
+    await dispatchTelegramCallback(
+      {
+        async reply() {
+          replyCalls++;
+        },
+        async answerCbQuery(text, showAlert) {
+          alertCalls.push({ text, showAlert });
+        },
+        async deleteSourceMessage() {
+          deleteCalls++;
+        },
+      },
+      { data: 'STATUS_TRX-DEMO-999', userId: '555666', username: 'Tester' },
+      { dryRun: true }
+    );
+
+    assert.equal(deleteCalls, 0);
+    assert.equal(replyCalls, 0);
+    assert.equal(alertCalls.length, 1);
+    assert.equal(alertCalls[0].showAlert, true);
+    assert.ok(alertCalls[0].text && alertCalls[0].text.length <= 200);
+    assert.match(alertCalls[0].text!, /PENDING_PAYMENT/);
+
+    // Same check via BotDemoService (demo mode)
+    const demoStatus = await runBotDemoInteraction({
+      platform: 'TELEGRAM',
+      senderRole: 'CUSTOMER',
+      inputType: 'CALLBACK',
+      callbackData: 'STATUS_TRX-DEMO-999',
+      senderId: '555666',
+      actor: { id: 'testowner', role: 'OWNER' },
+    });
+    assert.equal(demoStatus.replies.length, 0);
+    assert.equal(demoStatus.alert?.showAlert, true);
+    assert.match(demoStatus.alert?.text || '', /PENDING_PAYMENT/);
+  } finally {
+    if (prevUsername === undefined) delete process.env.OWNER_TELEGRAM_USERNAME;
+    else process.env.OWNER_TELEGRAM_USERNAME = prevUsername;
+    if (prevId === undefined) delete process.env.OWNER_TELEGRAM_ID;
+    else process.env.OWNER_TELEGRAM_ID = prevId;
+    refreshConfig(process.env);
+  }
+});
+
 test.after(() => {
   closeDb();
   fs.rmSync(tempDir, { recursive: true, force: true });

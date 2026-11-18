@@ -20,6 +20,7 @@ export interface AppConfig {
     sessionSecret: string;
     ownerWhatsappJid: string;
     ownerTelegramId: string;
+    ownerTelegramUsername: string;
   };
   paymentGateway: {
     baseUrl: string;
@@ -187,6 +188,10 @@ export function validateAndLoadConfig(env: NodeJS.ProcessEnv = process.env): App
 
   try {
     port = parseIntBounded('PORT', env.PORT, 3000, 1, 65535);
+    // In AI Studio's Cloud Run dev container, nginx occupies PORT=8080 and proxies to the dev server on port 3000.
+    if (nodeEnv === 'development' && env.K_SERVICE && env.APP_DIR === '/app/applet' && port === 8080) {
+      port = 3000;
+    }
     appUrl = parseUrl('APP_URL', env.APP_URL, `http://localhost:${port}`);
     gatewayBaseUrl = parseUrl(
       'PAYMENT_GATEWAY_BASE_URL',
@@ -328,6 +333,7 @@ export function validateAndLoadConfig(env: NodeJS.ProcessEnv = process.env): App
       sessionSecret,
       ownerWhatsappJid: (env.OWNER_WHATSAPP_JID || '').trim(),
       ownerTelegramId: (env.OWNER_TELEGRAM_ID || '').trim(),
+      ownerTelegramUsername: (env.OWNER_TELEGRAM_USERNAME || '').trim().replace(/^@+/, ''),
     },
     paymentGateway: {
       baseUrl: gatewayBaseUrl,

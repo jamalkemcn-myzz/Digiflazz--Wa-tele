@@ -66,6 +66,37 @@ export function listCategories(onlyActive = false): CategoryRow[] {
   return db.prepare(`SELECT * FROM categories ${where} ORDER BY name ASC`).all() as CategoryRow[];
 }
 
+export function getCategoryById(id: number): CategoryRow | null {
+  const db = getDb();
+  return (db.prepare('SELECT * FROM categories WHERE id = ?').get(id) as CategoryRow | undefined) ?? null;
+}
+
+export interface CategoryBrandSummary {
+  brand: string;
+  productCount: number;
+  minPrice: number;
+}
+
+export function listActiveBrandsInCategory(categoryId: number): CategoryBrandSummary[] {
+  const db = getDb();
+  return db
+    .prepare(
+      `SELECT
+         COALESCE(NULLIF(TRIM(brand), ''), 'LAINNYA') as brand,
+         COUNT(*) as productCount,
+         MIN(selling_price) as minPrice
+       FROM products
+       WHERE category_id = ?
+         AND status = 'ACTIVE'
+         AND is_available = 1
+       GROUP BY UPPER(COALESCE(NULLIF(TRIM(brand), ''), 'LAINNYA'))
+       ORDER BY
+         CASE WHEN COALESCE(NULLIF(TRIM(brand), ''), 'LAINNYA') = 'LAINNYA' THEN 1 ELSE 0 END ASC,
+         brand ASC`
+    )
+    .all(categoryId) as CategoryBrandSummary[];
+}
+
 export function createCategory(
   input: { name: string; marginType?: MarginType | null; marginValue?: number | null; maxMargin?: number | null },
   actor: { id: string; role: string }
@@ -187,8 +218,10 @@ export function listProducts(params: {
   page?: number;
   limit?: number;
   categoryId?: number;
+  brand?: string;
   search?: string;
   onlyActive?: boolean;
+  sortBy?: 'NAME_ASC' | 'PRICE_ASC';
 }) {
   const db = getDb();
   const page = Math.max(1, params.page ?? 1);
@@ -205,11 +238,25 @@ export function listProducts(params: {
     where.push('p.category_id = ?');
     args.push(params.categoryId);
   }
+  if (params.brand && params.brand.trim()) {
+    const cleanBrand = params.brand.trim();
+    if (cleanBrand.toUpperCase() === 'LAINNYA') {
+      where.push("(p.brand IS NULL OR TRIM(p.brand) = '')");
+    } else {
+      where.push('UPPER(TRIM(p.brand)) = UPPER(TRIM(?))');
+      args.push(cleanBrand);
+    }
+  }
   if (params.search) {
     where.push('(p.sku LIKE ? OR p.name LIKE ? OR p.brand LIKE ?)');
     const q = `%${params.search}%`;
     args.push(q, q, q);
   }
+
+  const orderBySql =
+    params.sortBy === 'PRICE_ASC'
+      ? 'ORDER BY p.selling_price ASC, p.name ASC'
+      : 'ORDER BY p.name ASC';
 
   const whereSql = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
   const total = (
@@ -222,7 +269,7 @@ export function listProducts(params: {
        FROM products p
        LEFT JOIN categories c ON c.id = p.category_id
        ${whereSql}
-       ORDER BY p.name ASC LIMIT ? OFFSET ?`
+       ${orderBySql} LIMIT ? OFFSET ?`
     )
     .all(...args, limit, offset) as ProductRow[];
 
