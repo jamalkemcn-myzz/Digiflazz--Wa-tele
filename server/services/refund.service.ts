@@ -77,6 +77,8 @@ export function processAutomaticRefund(
           customer_id: number;
           customer_code: string;
           product_name_snapshot: string;
+          destination: string;
+          platform: string;
           payment_amount: number;
           payment_status: PaymentStatus;
           supplier_status: SupplierStatus;
@@ -188,6 +190,8 @@ export function processAutomaticRefund(
       transactionId,
       customerCode: tx.customer_code,
       productName: tx.product_name_snapshot,
+      destination: tx.destination,
+      platform: tx.platform,
       amount: result.amount ?? 0,
       status: 'REFUNDED',
       note: `Refund internal dicatat (${reason})`,

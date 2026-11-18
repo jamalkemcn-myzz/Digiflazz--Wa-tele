@@ -16,7 +16,12 @@ import { resolveOrCreateCustomer, findCustomerByPlatform, type CustomerPlatform 
 import { getGlobalMarginRule, getProductBySkuOrId } from './product.service';
 import { validateAndClaimCouponInTx, previewCouponReadOnly } from './coupon.service';
 import { isMaintenanceMode } from './settings.service';
-import { emitTransactionLogToGroups, notifyCustomerForTransaction } from './notification.service';
+import {
+  emitTransactionLogToGroups,
+  emitSuccessAdminLogToGroups,
+  emitTestimonyToGroups,
+  notifyCustomerForTransaction,
+} from './notification.service';
 import { processAutomaticRefund } from './refund.service';
 import { defaultPaymentGateway, type PaymentGatewayPort } from '../integrations/myzzstore.gateway';
 import { digiflazzService, type DigiflazzService } from '../integrations/digiflazz.service';
@@ -508,6 +513,8 @@ export async function createOrder(
     transactionId: pendingTx.transaction_id,
     customerCode: customer.customer_code,
     productName: pendingTx.product_name_snapshot,
+    destination: pendingTx.destination,
+    platform: pendingTx.platform,
     amount: pendingTx.payment_amount,
     status: pendingTx.transaction_status,
     note: `Invoice QRIS dibuat (Ref: ${pendingTx.gateway_reference || '-'})`,
@@ -627,6 +634,8 @@ export function handleVerifiedPaymentPaid(
       transactionId,
       customerCode: cus.customer_code,
       productName: result.transaction.product_name_snapshot,
+      destination: result.transaction.destination,
+      platform: result.transaction.platform,
       amount: result.transaction.payment_amount,
       status: 'PAID_PROCESSING',
       note: `Pembayaran terverifikasi via ${source}`,
@@ -748,15 +757,74 @@ export async function processSingleSupplierJob(
         `Terima kasih telah bertransaksi.`,
     });
 
+    const productMeta = db
+      .prepare(
+        `SELECT p.brand, c.name as category_name
+         FROM products p
+         LEFT JOIN categories c ON c.id = p.category_id
+         WHERE p.id = ?`
+      )
+      .get(tx.product_id) as { brand: string | null; category_name: string | null } | undefined;
+
+    const identity =
+      (db
+        .prepare(
+          `SELECT platform_user_id, platform_username
+           FROM customer_identities
+           WHERE customer_id = ? AND platform = ?
+           LIMIT 1`
+        )
+        .get(tx.customer_id, tx.platform) as
+        | { platform_user_id: string; platform_username: string | null }
+        | undefined) ||
+      (db
+        .prepare(
+          `SELECT platform_user_id, platform_username
+           FROM customer_identities
+           WHERE customer_id = ?
+           ORDER BY id ASC
+           LIMIT 1`
+        )
+        .get(tx.customer_id) as
+        | { platform_user_id: string; platform_username: string | null }
+        | undefined);
+
     emitTransactionLogToGroups({
       eventKey: 'success',
       transactionId: tx.transaction_id,
       customerCode: cus.customer_code,
       productName: tx.product_name_snapshot,
+      destination: tx.destination,
+      platform: tx.platform,
       amount: tx.payment_amount,
       status: 'SUCCESS',
       note: `Sukses Digiflazz${resp.sn ? ` SN:${resp.sn}` : ''}`,
     });
+
+    const successPayload = {
+      transactionId: tx.transaction_id,
+      platform: tx.platform,
+      customerCode: cus.customer_code,
+      platformUserId: identity?.platform_user_id ?? null,
+      platformUsername: identity?.platform_username ?? null,
+      categoryName: productMeta?.category_name ?? null,
+      brand: productMeta?.brand ?? null,
+      productSku: tx.product_sku_snapshot,
+      productName: tx.product_name_snapshot,
+      destination: tx.destination,
+      sn: resp.sn ?? null,
+      supplierPrice: tx.supplier_price_snapshot,
+      margin: tx.margin_snapshot,
+      discount: tx.discount_snapshot,
+      uniqueCode: tx.unique_code,
+      paymentAmount: tx.payment_amount,
+      supplierReference: resp.refId ?? tx.supplier_reference ?? null,
+      gatewayReference: tx.gateway_reference ?? null,
+      completedAt: finishNow,
+    };
+
+    emitSuccessAdminLogToGroups(successPayload);
+    emitTestimonyToGroups(successPayload);
 
     return { handled: true, status: 'SUCCESS' };
   }
@@ -827,6 +895,8 @@ export async function processSingleSupplierJob(
         transactionId: tx.transaction_id,
         customerCode: cus.customer_code,
         productName: tx.product_name_snapshot,
+        destination: tx.destination,
+        platform: tx.platform,
         amount: tx.payment_amount,
         status: 'SUPPLIER_PENDING',
         note: 'Menunggu hasil supplier (inquiry terjadwal)',
@@ -1352,6 +1422,8 @@ export async function cancelCustomerTransaction(
     transactionId: cancelled.transaction_id,
     customerCode: resolved.customer.customer_code,
     productName: cancelled.product_name_snapshot,
+    destination: cancelled.destination,
+    platform: cancelled.platform,
     amount: cancelled.payment_amount,
     status: 'CANCELLED',
     note: `Dibatalkan oleh pelanggan via ${input.platform}`,

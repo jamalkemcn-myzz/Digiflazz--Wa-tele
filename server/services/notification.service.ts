@@ -1,7 +1,12 @@
 import { getDb } from '../database/connection';
 import { config } from '../config/env';
 import { logger } from '../logging/logger';
-import { maskCustomerIdentifier } from '../domain/masking';
+import {
+  maskBuyerForTestimony,
+  maskDestination,
+  maskSerialNumber,
+  maskTransactionId,
+} from '../domain/masking';
 
 export type NotificationSender = (params: {
   recipientId: string;
@@ -16,6 +21,38 @@ const senders: {
   WHATSAPP: null,
   TELEGRAM: null,
 };
+
+let runtimeTelegramBotUsername: string | null = null;
+
+export function setTelegramBotUsernameForLogs(username: string | null): void {
+  const cleaned = (username || '').trim().replace(/^@+/, '');
+  runtimeTelegramBotUsername = cleaned || null;
+}
+
+export function getEffectiveBotDisplayHandle(): string {
+  const tgUsername = runtimeTelegramBotUsername || config.telegram.botUsername;
+  if (tgUsername) return `@${tgUsername}`;
+  return config.shopName;
+}
+
+export function formatGroupLogTimestamp(isoDate?: string): string {
+  const date = isoDate ? new Date(isoDate) : new Date();
+  const safeDate = Number.isNaN(date.getTime()) ? new Date() : date;
+  try {
+    return new Intl.DateTimeFormat('id-ID', {
+      timeZone: config.timezone || 'Asia/Jakarta',
+      day: '2-digit',
+      month: '2-digit',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    }).format(safeDate);
+  } catch {
+    return safeDate.toISOString();
+  }
+}
 
 export function registerNotificationSender(
   platform: 'WHATSAPP' | 'TELEGRAM',
@@ -59,8 +96,9 @@ export function enqueueNotification(params: {
   }
 }
 
+// 1. Log event layanan admin
 export function emitServiceLogToGroups(eventKey: string, title: string, safeSummary: string): void {
-  const timestamp = new Date().toISOString();
+  const timestamp = formatGroupLogTimestamp();
   const text = `[SERVICE LOG]\nWaktu: ${timestamp}\nEvent: ${title}\nDetail: ${safeSummary}`;
 
   if (config.whatsapp.enabled && config.whatsapp.serviceLogGroup) {
@@ -84,24 +122,27 @@ export function emitServiceLogToGroups(eventKey: string, title: string, safeSumm
   }
 }
 
+// 2. Log all transaksi admin
 export function emitTransactionLogToGroups(params: {
   eventKey: string;
   transactionId: string;
   customerCode: string;
   productName: string;
+  destination?: string;
+  platform?: string;
   amount: number;
   status: string;
   note: string;
 }): void {
-  const timestamp = new Date().toISOString();
-  const maskedCustomer = maskCustomerIdentifier(params.customerCode);
+  const timestamp = formatGroupLogTimestamp();
   const text =
-    `[TRANSACTION LOG]\n` +
+    `[ALL TRANSAKSI ADMIN]\n` +
     `Waktu: ${timestamp}\n` +
     `ID: ${params.transactionId}\n` +
-    `Pelanggan: ${maskedCustomer}\n` +
+    `Pelanggan: ${params.customerCode}${params.platform ? ` (${params.platform})` : ''}\n` +
     `Produk: ${params.productName}\n` +
-    `Nominal: Rp${params.amount.toLocaleString('id-ID')}\n` +
+    (params.destination ? `Tujuan: ${params.destination}\n` : '') +
+    `Nominal: Rp ${params.amount.toLocaleString('id-ID')}\n` +
     `Status: ${params.status}\n` +
     `Keterangan: ${params.note}`;
 
@@ -127,6 +168,155 @@ export function emitTransactionLogToGroups(params: {
     });
   }
 }
+
+export interface SuccessGroupLogParams {
+  transactionId: string;
+  platform: 'WHATSAPP' | 'TELEGRAM' | 'DASHBOARD';
+  customerCode: string;
+  platformUserId?: string | null;
+  platformUsername?: string | null;
+  categoryName?: string | null;
+  brand?: string | null;
+  productSku: string;
+  productName: string;
+  destination: string;
+  sn?: string | null;
+  supplierPrice: number;
+  margin: number;
+  discount: number;
+  uniqueCode: number;
+  paymentAmount: number;
+  supplierReference?: string | null;
+  gatewayReference?: string | null;
+  completedAt?: string;
+}
+
+// 3. Log transaksi sukses admin (FULL TANPA SENSOR, khusus grup admin)
+export function emitSuccessAdminLogToGroups(params: SuccessGroupLogParams): void {
+  const timestamp = formatGroupLogTimestamp(params.completedAt);
+  const serviceLabel =
+    params.categoryName && params.brand && params.categoryName.toLowerCase() !== params.brand.toLowerCase()
+      ? `${params.categoryName} • ${params.brand}`
+      : params.categoryName || params.brand || 'Produk PPOB';
+  const buyerIdentityParts = [params.customerCode];
+  if (params.platformUsername) {
+    buyerIdentityParts.push(`@${params.platformUsername.replace(/^@+/, '')}`);
+  }
+  if (params.platformUserId) {
+    buyerIdentityParts.push(`ID:${params.platformUserId}`);
+  }
+
+  const text =
+    `✅ [LOG TRANSAKSI SUKSES ADMIN]\n` +
+    `Waktu: ${timestamp}\n` +
+    `Order ID: ${params.transactionId}\n` +
+    `Platform: ${params.platform}\n` +
+    `Pembeli: ${buyerIdentityParts.join(' | ')}\n` +
+    `Layanan: ${serviceLabel}\n` +
+    `Produk: ${params.productName} (${params.productSku})\n` +
+    `Tujuan: ${params.destination}\n` +
+    `SN / Token: ${params.sn || '-'}\n` +
+    `Modal Supplier: Rp ${params.supplierPrice.toLocaleString('id-ID')}\n` +
+    `Diskon: Rp ${params.discount.toLocaleString('id-ID')} | Kode Unik: ${params.uniqueCode}\n` +
+    `Total Bayar: Rp ${params.paymentAmount.toLocaleString('id-ID')}\n` +
+    `Margin: Rp ${params.margin.toLocaleString('id-ID')}\n` +
+    `Ref Supplier: ${params.supplierReference || '-'}\n` +
+    `Ref Gateway: ${params.gatewayReference || '-'}`;
+
+  if (config.whatsapp.enabled && config.whatsapp.successLogGroup) {
+    enqueueNotification({
+      dedupeKey: `txok-wa-${params.transactionId}`,
+      transactionId: params.transactionId,
+      platform: 'WHATSAPP',
+      recipientId: config.whatsapp.successLogGroup,
+      messageType: 'SUCCESS_ADMIN_LOG',
+      payload: { text },
+    });
+  }
+
+  if (config.telegram.enabled && config.telegram.successLogChatId) {
+    enqueueNotification({
+      dedupeKey: `txok-tg-${params.transactionId}`,
+      transactionId: params.transactionId,
+      platform: 'TELEGRAM',
+      recipientId: config.telegram.successLogChatId,
+      messageType: 'SUCCESS_ADMIN_LOG',
+      payload: { text },
+    });
+  }
+}
+
+export function formatTestimonyMessage(params: SuccessGroupLogParams): string {
+  const timestamp = formatGroupLogTimestamp(params.completedAt);
+  const serviceLabel =
+    params.categoryName && params.brand && params.categoryName.toLowerCase() !== params.brand.toLowerCase()
+      ? `${params.categoryName} • ${params.brand}`
+      : params.categoryName || params.brand || 'Layanan PPOB';
+  const maskedDestination = maskDestination(params.destination);
+  const maskedOrder = maskTransactionId(params.transactionId);
+  const { buyerLabel, maskedId } = maskBuyerForTestimony({
+    customerCode: params.customerCode,
+    platformUsername: params.platformUsername,
+    platformUserId: params.platformUserId,
+  });
+  const maskedSn = params.sn ? maskSerialNumber(params.sn) : null;
+  const botHandle = getEffectiveBotDisplayHandle();
+
+  const lines = [
+    '✨ ORDER BERHASIL',
+    '╭───────────────',
+    '│ DETAIL TRANSAKSI',
+    '├───────────────',
+    `┣ Layanan : ${serviceLabel}`,
+    `┣ Produk  : ${params.productName}`,
+    `┣ Tujuan  : ${maskedDestination}`,
+    ...(maskedSn ? [`┣ SN      : ${maskedSn}`] : []),
+    `┣ Total   : Rp ${params.paymentAmount.toLocaleString('id-ID')}`,
+    `┣ Pembeli : ${buyerLabel}`,
+    `┣ ID      : ${maskedId}`,
+    `┣ Order   : ${maskedOrder}`,
+    `╰ Waktu   : ${timestamp}`,
+    '',
+    `🙏 Terima kasih sudah order di ${config.shopName}`,
+    '',
+    '💎 Keunggulan',
+    '• Auto proses',
+    '• Proses cepat',
+    '• Harga bersahabat',
+    '',
+    `🤖 Bot: ${botHandle}`,
+  ];
+
+  return lines.join('\n');
+}
+
+// 4. Grup / channel testimoni member (DISENSOR, HANYA transaksi sukses)
+export function emitTestimonyToGroups(params: SuccessGroupLogParams): void {
+  const text = formatTestimonyMessage(params);
+
+  if (config.whatsapp.enabled && config.whatsapp.testimonyGroup) {
+    enqueueNotification({
+      dedupeKey: `testi-wa-${params.transactionId}`,
+      transactionId: params.transactionId,
+      platform: 'WHATSAPP',
+      recipientId: config.whatsapp.testimonyGroup,
+      messageType: 'TESTIMONY_LOG',
+      payload: { text },
+    });
+  }
+
+  if (config.telegram.enabled && config.telegram.testimonyChatId) {
+    enqueueNotification({
+      dedupeKey: `testi-tg-${params.transactionId}`,
+      transactionId: params.transactionId,
+      platform: 'TELEGRAM',
+      recipientId: config.telegram.testimonyChatId,
+      messageType: 'TESTIMONY_LOG',
+      payload: { text },
+    });
+  }
+}
+
 
 export function notifyCustomerForTransaction(params: {
   transactionId: string;

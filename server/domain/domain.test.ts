@@ -12,7 +12,13 @@ import {
   isEligibleForInternalRefund,
   shouldTriggerCooldown,
 } from './state-machine';
-import { normalizeWhatsappNumber, maskDestination } from './masking';
+import {
+  normalizeWhatsappNumber,
+  maskDestination,
+  maskTransactionId,
+  maskSerialNumber,
+  maskBuyerForTestimony,
+} from './masking';
 import { hasPermission } from './rbac';
 
 test('Margin priority: product overrides category and global', () => {
@@ -207,6 +213,15 @@ test('Phone normalization, masking, and RBAC checks', () => {
   assert.equal(normalizeWhatsappNumber('081234567890'), '6281234567890');
   assert.equal(normalizeWhatsappNumber('+62 812-3456-7890'), '6281234567890');
   assert.equal(maskDestination('081234567890'), '0812****7890');
+  assert.equal(maskTransactionId('TRX-20261118-3082'), 'TRX-****-3082');
+  assert.equal(maskSerialNumber('123456789012'), '1234****9012');
+  const buyer = maskBuyerForTestimony({
+    customerCode: 'CUS-000123',
+    platformUsername: 'budi_santoso',
+    platformUserId: '8686345389',
+  });
+  assert.equal(buyer.buyerLabel, '@bu***o');
+  assert.equal(buyer.maskedId, '868****389');
   assert.equal(hasPermission('OWNER', [], 'refunds:adjust'), true);
   assert.equal(hasPermission('ADMIN', [], 'refunds:adjust'), false);
   assert.equal(hasPermission('OPERATOR', [], 'transactions:read'), true);

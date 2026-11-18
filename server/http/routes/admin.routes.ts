@@ -463,6 +463,7 @@ adminRouter.get('/bots/status', requirePermission('bots:read'), (_req: Request, 
       whatsapp: whatsappService.getStatus(),
       telegram: telegramService.getStatus(),
       notifications: getNotificationQueueStats(),
+      logChannels: getSafeConfigSummary().logChannels,
     },
   });
 });

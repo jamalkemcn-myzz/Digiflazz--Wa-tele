@@ -262,6 +262,8 @@ export async function finalizeExpiredInvoice(
     transactionId: tx.transaction_id,
     customerCode: cus.customer_code,
     productName: tx.product_name_snapshot,
+    destination: tx.destination,
+    platform: tx.platform,
     amount: tx.payment_amount,
     status: 'EXPIRED',
     note: 'Invoice kedaluwarsa (terverifikasi belum dibayar)',

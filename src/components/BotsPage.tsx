@@ -244,6 +244,74 @@ export function BotsPage({ permissions }: { permissions: string[] }) {
           </div>
         </div>
       )}
+
+      {status?.logChannels && (
+        <div className="bg-[#131c2e] border border-[#1f2b42] rounded-lg p-6 space-y-4">
+          <div>
+            <h3 className="text-base font-bold text-slate-100">Routing 4 Grup &amp; Channel Log Otomatis</h3>
+            <p className="text-xs text-slate-400 mt-0.5">
+              Grup admin sukses menampilkan seluruh data tanpa sensor; grup/channel testimoni member hanya menerima transaksi sukses dengan data disensor.
+            </p>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
+            {[
+              {
+                title: '1. Event Layanan Admin',
+                desc: 'Koneksi bot, backup, & error sistem',
+                waKey: 'WHATSAPP_SERVICE_LOG_GROUP',
+                tgKey: 'TELEGRAM_SERVICE_LOG_CHAT_ID',
+                waReady: status.logChannels.whatsapp?.serviceLog,
+                tgReady: status.logChannels.telegram?.serviceLog,
+              },
+              {
+                title: '2. All Transaksi Admin',
+                desc: 'Semua status order (created, paid, pending, batal, sukses)',
+                waKey: 'WHATSAPP_TRANSACTION_LOG_GROUP',
+                tgKey: 'TELEGRAM_TRANSACTION_LOG_CHAT_ID',
+                waReady: status.logChannels.whatsapp?.transactionLog,
+                tgReady: status.logChannels.telegram?.transactionLog,
+              },
+              {
+                title: '3. Transaksi Sukses Admin',
+                desc: 'Khusus SUCCESS · Full data tanpa sensor',
+                waKey: 'WHATSAPP_SUCCESS_LOG_GROUP',
+                tgKey: 'TELEGRAM_SUCCESS_LOG_CHAT_ID',
+                waReady: status.logChannels.whatsapp?.successLog,
+                tgReady: status.logChannels.telegram?.successLog,
+              },
+              {
+                title: '4. Testimoni / Sukses Member',
+                desc: 'Khusus SUCCESS · Nomor & ID disensor',
+                waKey: 'WHATSAPP_TESTIMONY_GROUP',
+                tgKey: 'TELEGRAM_TESTIMONY_CHAT_ID',
+                waReady: status.logChannels.whatsapp?.testimony,
+                tgReady: status.logChannels.telegram?.testimony,
+              },
+            ].map((ch) => (
+              <div key={ch.title} className="p-3.5 rounded-lg bg-[#0f1727] border border-[#1f2b42] space-y-2">
+                <div>
+                  <p className="font-semibold text-slate-100">{ch.title}</p>
+                  <p className="text-[11px] text-slate-400 mt-0.5">{ch.desc}</p>
+                </div>
+                <div className="space-y-1 pt-1 border-t border-[#1e293d] font-mono text-[11px]">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-slate-400">WhatsApp</span>
+                    <span className={ch.waReady ? 'text-emerald-400 font-semibold' : 'text-slate-500'}>
+                      {ch.waReady ? 'Aktif' : 'Belum diset'}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-slate-400">Telegram</span>
+                    <span className={ch.tgReady ? 'text-emerald-400 font-semibold' : 'text-slate-500'}>
+                      {ch.tgReady ? 'Aktif' : 'Belum diset'}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -46,18 +46,23 @@ export interface AppConfig {
     sessionDir: string;
     serviceLogGroup: string;
     transactionLogGroup: string;
+    successLogGroup: string;
+    testimonyGroup: string;
     reconnectMinDelayMs: number;
     reconnectMaxDelayMs: number;
   };
   telegram: {
     enabled: boolean;
     botToken: string;
+    botUsername: string;
     mode: 'webhook' | 'polling';
     webhookUrl: string;
     webhookSecret: string;
     webhookPath: string;
     serviceLogChatId: string;
     transactionLogChatId: string;
+    successLogChatId: string;
+    testimonyChatId: string;
   };
   transaction: {
     invoiceExpiryMinutes: number;
@@ -359,18 +364,23 @@ export function validateAndLoadConfig(env: NodeJS.ProcessEnv = process.env): App
       sessionDir: resolvedWaSessionDir,
       serviceLogGroup: (env.WHATSAPP_SERVICE_LOG_GROUP || '').trim(),
       transactionLogGroup: (env.WHATSAPP_TRANSACTION_LOG_GROUP || '').trim(),
+      successLogGroup: (env.WHATSAPP_SUCCESS_LOG_GROUP || '').trim(),
+      testimonyGroup: (env.WHATSAPP_TESTIMONY_GROUP || '').trim(),
       reconnectMinDelayMs: waMinDelay,
       reconnectMaxDelayMs: waMaxDelay,
     },
     telegram: {
       enabled: tgEnabled,
       botToken: (env.TELEGRAM_BOT_TOKEN || '').trim(),
+      botUsername: (env.TELEGRAM_BOT_USERNAME || '').trim().replace(/^@+/, ''),
       mode: (env.TELEGRAM_MODE || 'webhook').trim().toLowerCase() === 'polling' ? 'polling' : 'webhook',
       webhookUrl: (env.TELEGRAM_WEBHOOK_URL || '').trim().replace(/\/+$/, ''),
       webhookSecret: (env.TELEGRAM_WEBHOOK_SECRET || '').trim(),
       webhookPath: '/api/telegram/webhook',
       serviceLogChatId: (env.TELEGRAM_SERVICE_LOG_CHAT_ID || '').trim(),
       transactionLogChatId: (env.TELEGRAM_TRANSACTION_LOG_CHAT_ID || '').trim(),
+      successLogChatId: (env.TELEGRAM_SUCCESS_LOG_CHAT_ID || '').trim(),
+      testimonyChatId: (env.TELEGRAM_TESTIMONY_CHAT_ID || '').trim(),
     },
     transaction: {
       invoiceExpiryMinutes,
@@ -497,6 +507,20 @@ export function getSafeConfigSummary(cfg: AppConfig = config) {
     paymentGateway: {
       baseUrl: cfg.paymentGateway.baseUrl,
       timeoutMs: cfg.paymentGateway.timeoutMs,
+    },
+    logChannels: {
+      whatsapp: {
+        serviceLog: Boolean(cfg.whatsapp.serviceLogGroup),
+        transactionLog: Boolean(cfg.whatsapp.transactionLogGroup),
+        successLog: Boolean(cfg.whatsapp.successLogGroup),
+        testimony: Boolean(cfg.whatsapp.testimonyGroup),
+      },
+      telegram: {
+        serviceLog: Boolean(cfg.telegram.serviceLogChatId),
+        transactionLog: Boolean(cfg.telegram.transactionLogChatId),
+        successLog: Boolean(cfg.telegram.successLogChatId),
+        testimony: Boolean(cfg.telegram.testimonyChatId),
+      },
     },
     readiness: getIntegrationReadiness(cfg),
   };

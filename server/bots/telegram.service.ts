@@ -7,7 +7,11 @@ import { logger } from '../logging/logger';
 import { registerTelegramCommands } from './telegram.command-handler';
 import { registerTelegramCallbacks } from './telegram.callback-handler';
 import { deleteTelegramMessageSafely, sendTelegramText } from './telegram.notification.service';
-import { registerNotificationSender, emitServiceLogToGroups } from '../services/notification.service';
+import {
+  registerNotificationSender,
+  emitServiceLogToGroups,
+  setTelegramBotUsernameForLogs,
+} from '../services/notification.service';
 import { registerQrMessageDeleter } from '../services/payment.service';
 
 export type TelegramState = 'DISABLED' | 'STOPPED' | 'STARTING' | 'CONNECTED' | 'ERROR';
@@ -138,6 +142,7 @@ class TelegramService {
 
       const me = await bot.telegram.getMe();
       this.botUsername = me.username || null;
+      setTelegramBotUsernameForLogs(this.botUsername);
 
       const targetWebhookUrl = this.resolveTargetWebhookUrl();
       if (config.telegram.mode === 'webhook' && targetWebhookUrl) {
@@ -222,6 +227,7 @@ class TelegramService {
   async stop(): Promise<void> {
     registerNotificationSender('TELEGRAM', null);
     registerQrMessageDeleter('TELEGRAM', null);
+    setTelegramBotUsernameForLogs(null);
     if (this.bot) {
       if (this.activeMode === 'POLLING') {
         try {

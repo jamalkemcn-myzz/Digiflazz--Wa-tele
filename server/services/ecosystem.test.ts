@@ -27,6 +27,7 @@ import { setGlobalMargin, setCategoryMargin, listMarginHistory } from './margin.
 import { createCoupon } from './coupon.service';
 import {
   createOrder,
+  handleVerifiedPaymentPaid,
   processSingleSupplierJob,
   transitionTransactionStatus,
   cancelCustomerTransaction,
@@ -2035,8 +2036,151 @@ test('Telegram Hubungi Admin URL Button & Cek Status Callback Query Alert (show_
   }
 });
 
+test('4 Group Log Routing: Service, All Tx Admin, Unmasked Success Admin, and Censored Testimony (Success Only)', async () => {
+  const prevEnv = {
+    WA_ENABLED: process.env.WHATSAPP_ENABLED,
+    TG_ENABLED: process.env.TELEGRAM_ENABLED,
+    TG_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
+    TG_BOT_USER: process.env.TELEGRAM_BOT_USERNAME,
+    WA_SVC: process.env.WHATSAPP_SERVICE_LOG_GROUP,
+    WA_TX: process.env.WHATSAPP_TRANSACTION_LOG_GROUP,
+    WA_OK: process.env.WHATSAPP_SUCCESS_LOG_GROUP,
+    WA_TESTI: process.env.WHATSAPP_TESTIMONY_GROUP,
+    TG_SVC: process.env.TELEGRAM_SERVICE_LOG_CHAT_ID,
+    TG_TX: process.env.TELEGRAM_TRANSACTION_LOG_CHAT_ID,
+    TG_OK: process.env.TELEGRAM_SUCCESS_LOG_CHAT_ID,
+    TG_TESTI: process.env.TELEGRAM_TESTIMONY_CHAT_ID,
+  };
+
+  try {
+    process.env.WHATSAPP_ENABLED = 'true';
+    process.env.TELEGRAM_ENABLED = 'true';
+    process.env.TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '123456:TEST_TOKEN_FOR_SUITE';
+    process.env.TELEGRAM_BOT_USERNAME = 'lynzz_ppob_bot';
+    process.env.WHATSAPP_SERVICE_LOG_GROUP = '1203630001@g.us';
+    process.env.WHATSAPP_TRANSACTION_LOG_GROUP = '1203630002@g.us';
+    process.env.WHATSAPP_SUCCESS_LOG_GROUP = '1203630003@g.us';
+    process.env.WHATSAPP_TESTIMONY_GROUP = '1203630004@g.us';
+    process.env.TELEGRAM_SERVICE_LOG_CHAT_ID = '-1001001';
+    process.env.TELEGRAM_TRANSACTION_LOG_CHAT_ID = '-1001002';
+    process.env.TELEGRAM_SUCCESS_LOG_CHAT_ID = '-1001003';
+    process.env.TELEGRAM_TESTIMONY_CHAT_ID = '@lynzz_testimoni';
+    refreshConfig(process.env);
+
+    const db = getDb();
+    const { emitServiceLogToGroups } = await import('../services/notification.service');
+    emitServiceLogToGroups('test-4ch-svc', 'Test Layanan', 'Cek log layanan 4 channel');
+
+    // 1. Order that goes SUCCESS -> triggers TRANSACTION_LOG + SUCCESS_ADMIN_LOG + TESTIMONY_LOG
+    const gw = new TestPaymentGateway();
+    const orderOk = await createOrder(
+      {
+        platform: 'TELEGRAM',
+        platformUserId: '8686345389',
+        platformUsername: 'lynzz_buyer',
+        productSkuOrId: 'TSEL10',
+        destination: '081234569988',
+      },
+      gw
+    );
+    assert.equal(orderOk.ok, true);
+    const txIdOk = orderOk.transaction!.transaction_id;
+
+    handleVerifiedPaymentPaid(txIdOk, 'TEST_4CH_PAY');
+    const okPort = new TestDigiflazzPort();
+    okPort.nextStatus = 'SUCCESS';
+    const supplierMock = new DigiflazzService(okPort);
+    const supRes = await processSingleSupplierJob(txIdOk, 'worker-4ch', supplierMock);
+    assert.equal(supRes.status, 'SUCCESS');
+
+    const jobsOk = db
+      .prepare('SELECT platform, recipient_id, message_type, payload_json FROM notification_jobs WHERE transaction_id = ?')
+      .all(txIdOk) as Array<{ platform: string; recipient_id: string; message_type: string; payload_json: string }>;
+
+    const adminSuccessJobs = jobsOk.filter((j) => j.message_type === 'SUCCESS_ADMIN_LOG');
+    assert.equal(adminSuccessJobs.length, 2);
+    for (const job of adminSuccessJobs) {
+      const text = (JSON.parse(job.payload_json) as { text: string }).text;
+      // Full unmasked data in admin success group
+      assert.ok(text.includes(txIdOk));
+      assert.ok(text.includes('081234569988'));
+      assert.ok(text.includes('8686345389'));
+      assert.ok(text.includes('@lynzz_buyer'));
+      assert.ok(text.includes('SN-123456'));
+    }
+
+    const testimonyJobs = jobsOk.filter((j) => j.message_type === 'TESTIMONY_LOG');
+    assert.equal(testimonyJobs.length, 2);
+    const tgTestimony = testimonyJobs.find((j) => j.platform === 'TELEGRAM' && j.recipient_id === '@lynzz_testimoni');
+    assert.ok(tgTestimony);
+    const testiText = (JSON.parse(tgTestimony!.payload_json) as { text: string }).text;
+    assert.match(testiText, /✨ ORDER BERHASIL/);
+    assert.match(testiText, /DETAIL TRANSAKSI/);
+    assert.match(testiText, /0812\*\*\*\*9988/);
+    assert.match(testiText, /SN-1\*\*\*\*3456/);
+    assert.match(testiText, /@ly\*\*\*r/);
+    assert.match(testiText, /TRX-\*\*\*\*-/);
+    assert.match(testiText, /🤖 Bot: @lynzz_ppob_bot/);
+    // Sensitive full values must NEVER appear in testimony
+    assert.equal(testiText.includes('081234569988'), false);
+    assert.equal(testiText.includes('SN-123456'), false);
+    assert.equal(testiText.includes('8686345389'), false);
+    assert.equal(testiText.includes(txIdOk), false);
+
+    // 2. Order that FAILS -> triggers TRANSACTION_LOG (and refund), but NEVER SUCCESS_ADMIN_LOG or TESTIMONY_LOG
+    const orderFail = await createOrder(
+      {
+        platform: 'WHATSAPP',
+        platformUserId: '6281234567000',
+        productSkuOrId: 'TSEL10',
+        destination: '081234560000',
+      },
+      gw
+    );
+    assert.equal(orderFail.ok, true);
+    const txIdFail = orderFail.transaction!.transaction_id;
+    handleVerifiedPaymentPaid(txIdFail, 'TEST_4CH_FAIL_PAY');
+    const failPort = new TestDigiflazzPort();
+    failPort.nextStatus = 'FAILED';
+    const failSup = new DigiflazzService(failPort);
+    await processSingleSupplierJob(txIdFail, 'worker-4ch-fail', failSup);
+
+    const jobsFail = db
+      .prepare('SELECT message_type FROM notification_jobs WHERE transaction_id = ?')
+      .all(txIdFail) as Array<{ message_type: string }>;
+    assert.ok(jobsFail.some((j) => j.message_type === 'TRANSACTION_LOG'));
+    assert.equal(jobsFail.some((j) => j.message_type === 'SUCCESS_ADMIN_LOG'), false);
+    assert.equal(jobsFail.some((j) => j.message_type === 'TESTIMONY_LOG'), false);
+
+    // Verify service log job created
+    const svcJobs = db
+      .prepare("SELECT message_type FROM notification_jobs WHERE dedupe_key LIKE 'svc-%test-4ch-svc'")
+      .all() as Array<{ message_type: string }>;
+    assert.equal(svcJobs.length, 2);
+  } finally {
+    const restore = (k: string, v: string | undefined) => {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    };
+    restore('WHATSAPP_ENABLED', prevEnv.WA_ENABLED);
+    restore('TELEGRAM_ENABLED', prevEnv.TG_ENABLED);
+    restore('TELEGRAM_BOT_TOKEN', prevEnv.TG_TOKEN);
+    restore('TELEGRAM_BOT_USERNAME', prevEnv.TG_BOT_USER);
+    restore('WHATSAPP_SERVICE_LOG_GROUP', prevEnv.WA_SVC);
+    restore('WHATSAPP_TRANSACTION_LOG_GROUP', prevEnv.WA_TX);
+    restore('WHATSAPP_SUCCESS_LOG_GROUP', prevEnv.WA_OK);
+    restore('WHATSAPP_TESTIMONY_GROUP', prevEnv.WA_TESTI);
+    restore('TELEGRAM_SERVICE_LOG_CHAT_ID', prevEnv.TG_SVC);
+    restore('TELEGRAM_TRANSACTION_LOG_CHAT_ID', prevEnv.TG_TX);
+    restore('TELEGRAM_SUCCESS_LOG_CHAT_ID', prevEnv.TG_OK);
+    restore('TELEGRAM_TESTIMONY_CHAT_ID', prevEnv.TG_TESTI);
+    refreshConfig(process.env);
+  }
+});
+
 test.after(() => {
   closeDb();
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
+
 
