@@ -49,6 +49,14 @@ export type BotConversationState =
       updatedAt: number;
     };
 
+export type TelegramAdminSessionState =
+  | { mode: 'AWAITING_GLOBAL_DESC'; updatedAt: number }
+  | { mode: 'AWAITING_PRODUCT_DESC'; updatedAt: number }
+  | { mode: 'AWAITING_MARGIN_INPUT'; marginType: 'FIXED' | 'PERCENT'; updatedAt: number }
+  | { mode: 'AWAITING_BALANCE_ADJUSTMENT'; updatedAt: number }
+  | { mode: 'AWAITING_VOUCHER_CREATE'; updatedAt: number }
+  | { mode: 'AWAITING_WA_PAIRING_PHONE'; updatedAt: number };
+
 const SESSION_TTL_MS = 10 * 60 * 1000;
 const TG_MESSAGE_REF_TTL_MS = 30 * 60 * 1000;
 const ORDER_EXECUTION_LOCK_TTL_MS = 60 * 1000;
@@ -56,6 +64,7 @@ const RECENT_CONFIRMATION_GRACE_MS = 8 * 1000;
 const MAX_SESSIONS = 1500;
 const MAX_TRACKED_TG_CHATS = 1500;
 const sessions = new Map<string, BotConversationState>();
+const adminConfigSessions = new Map<string, TelegramAdminSessionState>();
 const inFlightOrderExecutions = new Map<string, { updatedAt: number }>();
 const recentOrderConfirmations = new Map<string, { updatedAt: number }>();
 const confirmedSourceMessageIds = new Map<string, { updatedAt: number }>();
@@ -126,6 +135,37 @@ export function setBotSession(
 
 export function clearBotSession(platform: BotPlatformKey, userId: string, dryRun?: boolean): void {
   sessions.delete(makeKey(platform, userId, dryRun));
+}
+
+export function getTelegramAdminSession(
+  userId: string,
+  dryRun?: boolean
+): TelegramAdminSessionState | null {
+  const key = makeKey('TELEGRAM', userId, dryRun);
+  const entry = adminConfigSessions.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.updatedAt > SESSION_TTL_MS) {
+    adminConfigSessions.delete(key);
+    return null;
+  }
+  return entry;
+}
+
+export function setTelegramAdminSession(
+  userId: string,
+  state: TelegramAdminSessionState,
+  dryRun?: boolean
+): void {
+  if (adminConfigSessions.size >= MAX_SESSIONS) {
+    trimMapToLimit(adminConfigSessions, MAX_SESSIONS, SESSION_TTL_MS, Date.now());
+  }
+  const key = makeKey('TELEGRAM', userId, dryRun);
+  adminConfigSessions.delete(key);
+  adminConfigSessions.set(key, state);
+}
+
+export function clearTelegramAdminSession(userId: string, dryRun?: boolean): void {
+  adminConfigSessions.delete(makeKey('TELEGRAM', userId, dryRun));
 }
 
 export function acquireOrderExecutionLock(
@@ -298,6 +338,11 @@ export function pruneBotSessionsMemory(now = Date.now()): {
     if (now - v.updatedAt > SESSION_TTL_MS) {
       sessions.delete(k);
       sessionsEvicted++;
+    }
+  }
+  for (const [k, v] of adminConfigSessions) {
+    if (now - v.updatedAt > SESSION_TTL_MS) {
+      adminConfigSessions.delete(k);
     }
   }
   for (const [k, v] of inFlightOrderExecutions) {

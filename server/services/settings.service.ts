@@ -14,6 +14,7 @@ export interface ProductAutoRefreshConfig {
 }
 
 const PRODUCT_AUTO_REFRESH_KEY = 'product_auto_refresh_config';
+const CONFIRMATION_DESCRIPTION_KEY = 'confirmation_description';
 
 export function getSetting(key: string): string | null {
   const db = getDb();
@@ -21,6 +22,44 @@ export function getSetting(key: string): string | null {
     | { setting_value: string }
     | undefined;
   return row ? row.setting_value : null;
+}
+
+export function getConfirmationDescription(): string | null {
+  const raw = getSetting(CONFIRMATION_DESCRIPTION_KEY);
+  const trimmed = (raw || '').trim();
+  return trimmed ? trimmed : null;
+}
+
+export function setConfirmationDescription(
+  description: string | null,
+  actor: { id: string; role: string }
+): string | null {
+  const clean = (description || '').trim();
+  const value = clean === '-' ? '' : clean;
+  if (value.length > 500) {
+    throw new Error('Keterangan konfirmasi pembayaran maksimal 500 karakter');
+  }
+  const now = new Date().toISOString();
+  withTransaction((txDb) => {
+    txDb
+      .prepare(
+        `INSERT INTO settings (setting_key, setting_value, updated_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(setting_key) DO UPDATE SET setting_value = excluded.setting_value, updated_at = excluded.updated_at`
+      )
+      .run(CONFIRMATION_DESCRIPTION_KEY, value, now);
+  });
+
+  recordAuditLog({
+    actorId: actor.id,
+    actorRole: actor.role,
+    action: 'CONFIRMATION_DESCRIPTION_UPDATED',
+    targetType: 'SYSTEM_SETTINGS',
+    targetId: CONFIRMATION_DESCRIPTION_KEY,
+    details: { cleared: !value, length: value.length },
+  });
+
+  return value || null;
 }
 
 export function isMaintenanceMode(): boolean {

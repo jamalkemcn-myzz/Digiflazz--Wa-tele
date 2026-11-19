@@ -43,6 +43,7 @@ import {
   type TelegramInlineButton,
   type TelegramReplyTransport,
 } from './telegram.command-handler';
+import { handleTelegramAdminConfigCallback } from './telegram.admin-config';
 import { sendTelegramQrisInvoice } from './telegram.notification.service';
 import {
   acquireOrderExecutionLock,
@@ -331,11 +332,11 @@ export async function dispatchTelegramCallback(
     const canCancel = ['CREATED', 'PENDING_PAYMENT', 'PAYMENT_PROCESSING'].includes(latest.transaction_status);
     const buttons: TelegramInlineButton[][] = [];
     if (canCancel) {
-      buttons.push([{ text: 'Batalkan Pesanan', callbackData: `CANCEL_TX_${latest.transaction_id}` }]);
+      buttons.push([{ text: '🚫 Batalkan Pesanan', callbackData: `CANCEL_TX_${latest.transaction_id}` }]);
     }
     buttons.push([
-      { text: 'Riwayat Lengkap', callbackData: 'MY_HISTORY' },
-      { text: 'Menu Utama', callbackData: 'MAIN_MENU' },
+      { text: '📜 Riwayat Lengkap', callbackData: 'MY_HISTORY' },
+      { text: '🏠 Menu Utama', callbackData: 'MAIN_MENU' },
     ]);
     await transport.reply(
       `Transaksi Terakhir (${latest.transaction_id})\n` +
@@ -377,7 +378,7 @@ export async function dispatchTelegramCallback(
         `Kode Penghubung Akun (Simulasi Demo, berlaku ${config.accountLinking.codeExpiryMinutes} menit):\n\n` +
           `hubungkan DEMO-123456\n\n` +
           `Kirim perintah di atas ke Bot WhatsApp kami.\n[Mode Demo: token tidak dibuat di database]`,
-        [[{ text: 'Menu Utama', callbackData: 'MAIN_MENU' }]]
+        [[{ text: '🏠 Menu Utama', callbackData: 'MAIN_MENU' }]]
       );
       return;
     }
@@ -389,7 +390,7 @@ export async function dispatchTelegramCallback(
     if (!res.ok) {
       await transport.reply(
         res.errorMessage || 'Maaf Kak, gagal membuat kode penghubung.',
-        [[{ text: 'Menu Utama', callbackData: 'MAIN_MENU' }]]
+        [[{ text: '🏠 Menu Utama', callbackData: 'MAIN_MENU' }]]
       );
       return;
     }
@@ -397,7 +398,7 @@ export async function dispatchTelegramCallback(
       `Kode Penghubung Akun (berlaku ${config.accountLinking.codeExpiryMinutes} menit):\n\n` +
         `hubungkan ${res.code}\n\n` +
         `Kirim perintah di atas ke Bot WhatsApp kami. Jangan bagikan kode ini kepada siapa pun ya Kak.`,
-      [[{ text: 'Menu Utama', callbackData: 'MAIN_MENU' }]]
+      [[{ text: '🏠 Menu Utama', callbackData: 'MAIN_MENU' }]]
     );
     return;
   }
@@ -452,7 +453,7 @@ export async function dispatchTelegramCallback(
       const canCancel = ['CREATED', 'PENDING_PAYMENT', 'PAYMENT_PROCESSING'].includes(t.transaction_status);
       const buttons: TelegramInlineButton[][] = canCancel
         ? [
-            [{ text: 'Batalkan Pesanan', callbackData: `CANCEL_TX_${t.transaction_id}` }],
+            [{ text: '🚫 Batalkan Pesanan', callbackData: `CANCEL_TX_${t.transaction_id}` }],
             ...TG_NAV_BACK_BUTTONS,
           ]
         : TG_NAV_BACK_BUTTONS;
@@ -495,7 +496,18 @@ export async function dispatchTelegramCallback(
 
     const admin = resolveAdmin();
     if (!admin) {
-      await transport.reply('Maaf, akses admin ditolak.', [[{ text: 'Menu Pelanggan', callbackData: 'MAIN_MENU' }]]);
+      await transport.reply('Maaf, akses admin ditolak.', [[{ text: '🏠 Menu Pelanggan', callbackData: 'MAIN_MENU' }]]);
+      return;
+    }
+
+    const handledConfig = await handleTelegramAdminConfigCallback({
+      data,
+      transport,
+      admin,
+      userId: input.userId || 'guest',
+      dryRun,
+    });
+    if (handledConfig) {
       return;
     }
 

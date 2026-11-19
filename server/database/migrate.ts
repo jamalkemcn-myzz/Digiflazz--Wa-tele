@@ -451,6 +451,21 @@ const MIGRATIONS: Migration[] = [
       ).run(now);
     },
   },
+  {
+    id: '004',
+    name: 'add_confirmation_descriptions',
+    up: (db) => {
+      const now = new Date().toISOString();
+      const prodCols = (db.prepare('PRAGMA table_info(products)').all() as Array<{ name: string }>).map((c) => c.name);
+      if (!prodCols.includes('description')) {
+        db.exec('ALTER TABLE products ADD COLUMN description TEXT');
+      }
+      db.prepare(
+        `INSERT OR IGNORE INTO settings (setting_key, setting_value, updated_at)
+         VALUES ('confirmation_description', '', ?)`
+      ).run(now);
+    },
+  },
 ];
 
 export function runMigrations(customDb?: Database.Database): void {

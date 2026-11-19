@@ -285,6 +285,14 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify({ enabled, reason }),
     }),
+  setConfirmationDescription: (description: string | null) =>
+    requestJson<{ ok: true; data: { confirmationDescription: string | null } }>(
+      '/api/admin/settings/confirmation-description',
+      {
+        method: 'PUT',
+        body: JSON.stringify({ description }),
+      }
+    ),
   runBackup: () => requestJson<{ ok: true; data: any }>('/api/admin/backups/run', { method: 'POST' }),
   createAdmin: (payload: {
     name: string;

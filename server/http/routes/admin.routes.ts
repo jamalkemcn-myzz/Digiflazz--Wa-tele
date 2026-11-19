@@ -45,6 +45,8 @@ import {
   getProductAutoRefreshConfig,
   saveProductAutoRefreshConfig,
   formatProductAutoRefreshSummary,
+  getConfirmationDescription,
+  setConfirmationDescription,
 } from '../../services/settings.service';
 import { listAuditLogs } from '../../services/audit.service';
 import { getNotificationQueueStats } from '../../services/notification.service';
@@ -614,6 +616,7 @@ adminRouter.get('/settings', requirePermission('settings:read'), (_req: Request,
     ok: true,
     data: {
       maintenanceMode: isMaintenanceMode(),
+      confirmationDescription: getConfirmationDescription(),
       config: getSafeConfigSummary(),
       digiflazzDiagnostic: getDigiflazzEnvDiagnostic(),
       productAutoRefresh: {
@@ -679,6 +682,16 @@ adminRouter.put('/settings/maintenance', requirePermission('maintenance:toggle')
   const reason = typeof req.body.reason === 'string' ? req.body.reason : undefined;
   const result = setMaintenanceMode(enabled, { id: req.admin!.username, role: req.admin!.role }, reason);
   res.json({ ok: true, data: { maintenanceMode: result } });
+});
+
+adminRouter.put('/settings/confirmation-description', requirePermission('settings:write'), (req: Request, res: Response, next) => {
+  try {
+    const raw = typeof req.body?.description === 'string' ? req.body.description : null;
+    const saved = setConfirmationDescription(raw, { id: req.admin!.username, role: req.admin!.role });
+    res.json({ ok: true, data: { confirmationDescription: saved } });
+  } catch (err) {
+    next(err);
+  }
 });
 
 adminRouter.post('/backups/run', requirePermission('backups:manage'), async (req: Request, res: Response) => {

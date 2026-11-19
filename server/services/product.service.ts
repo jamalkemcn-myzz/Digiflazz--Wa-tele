@@ -19,6 +19,7 @@ export interface ProductRow {
   id: number;
   sku: string;
   name: string;
+  description: string | null;
   category_id: number | null;
   category_name?: string | null;
   brand: string | null;
@@ -306,6 +307,7 @@ export function upsertProduct(
   input: {
     sku: string;
     name: string;
+    description?: string | null;
     categoryId: number | null;
     brand?: string | null;
     type?: string | null;
@@ -325,6 +327,14 @@ export function upsertProduct(
   }
   if (input.maxMargin !== null && input.maxMargin !== undefined && (!Number.isFinite(input.maxMargin) || input.maxMargin < 0)) {
     throw new Error('Batas maksimal margin produk tidak valid');
+  }
+
+  const hasDescriptionField = input.description !== undefined;
+  const normalizedDescription = hasDescriptionField
+    ? (input.description || '').trim() || null
+    : undefined;
+  if (normalizedDescription && normalizedDescription.length > 500) {
+    throw new Error('Deskripsi produk maksimal 500 karakter');
   }
 
   const db = getDb();
@@ -358,16 +368,20 @@ export function upsertProduct(
 
   const now = new Date().toISOString();
   const product = withTransaction((txDb) => {
-    const existing = txDb.prepare('SELECT id FROM products WHERE sku = ?').get(sku) as { id: number } | undefined;
+    const existing = txDb
+      .prepare('SELECT id, description FROM products WHERE sku = ?')
+      .get(sku) as { id: number; description: string | null } | undefined;
     if (existing) {
+      const nextDescription = hasDescriptionField ? (normalizedDescription ?? null) : existing.description;
       txDb
         .prepare(
           `UPDATE products
-           SET name = ?, category_id = ?, brand = ?, type = ?, supplier_price = ?, selling_price = ?, margin_type = ?, margin_value = ?, max_margin = ?, status = ?, is_available = 1, updated_at = ?
+           SET name = ?, description = ?, category_id = ?, brand = ?, type = ?, supplier_price = ?, selling_price = ?, margin_type = ?, margin_value = ?, max_margin = ?, status = ?, is_available = 1, updated_at = ?
            WHERE id = ?`
         )
         .run(
           name,
+          nextDescription,
           input.categoryId,
           input.brand ?? null,
           input.type ?? null,
@@ -385,12 +399,13 @@ export function upsertProduct(
 
     const res = txDb
       .prepare(
-        `INSERT INTO products (sku, name, category_id, brand, type, supplier_price, selling_price, margin_type, margin_value, max_margin, status, is_available, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
+        `INSERT INTO products (sku, name, description, category_id, brand, type, supplier_price, selling_price, margin_type, margin_value, max_margin, status, is_available, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
       )
       .run(
         sku,
         name,
+        normalizedDescription ?? null,
         input.categoryId,
         input.brand ?? null,
         input.type ?? null,
@@ -420,6 +435,42 @@ export function upsertProduct(
   });
 
   return product;
+}
+
+export function updateProductDescription(
+  skuOrId: string | number,
+  description: string | null,
+  actor: { id: string; role: string }
+): ProductRow {
+  const existing = getProductBySkuOrId(skuOrId);
+  if (!existing) throw new Error(`Produk "${skuOrId}" tidak ditemukan`);
+  const clean = (description || '').trim();
+  const nextDesc = clean === '-' || !clean ? null : clean;
+  if (nextDesc && nextDesc.length > 500) {
+    throw new Error('Deskripsi produk maksimal 500 karakter');
+  }
+  const now = new Date().toISOString();
+  const updated = withTransaction((txDb) => {
+    txDb
+      .prepare('UPDATE products SET description = ?, updated_at = ? WHERE id = ?')
+      .run(nextDesc, now, existing.id);
+    return txDb
+      .prepare(
+        `SELECT p.*, c.name as category_name FROM products p LEFT JOIN categories c ON c.id = p.category_id WHERE p.id = ?`
+      )
+      .get(existing.id) as ProductRow;
+  });
+
+  recordAuditLog({
+    actorId: actor.id,
+    actorRole: actor.role,
+    action: 'PRODUCT_DESCRIPTION_UPDATED',
+    targetType: 'PRODUCT',
+    targetId: updated.sku,
+    details: { cleared: !nextDesc, length: nextDesc?.length || 0 },
+  });
+
+  return updated;
 }
 
 export function updateProductStatus(

@@ -23,7 +23,6 @@ import {
   unlinkPlatformIdentity,
   getCustomerRefundCreditTotal,
   getCustomerProfileSummary,
-  getTotalBotUsersCount,
 } from '../services/customer.service';
 import { previewVoucherRedeem } from '../services/coupon.service';
 import {
@@ -41,7 +40,7 @@ import {
   getAdminBotTransactionReport,
   type ResolvedAdmin,
 } from '../services/admin.service';
-import { isMaintenanceMode, setMaintenanceMode } from '../services/settings.service';
+import { getConfirmationDescription, isMaintenanceMode, setMaintenanceMode } from '../services/settings.service';
 import { centralScheduler } from '../workers/scheduler';
 import {
   acquireOrderExecutionLock,
@@ -90,23 +89,23 @@ export interface WhatsappCommandOptions {
 
 const MAIN_MENU_BUTTONS: WhatsappQuickButton[][] = [
   [
-    { text: 'Kategori Produk', replyText: '!kategori' },
-    { text: 'Daftar Produk', replyText: '!produk' },
+    { text: '📂 Kategori Produk', replyText: '!kategori' },
+    { text: '🛒 Daftar Produk', replyText: '!produk' },
   ],
   [
-    { text: 'Profil & Saldo', replyText: '!profil' },
-    { text: 'Redeem Voucher', replyText: '!voucher' },
+    { text: '👤 Profil & Saldo', replyText: '!profil' },
+    { text: '🎟️ Redeem Voucher', replyText: '!voucher' },
   ],
   [
-    { text: 'Riwayat Transaksi', replyText: '!riwayat' },
-    { text: 'Hubungi Admin', replyText: '!kontak' },
+    { text: '📜 Riwayat Transaksi', replyText: '!riwayat' },
+    { text: '👨‍💼 Hubungi Admin', replyText: '!kontak' },
   ],
 ];
 
 const NAV_BACK_BUTTONS: WhatsappQuickButton[][] = [
   [
-    { text: 'Daftar Produk', replyText: '!produk' },
-    { text: 'Menu Utama', replyText: '!menu' },
+    { text: '🛒 Daftar Produk', replyText: '!produk' },
+    { text: '🏠 Menu Utama', replyText: '!menu' },
   ],
 ];
 
@@ -222,7 +221,6 @@ async function sendMainMenu(
     displayName: pushName || null,
     dryRun,
   });
-  const totalUsers = getTotalBotUsersCount();
   const isAdmin = dryRun ? Boolean(demoAdmin) : Boolean(resolveAdminByPlatform('WHATSAPP', jid));
 
   await sock.sendMessage(jid, {
@@ -232,7 +230,6 @@ async function sendMainMenu(
         shopName: config.shopName,
         userId: summary.userId,
         isAdmin,
-        totalUsers,
       })}\n\n` +
       `*Menu Utama (Prefix ! / .):*\n` +
       `• *!kategori* — Kategori Produk\n` +
@@ -264,10 +261,10 @@ async function sendWhatsappProfile(
     text: formatProfileMessage(summary, config.timezone),
     quickReplies: [
       [
-        { text: 'Daftar Produk', replyText: '!produk' },
-        { text: 'Riwayat Transaksi', replyText: '!riwayat' },
+        { text: '🛒 Daftar Produk', replyText: '!produk' },
+        { text: '📜 Riwayat Transaksi', replyText: '!riwayat' },
       ],
-      [{ text: 'Menu Utama', replyText: '!menu' }],
+      [{ text: '🏠 Menu Utama', replyText: '!menu' }],
     ],
   });
 }
@@ -278,8 +275,8 @@ async function sendWhatsappContactAdmin(sock: WhatsappReplyTransport, jid: strin
     text: formatContactAdminMessage(config),
     quickReplies: [
       [
-        { text: 'Riwayat Transaksi', replyText: '!riwayat' },
-        { text: 'Menu Utama', replyText: '!menu' },
+        { text: '📜 Riwayat Transaksi', replyText: '!riwayat' },
+        { text: '🏠 Menu Utama', replyText: '!menu' },
       ],
     ],
   });
@@ -297,7 +294,7 @@ async function handleWhatsappVoucherCommand(
     setBotSession('WHATSAPP', jid, { mode: 'AWAITING_VOUCHER_CODE', updatedAt: Date.now() }, dryRun);
     await sock.sendMessage(jid, {
       text: formatVoucherPromptMessage('WHATSAPP', activeVoucher),
-      quickReplies: [[{ text: 'Batal / Menu Utama', replyText: '!menu' }]],
+      quickReplies: [[{ text: '❌ Batal / Menu Utama', replyText: '!menu' }]],
     });
     return;
   }
@@ -314,8 +311,8 @@ async function handleWhatsappVoucherCommand(
       text: `Maaf Kak, ${check.errorMessage || 'kode voucher tidak valid.'}`,
       quickReplies: [
         [
-          { text: 'Coba Lagi', replyText: '!voucher' },
-          { text: 'Menu Utama', replyText: '!menu' },
+          { text: '🔄 Coba Lagi', replyText: '!voucher' },
+          { text: '🏠 Menu Utama', replyText: '!menu' },
         ],
       ],
     });
@@ -327,8 +324,8 @@ async function handleWhatsappVoucherCommand(
     text: formatVoucherSuccessMessage(check.coupon, config.timezone),
     quickReplies: [
       [
-        { text: 'Daftar Produk', replyText: '!produk' },
-        { text: 'Menu Utama', replyText: '!menu' },
+        { text: '🛒 Daftar Produk', replyText: '!produk' },
+        { text: '🏠 Menu Utama', replyText: '!menu' },
       ],
     ],
   });
@@ -339,7 +336,7 @@ async function sendCategoryList(sock: WhatsappReplyTransport, jid: string, dryRu
   if (cats.length === 0) {
     await sock.sendMessage(jid, {
       text: 'Maaf Kak, belum ada kategori produk yang aktif saat ini. Silakan coba lagi nanti ya.',
-      quickReplies: [[{ text: 'Menu Utama', replyText: '!menu' }]],
+      quickReplies: [[{ text: '🏠 Menu Utama', replyText: '!menu' }]],
     });
     return;
   }
@@ -356,16 +353,16 @@ async function sendCategoryList(sock: WhatsappReplyTransport, jid: string, dryRu
   const buttonRows: WhatsappQuickButton[][] = [];
   for (let i = 0; i < shown.length; i += 2) {
     const row = shown.slice(i, i + 2).map((c, offset) => ({
-      text: `${i + offset + 1}. ${c.name}`,
+      text: `🏷️ ${i + offset + 1}. ${c.name}`,
       replyText: `!produk_kat ${c.id} 1`,
     }));
     buttonRows.push(row);
   }
   buttonRows.push([
-    { text: 'Cari Produk', replyText: '!cari_produk' },
-    { text: 'Semua Produk', replyText: '!produk' },
+    { text: '🔍 Cari Produk', replyText: '!cari_produk' },
+    { text: '📦 Semua Produk', replyText: '!produk' },
   ]);
-  buttonRows.push([{ text: 'Menu Utama', replyText: '!menu' }]);
+  buttonRows.push([{ text: '🏠 Menu Utama', replyText: '!menu' }]);
 
   await sock.sendMessage(jid, {
     text:
@@ -385,16 +382,16 @@ function buildWhatsappBrandButtons(
   for (let i = 0; i < shown.length; i += 2) {
     buttonRows.push(
       shown.slice(i, i + 2).map((b, offset) => ({
-        text: `${i + offset + 1}. ${b.brand} (${b.productCount})`,
+        text: `📶 ${i + offset + 1}. ${b.brand} (${b.productCount})`,
         replyText: `!produk_brand ${categoryId} 1 ${b.brand}`,
       }))
     );
   }
   buttonRows.push([
-    { text: 'Cari Produk', replyText: '!cari_produk' },
-    { text: 'Kategori Lain', replyText: '!kategori' },
+    { text: '🔍 Cari Produk', replyText: '!cari_produk' },
+    { text: '📂 Kategori Lain', replyText: '!kategori' },
   ]);
-  buttonRows.push([{ text: 'Menu Utama', replyText: '!menu' }]);
+  buttonRows.push([{ text: '🏠 Menu Utama', replyText: '!menu' }]);
   return buttonRows;
 }
 
@@ -477,8 +474,8 @@ async function promptWhatsappSearch(
       `Silakan ketik awalan *!* atau *.* diikuti kata kunci produk yang dicari (contoh: *!xl 10*, *!telkomsel*, *!ml 86*, *!pln 50*).`,
     quickReplies: [
       [
-        { text: 'Kategori Produk', replyText: '!kategori' },
-        { text: 'Batal / Menu Utama', replyText: '!menu' },
+        { text: '📂 Kategori Produk', replyText: '!kategori' },
+        { text: '❌ Batal / Menu Utama', replyText: '!menu' },
       ],
     ],
   });
@@ -514,12 +511,12 @@ async function sendProductPage(
         : 'Maaf Kak, belum ada produk aktif di daftar ini saat ini.',
       quickReplies: [
         [
-          { text: 'Cari Produk', replyText: '!cari_produk' },
-          { text: 'Lihat Kategori', replyText: '!kategori' },
+          { text: '🔍 Cari Produk', replyText: '!cari_produk' },
+          { text: '📂 Lihat Kategori', replyText: '!kategori' },
         ],
         [
-          { text: 'Semua Produk', replyText: '!produk' },
-          { text: 'Menu Utama', replyText: '!menu' },
+          { text: '📦 Semua Produk', replyText: '!produk' },
+          { text: '🏠 Menu Utama', replyText: '!menu' },
         ],
       ],
     });
@@ -547,7 +544,7 @@ async function sendProductPage(
 
   const buttonRows: WhatsappQuickButton[][] = res.items.map((p, idx) => [
     {
-      text: formatWaProductButtonLabel(p.name, p.selling_price, idx + 1),
+      text: `🛍️ ${formatWaProductButtonLabel(p.name, p.selling_price, idx + 1)}`,
       replyText: `!pilih ${p.sku}`,
     },
   ]);
@@ -565,13 +562,13 @@ async function sendProductPage(
   const navRow: WhatsappQuickButton[] = [];
   if (params.page > 1) {
     navRow.push({
-      text: 'Sebelumnya',
+      text: '⬅️ Sebelumnya',
       replyText: makePageCmd(params.page - 1),
     });
   }
   if (params.page < res.pagination.totalPages) {
     navRow.push({
-      text: 'Berikutnya',
+      text: '➡️ Berikutnya',
       replyText: makePageCmd(params.page + 1),
     });
   }
@@ -579,19 +576,19 @@ async function sendProductPage(
 
   if (params.categoryId && params.brand) {
     buttonRows.push([
-      { text: 'Ganti Operator / Brand', replyText: `!produk_kat ${params.categoryId} 1` },
-      { text: 'Cari Produk', replyText: '!cari_produk' },
+      { text: '🔄 Ganti Operator / Brand', replyText: `!produk_kat ${params.categoryId} 1` },
+      { text: '🔍 Cari Produk', replyText: '!cari_produk' },
     ]);
     buttonRows.push([
-      { text: 'Kategori Lain', replyText: '!kategori' },
-      { text: 'Menu Utama', replyText: '!menu' },
+      { text: '📂 Kategori Lain', replyText: '!kategori' },
+      { text: '🏠 Menu Utama', replyText: '!menu' },
     ]);
   } else {
     buttonRows.push([
-      { text: 'Cari Produk', replyText: '!cari_produk' },
-      { text: 'Kategori Lain', replyText: '!kategori' },
+      { text: '🔍 Cari Produk', replyText: '!cari_produk' },
+      { text: '📂 Kategori Lain', replyText: '!kategori' },
     ]);
-    buttonRows.push([{ text: 'Menu Utama', replyText: '!menu' }]);
+    buttonRows.push([{ text: '🏠 Menu Utama', replyText: '!menu' }]);
   }
 
   let headerText: string;
@@ -654,8 +651,8 @@ async function promptProductDestination(
       `Silakan ketik awalan *!* atau *.* diikuti *nomor tujuan / ID pelanggan* Anda sekarang (contoh: *!081234567890*, atau tambahkan kode kupon setelah spasi).`,
     quickReplies: [
       [
-        { text: 'Pilih Produk Lain', replyText: '!produk' },
-        { text: 'Batal / Menu Utama', replyText: '!batal' },
+        { text: '🛒 Pilih Produk Lain', replyText: '!produk' },
+        { text: '❌ Batal / Menu Utama', replyText: '!batal' },
       ],
     ],
   });
@@ -687,6 +684,9 @@ async function promptWhatsappOrderConfirmation(
 
   const p = preview.transaction;
   const sellingPrice = p.supplier_price_snapshot + p.margin_snapshot;
+  const productRow = getProductBySkuOrId(p.product_sku_snapshot);
+  const productDesc = productRow?.description?.trim() || null;
+  const globalDesc = getConfirmationDescription();
 
   setBotSession(
     'WHATSAPP',
@@ -712,12 +712,14 @@ async function promptWhatsappOrderConfirmation(
       `Tujuan: *${params.destination.trim()}*\n` +
       `Harga: Rp${sellingPrice.toLocaleString('id-ID')}\n` +
       (p.coupon_code_snapshot ? `Kupon: ${p.coupon_code_snapshot} (-Rp${p.discount_snapshot.toLocaleString('id-ID')})\n` : '') +
-      `Estimasi Total (+ Kode Unik): *Rp${p.payment_amount.toLocaleString('id-ID')}*\n\n` +
-      `Balas *!ya* untuk melanjutkan atau *!batal* untuk membatalkan:`,
+      `Estimasi Total (+ Kode Unik): *Rp${p.payment_amount.toLocaleString('id-ID')}*\n` +
+      (productDesc ? `Keterangan: ${productDesc}\n` : '') +
+      (globalDesc ? `Catatan: ${globalDesc}\n` : '') +
+      `\nBalas *!ya* untuk melanjutkan atau *!batal* untuk membatalkan:`,
     quickReplies: [
       [
-        { text: 'Ya, Buat QRIS', replyText: '!ya' },
-        { text: 'Batal', replyText: '!batal' },
+        { text: '✅ Ya, Buat QRIS', replyText: '!ya' },
+        { text: '❌ Batal', replyText: '!batal' },
       ],
     ],
   });
@@ -762,10 +764,10 @@ async function executeWhatsappOrder(
           `Total: Rp${a.payment_amount.toLocaleString('id-ID')}`,
         quickReplies: [
           [
-            { text: 'Cek Status Invoice', replyText: `!status ${a.transaction_id}` },
-            { text: 'Batalkan Pesanan', replyText: `!batal ${a.transaction_id}` },
+            { text: '🔍 Cek Status Invoice', replyText: `!status ${a.transaction_id}` },
+            { text: '🚫 Batalkan Pesanan', replyText: `!batal ${a.transaction_id}` },
           ],
-          [{ text: 'Menu Utama', replyText: '!menu' }],
+          [{ text: '🏠 Menu Utama', replyText: '!menu' }],
         ],
       });
       return;
@@ -797,10 +799,10 @@ async function executeWhatsappOrder(
 
   const invoiceButtons: WhatsappQuickButton[][] = [
     [
-      { text: 'Cek Status Pembayaran', replyText: `!status ${tx.transaction_id}` },
-      { text: 'Batalkan Pesanan', replyText: `!batal ${tx.transaction_id}` },
+      { text: '🔍 Cek Status Pembayaran', replyText: `!status ${tx.transaction_id}` },
+      { text: '🚫 Batalkan Pesanan', replyText: `!batal ${tx.transaction_id}` },
     ],
-    [{ text: 'Menu Utama', replyText: '!menu' }],
+    [{ text: '🏠 Menu Utama', replyText: '!menu' }],
   ];
 
   try {
@@ -866,10 +868,10 @@ async function handleWhatsappOrderCancellation(
     const buttons: WhatsappQuickButton[][] = res.transaction
       ? [
           [
-            { text: 'Cek Status Pembayaran', replyText: `!status ${res.transaction.transaction_id}` },
-            { text: 'Coba Batalkan Lagi', replyText: `!batal ${res.transaction.transaction_id}` },
+            { text: '🔍 Cek Status Pembayaran', replyText: `!status ${res.transaction.transaction_id}` },
+            { text: '🔄 Coba Batalkan Lagi', replyText: `!batal ${res.transaction.transaction_id}` },
           ],
-          [{ text: 'Menu Utama', replyText: '!menu' }],
+          [{ text: '🏠 Menu Utama', replyText: '!menu' }],
         ]
       : NAV_BACK_BUTTONS;
     await sock.sendMessage(jid, {
@@ -970,17 +972,17 @@ export async function handleWhatsappCommand(
     if (!admin) {
       await sock.sendMessage(jid, {
         text: 'Maaf, perintah admin ditolak atau tidak dikenali. Silakan gunakan Menu Utama untuk layanan pelanggan ya Kak.',
-        quickReplies: [[{ text: 'Buka Menu Utama', replyText: '!menu' }]],
+        quickReplies: [[{ text: '🏠 Buka Menu Utama', replyText: '!menu' }]],
       });
       return;
     }
 
     const adminMenuButtons: WhatsappQuickButton[][] = [
       [
-        { text: 'Transaksi Terbaru', replyText: '!transaksi' },
-        { text: 'Status Layanan', replyText: '!statusbot' },
+        { text: '📊 Transaksi Terbaru', replyText: '!transaksi' },
+        { text: '🩺 Status Layanan', replyText: '!statusbot' },
       ],
-      [{ text: 'Menu Pelanggan', replyText: '!menu' }],
+      [{ text: '🏠 Menu Pelanggan', replyText: '!menu' }],
     ];
 
     if (cmd === 'admin') {
@@ -1334,7 +1336,7 @@ export async function handleWhatsappCommand(
       const t = detail.transaction;
       const canCancel = ['CREATED', 'PENDING_PAYMENT', 'PAYMENT_PROCESSING'].includes(t.transaction_status);
       const buttons: WhatsappQuickButton[][] = canCancel
-        ? [[{ text: 'Batalkan Pesanan', replyText: `!batal ${t.transaction_id}` }], ...NAV_BACK_BUTTONS]
+        ? [[{ text: '🚫 Batalkan Pesanan', replyText: `!batal ${t.transaction_id}` }], ...NAV_BACK_BUTTONS]
         : NAV_BACK_BUTTONS;
       await sock.sendMessage(jid, {
         text:
@@ -1361,11 +1363,11 @@ export async function handleWhatsappCommand(
     const canCancel = ['CREATED', 'PENDING_PAYMENT', 'PAYMENT_PROCESSING'].includes(latest.transaction_status);
     const buttons: WhatsappQuickButton[][] = [];
     if (canCancel) {
-      buttons.push([{ text: 'Batalkan Pesanan', replyText: `!batal ${latest.transaction_id}` }]);
+      buttons.push([{ text: '🚫 Batalkan Pesanan', replyText: `!batal ${latest.transaction_id}` }]);
     }
     buttons.push([
-      { text: 'Lihat Semua Riwayat', replyText: '!riwayat' },
-      { text: 'Menu Utama', replyText: '!menu' },
+      { text: '📜 Lihat Semua Riwayat', replyText: '!riwayat' },
+      { text: '🏠 Menu Utama', replyText: '!menu' },
     ]);
     await sock.sendMessage(jid, {
       text:
@@ -1391,7 +1393,7 @@ export async function handleWhatsappCommand(
         text: code
           ? `[Mode Demo] Simulasi verifikasi kode hubung "${code}" — tidak menautkan akun nyata.`
           : `*Kode Penghubung Akun (Simulasi Demo)*\nKirim perintah berikut di Bot Telegram dalam ${config.accountLinking.codeExpiryMinutes} menit:\n/hubungkan DEMO-123456\n\n_[Mode Demo: token tidak dibuat di database]_`,
-        quickReplies: [[{ text: 'Menu Utama', replyText: '!menu' }]],
+        quickReplies: [[{ text: '🏠 Menu Utama', replyText: '!menu' }]],
       });
       return;
     }
@@ -1404,7 +1406,7 @@ export async function handleWhatsappCommand(
       if (!res.ok) {
         await sock.sendMessage(jid, {
           text: res.errorMessage || 'Gagal membuat kode penghubung.',
-          quickReplies: [[{ text: 'Menu Utama', replyText: '!menu' }]],
+          quickReplies: [[{ text: '🏠 Menu Utama', replyText: '!menu' }]],
         });
         return;
       }
@@ -1414,7 +1416,7 @@ export async function handleWhatsappCommand(
           `Kirim perintah berikut di Bot Telegram dalam ${config.accountLinking.codeExpiryMinutes} menit:\n` +
           `/hubungkan ${res.code}\n\n` +
           `Jangan bagikan kode ini kepada siapa pun ya Kak.`,
-        quickReplies: [[{ text: 'Menu Utama', replyText: '!menu' }]],
+        quickReplies: [[{ text: '🏠 Menu Utama', replyText: '!menu' }]],
       });
       return;
     }
@@ -1429,7 +1431,7 @@ export async function handleWhatsappCommand(
       text: verify.ok
         ? `Yeay! Akun WhatsApp Kakak berhasil dihubungkan dengan akun ${verify.customerCode}. Riwayat transaksi kini tergabung.`
         : verify.errorMessage || 'Maaf Kak, gagal menghubungkan akun.',
-      quickReplies: [[{ text: 'Menu Utama', replyText: '!menu' }]],
+      quickReplies: [[{ text: '🏠 Menu Utama', replyText: '!menu' }]],
     });
     return;
   }
@@ -1439,7 +1441,7 @@ export async function handleWhatsappCommand(
     if (dryRun) {
       await sock.sendMessage(jid, {
         text: '[Mode Demo] Simulasi unlink WhatsApp — identitas nyata tidak diubah.',
-        quickReplies: [[{ text: 'Menu Utama', replyText: '!menu' }]],
+        quickReplies: [[{ text: '🏠 Menu Utama', replyText: '!menu' }]],
       });
       return;
     }
@@ -1448,7 +1450,7 @@ export async function handleWhatsappCommand(
       text: res.ok
         ? 'Identitas WhatsApp berhasil diputuskan dari akun gabungan.'
         : res.errorMessage || 'Maaf, gagal unlink akun.',
-      quickReplies: [[{ text: 'Menu Utama', replyText: '!menu' }]],
+      quickReplies: [[{ text: '🏠 Menu Utama', replyText: '!menu' }]],
     });
     return;
   }
@@ -1485,8 +1487,8 @@ export async function handleWhatsappCommand(
       text: `Pesanan *${session.productName}* (${session.destination}) menunggu konfirmasi Anda.\nTap tombol *Ya, Buat QRIS* atau *Batal* di bawah ini:`,
       quickReplies: [
         [
-          { text: 'Ya, Buat QRIS', replyText: '!ya' },
-          { text: 'Batal', replyText: '!batal' },
+          { text: '✅ Ya, Buat QRIS', replyText: '!ya' },
+          { text: '❌ Batal', replyText: '!batal' },
         ],
       ],
     });

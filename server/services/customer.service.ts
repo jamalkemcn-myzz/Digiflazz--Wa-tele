@@ -115,6 +115,74 @@ export function getCustomerIdentities(customerId: number): CustomerIdentityRow[]
     .all(customerId) as CustomerIdentityRow[];
 }
 
+export function findCustomerByIdentifier(query: string): {
+  customer: CustomerRow;
+  identities: CustomerIdentityRow[];
+} | null {
+  const clean = query.trim();
+  if (!clean) return null;
+  const db = getDb();
+
+  let customer: CustomerRow | undefined;
+  if (/^CUS-/i.test(clean)) {
+    customer = db
+      .prepare('SELECT * FROM customers WHERE UPPER(customer_code) = UPPER(?)')
+      .get(clean) as CustomerRow | undefined;
+  }
+
+  if (!customer && /^\d+$/.test(clean)) {
+    const byIdentity = db
+      .prepare('SELECT customer_id FROM customer_identities WHERE platform_user_id = ? LIMIT 1')
+      .get(clean) as { customer_id: number } | undefined;
+    if (byIdentity) {
+      customer = db
+        .prepare('SELECT * FROM customers WHERE id = ?')
+        .get(byIdentity.customer_id) as CustomerRow | undefined;
+    }
+    if (!customer) {
+      const waDigits = extractWhatsappPhoneFromJid(clean);
+      if (waDigits && waDigits !== clean) {
+        const byWa = db
+          .prepare("SELECT customer_id FROM customer_identities WHERE platform = 'WHATSAPP' AND platform_user_id = ? LIMIT 1")
+          .get(waDigits) as { customer_id: number } | undefined;
+        if (byWa) {
+          customer = db
+            .prepare('SELECT * FROM customers WHERE id = ?')
+            .get(byWa.customer_id) as CustomerRow | undefined;
+        }
+      }
+    }
+    if (!customer) {
+      customer = db.prepare('SELECT * FROM customers WHERE id = ?').get(Number(clean)) as CustomerRow | undefined;
+    }
+  }
+
+  if (!customer) {
+    const normalizedWa = extractWhatsappPhoneFromJid(clean);
+    const bareUsername = clean.replace(/^@/, '');
+    const row = db
+      .prepare(
+        `SELECT customer_id FROM customer_identities
+         WHERE platform_user_id = ?
+            OR platform_user_id = ?
+            OR LOWER(REPLACE(COALESCE(platform_username, ''), '@', '')) = LOWER(?)
+         LIMIT 1`
+      )
+      .get(clean, normalizedWa, bareUsername) as { customer_id: number } | undefined;
+    if (row) {
+      customer = db
+        .prepare('SELECT * FROM customers WHERE id = ?')
+        .get(row.customer_id) as CustomerRow | undefined;
+    }
+  }
+
+  if (!customer) return null;
+  return {
+    customer,
+    identities: getCustomerIdentities(customer.id),
+  };
+}
+
 export function requestAccountLinkCode(params: {
   platform: 'WHATSAPP' | 'TELEGRAM';
   platformUserId: string;

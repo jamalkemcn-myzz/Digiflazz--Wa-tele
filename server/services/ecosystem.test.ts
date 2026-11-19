@@ -1583,16 +1583,16 @@ test('PulsaSync Bot Revision: SHOP_NAME env, /start greeting & buttons, /profil 
   // Verify 6 main menu buttons & absence of Deposit button on Telegram
   const tgButtonLabels = TG_MAIN_MENU_BUTTONS.flat().map((b) => b.text);
   assert.deepEqual(tgButtonLabels, [
-    'Kategori Produk',
-    'Daftar Produk',
-    'Profil & Saldo',
-    'Redeem Voucher',
-    'Riwayat Transaksi',
-    'Hubungi Admin',
+    '📂 Kategori Produk',
+    '🛒 Daftar Produk',
+    '👤 Profil & Saldo',
+    '🎟️ Redeem Voucher',
+    '📜 Riwayat Transaksi',
+    '👨‍💼 Hubungi Admin',
   ]);
   assert.equal(tgButtonLabels.some((t) => /deposit/i.test(t)), false);
 
-  // Telegram /start renders exact greeting, SHOP_NAME, user summary & buttons
+  // Telegram /start renders exact greeting, SHOP_NAME, user summary & buttons (without Total Pengguna Bot)
   const tgStartReplies: Array<{ text: string; buttons?: unknown }> = [];
   await dispatchTelegramCommand(
     {
@@ -1610,7 +1610,7 @@ test('PulsaSync Bot Revision: SHOP_NAME env, /start greeting & buttons, /profil 
   );
   assert.match(startMsg, /ID User:/);
   assert.match(startMsg, /Status:\s*Member/);
-  assert.match(startMsg, /Total Pengguna Bot:\s*\d+/);
+  assert.equal(/Total Pengguna Bot/i.test(startMsg), false);
 
   // Telegram /profil renders Akun & Keuangan sections cleanly
   const tgProfileReplies: string[] = [];
@@ -1656,14 +1656,15 @@ test('PulsaSync Bot Revision: SHOP_NAME env, /start greeting & buttons, /profil 
   assert.equal(waSent.length, 1);
   assert.ok(waSent[0].text.includes('Halo Kak Andi WA!'));
   assert.ok(waSent[0].text.includes('Selamat datang di Toko PulsaSync Jaya — Layanan Pelanggan.'));
+  assert.equal(/Total Pengguna Bot/i.test(waSent[0].text), false);
   const waBtns = (waSent[0].buttons || []).flat().map((b) => b.text);
   assert.deepEqual(waBtns, [
-    'Kategori Produk',
-    'Daftar Produk',
-    'Profil & Saldo',
-    'Redeem Voucher',
-    'Riwayat Transaksi',
-    'Hubungi Admin',
+    '📂 Kategori Produk',
+    '🛒 Daftar Produk',
+    '👤 Profil & Saldo',
+    '🎟️ Redeem Voucher',
+    '📜 Riwayat Transaksi',
+    '👨‍💼 Hubungi Admin',
   ]);
   assert.equal(waBtns.some((t) => /deposit/i.test(t)), false);
 
@@ -1884,8 +1885,8 @@ test('Telegram & WhatsApp Category -> Brand/Operator -> Product + Phone Prefix A
   });
   assert.match(tgCatStep.replies[0].text, /deteksi operator otomatis/i);
   const tgBrandBtnTexts = (tgCatStep.replies[0].buttons || []).flat().map((b) => b.text);
-  assert.ok(tgBrandBtnTexts.some((t) => t.startsWith('XL')));
-  assert.ok(tgBrandBtnTexts.some((t) => t.startsWith('TELKOMSEL')));
+  assert.ok(tgBrandBtnTexts.some((t) => t.includes('XL')));
+  assert.ok(tgBrandBtnTexts.some((t) => t.includes('TELKOMSEL')));
 
   // 2. Telegram Opsi 2: Sending XL phone number auto-detects XL and lists XL products cheapest first
   const tgAutoDetect = await runBotDemoInteraction({
@@ -1964,7 +1965,7 @@ test('Telegram Hubungi Admin URL Button & Cek Status Callback Query Alert (show_
     const { dispatchTelegramCallback } = await import('../bots/telegram.callback-handler');
 
     const menuWithUsername = getTelegramMainMenuButtons().flat();
-    const adminBtnUser = menuWithUsername.find((b) => b.text === 'Hubungi Admin');
+    const adminBtnUser = menuWithUsername.find((b) => b.text === '👨‍💼 Hubungi Admin');
     assert.equal(adminBtnUser?.url, 'https://t.me/admin_pulsasync');
     assert.equal(adminBtnUser?.callbackData, undefined);
 
@@ -1974,7 +1975,7 @@ test('Telegram Hubungi Admin URL Button & Cek Status Callback Query Alert (show_
     refreshConfig(process.env);
     const adminBtnId = getTelegramMainMenuButtons()
       .flat()
-      .find((b) => b.text === 'Hubungi Admin');
+      .find((b) => b.text === '👨‍💼 Hubungi Admin');
     assert.equal(adminBtnId?.url, 'tg://user?id=987654321');
 
     // 3. Without both -> fallback to CONTACT_ADMIN callback
@@ -1983,7 +1984,7 @@ test('Telegram Hubungi Admin URL Button & Cek Status Callback Query Alert (show_
     refreshConfig(process.env);
     const adminBtnFallback = getTelegramMainMenuButtons()
       .flat()
-      .find((b) => b.text === 'Hubungi Admin');
+      .find((b) => b.text === '👨‍💼 Hubungi Admin');
     assert.equal(adminBtnFallback?.url, undefined);
     assert.equal(adminBtnFallback?.callbackData, 'CONTACT_ADMIN');
 
@@ -2329,6 +2330,292 @@ test('Telegram CONFIRM_ORDER double-tap never sends expired-session message befo
     { dryRun: true }
   );
   assert.ok(replies.some((r) => r.includes('Sesi konfirmasi pesanan sudah berakhir ya Kak')));
+});
+
+test('Optional Payment Confirmation Description (Global & Per-SKU) via Admin API, Telegram & WhatsApp', async () => {
+  const actor = { id: 'testowner', role: 'OWNER' as const };
+  const { setConfirmationDescription, getConfirmationDescription } = await import('./settings.service');
+  const { updateProductDescription } = await import('./product.service');
+
+  // Ensure both descriptions start empty
+  setConfirmationDescription(null, actor);
+  updateProductDescription('TSEL10', null, actor);
+  assert.equal(getConfirmationDescription(), null);
+
+  // 1. Without descriptions -> Konfirmasi Pesanan Anda must NOT show Keterangan: or Catatan:
+  const tgNoDesc = await runBotDemoInteraction({
+    platform: 'TELEGRAM',
+    senderRole: 'CUSTOMER',
+    inputType: 'CALLBACK',
+    callbackData: 'BUY_SKU_TSEL10',
+    senderId: '88221100',
+    actor,
+  });
+  assert.match(tgNoDesc.replies[0].text, /Nomor tujuan/i);
+  const tgConfirmEmpty = await runBotDemoInteraction({
+    platform: 'TELEGRAM',
+    senderRole: 'CUSTOMER',
+    inputType: 'TEXT',
+    text: '081234560101',
+    senderId: '88221100',
+    actor,
+  });
+  assert.match(tgConfirmEmpty.replies[0].text, /Konfirmasi Pesanan Anda/);
+  assert.equal(/Keterangan:|Catatan:/i.test(tgConfirmEmpty.replies[0].text), false);
+
+  const waConfirmEmpty = await runBotDemoInteraction({
+    platform: 'WHATSAPP',
+    senderRole: 'CUSTOMER',
+    inputType: 'TEXT',
+    text: '!order TSEL10 081234560101',
+    senderId: '6281200010101',
+    actor,
+  });
+  assert.match(waConfirmEmpty.replies[0].text, /Konfirmasi Pesanan Anda/);
+  assert.equal(/Keterangan:|Catatan:/i.test(waConfirmEmpty.replies[0].text), false);
+
+  // 2. Configure both via Admin HTTP API and verify GET /api/admin/settings + Bot Confirmation screens
+  const app = createExpressApp();
+  const server = await new Promise<http.Server>((resolve) => {
+    const s = app.listen(0, '127.0.0.1', () => resolve(s));
+  });
+  try {
+    const port = (server.address() as { port: number }).port;
+    const authHeader = `Basic ${Buffer.from('testowner:test-strong-password-999').toString('base64')}`;
+
+    const putDescRes = await fetch(`http://127.0.0.1:${port}/api/admin/settings/confirmation-description`, {
+      method: 'PUT',
+      headers: { Authorization: authHeader, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ description: 'Pastikan nomor aktif sebelum membayar.' }),
+    });
+    assert.equal(putDescRes.status, 200);
+    const putDescJson = (await putDescRes.json()) as { ok: boolean; data: { confirmationDescription: string | null } };
+    assert.equal(putDescJson.data.confirmationDescription, 'Pastikan nomor aktif sebelum membayar.');
+
+    const prodSaveRes = await fetch(`http://127.0.0.1:${port}/api/admin/products`, {
+      method: 'POST',
+      headers: { Authorization: authHeader, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sku: 'TSEL10',
+        name: 'Telkomsel 10.000',
+        supplierPrice: 10200,
+        description: 'Proses otomatis 1-3 menit.',
+      }),
+    });
+    assert.equal(prodSaveRes.status, 201);
+
+    const settingsRes = await fetch(`http://127.0.0.1:${port}/api/admin/settings`, {
+      headers: { Authorization: authHeader },
+    });
+    assert.equal(settingsRes.status, 200);
+    const settingsJson = (await settingsRes.json()) as { ok: boolean; data: { confirmationDescription: string | null } };
+    assert.equal(settingsJson.data.confirmationDescription, 'Pastikan nomor aktif sebelum membayar.');
+
+    // Check Telegram confirmation displays both descriptions & button emojis
+    await runBotDemoInteraction({
+      platform: 'TELEGRAM',
+      senderRole: 'CUSTOMER',
+      inputType: 'CALLBACK',
+      callbackData: 'BUY_SKU_TSEL10',
+      senderId: '88221102',
+      actor,
+    });
+    const tgConfirmWithDesc = await runBotDemoInteraction({
+      platform: 'TELEGRAM',
+      senderRole: 'CUSTOMER',
+      inputType: 'TEXT',
+      text: '081234560202',
+      senderId: '88221102',
+      actor,
+    });
+    assert.ok(tgConfirmWithDesc.replies[0].text.includes('Keterangan: Proses otomatis 1-3 menit.'));
+    assert.ok(tgConfirmWithDesc.replies[0].text.includes('Catatan: Pastikan nomor aktif sebelum membayar.'));
+    const tgConfirmBtnTexts = (tgConfirmWithDesc.replies[0].buttons || []).flat().map((b) => b.text);
+    assert.ok(tgConfirmBtnTexts.some((t) => t.includes('✅') && t.includes('Buat QRIS')));
+    assert.ok(tgConfirmBtnTexts.some((t) => t.includes('❌') && t.includes('Batal')));
+
+    // Check WhatsApp confirmation displays both descriptions
+    const waConfirmWithDesc = await runBotDemoInteraction({
+      platform: 'WHATSAPP',
+      senderRole: 'CUSTOMER',
+      inputType: 'TEXT',
+      text: '!order TSEL10 081234560202',
+      senderId: '6281200020202',
+      actor,
+    });
+    assert.ok(waConfirmWithDesc.replies[0].text.includes('Keterangan: Proses otomatis 1-3 menit.'));
+    assert.ok(waConfirmWithDesc.replies[0].text.includes('Catatan: Pastikan nomor aktif sebelum membayar.'));
+
+    // 3. Clearing both removes lines cleanly again
+    await fetch(`http://127.0.0.1:${port}/api/admin/settings/confirmation-description`, {
+      method: 'PUT',
+      headers: { Authorization: authHeader, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ description: null }),
+    });
+    updateProductDescription('TSEL10', null, actor);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test('Telegram-Only Admin Config Menus (Deskripsi, Refresh Harga, Margin, Kredit Saldo, Voucher, Bot WA) & RBAC', async () => {
+  const { dispatchTelegramCommand, TG_NAV_BACK_BUTTONS } = await import('../bots/telegram.command-handler');
+  const { dispatchTelegramCallback } = await import('../bots/telegram.callback-handler');
+  const { TG_ADMIN_MENU_BUTTONS, TG_ADMIN_CONFIG_BUTTONS } = await import('../bots/telegram.admin-config');
+  const { createAdmin } = await import('./admin.service');
+  const { resolveOrCreateCustomer, getCustomerRefundCreditTotal } = await import('./customer.service');
+  const { getConfirmationDescription } = await import('./settings.service');
+  const { getGlobalMarginRule, getProductBySkuOrId } = await import('./product.service');
+  const { listCoupons } = await import('./coupon.service');
+  const { handleWhatsappCommand, clearWhatsappCooldown } = await import('../bots/whatsapp.command-handler');
+
+  clearWhatsappCooldown();
+
+  // Verify every button across TG Admin / Config / Nav menus starts with an emoji symbol
+  for (const btn of [...TG_ADMIN_MENU_BUTTONS.flat(), ...TG_ADMIN_CONFIG_BUTTONS.flat(), ...TG_NAV_BACK_BUTTONS.flat()]) {
+    assert.match(btn.text, /^[^\w\s]/, `Menu button "${btn.text}" should start with an emoji`);
+  }
+
+  // Register a Telegram Admin user ID and a target customer
+  const adminTgId = '99007701';
+  createAdmin(
+    { name: 'TG Config Admin', role: 'OWNER', platform: 'TELEGRAM', platformUserId: adminTgId },
+    { id: 'testowner', role: 'OWNER' }
+  );
+  const { customer: cust } = resolveOrCreateCustomer({
+    platform: 'TELEGRAM',
+    platformUserId: '55110022',
+    platformUsername: '@cust_tg_bal',
+  });
+
+  // 1. Unauthorized normal customer cannot access /konfigurasi or ADMIN_CONFIG_MENU
+  const unauthReplies: string[] = [];
+  await dispatchTelegramCommand(
+    { async reply(text) { unauthReplies.push(text); } },
+    { userId: '55110022', username: '@cust_tg_bal', text: '/konfigurasi' }
+  );
+  assert.match(unauthReplies[0], /akses ditolak/i);
+
+  const unauthCbReplies: string[] = [];
+  await dispatchTelegramCallback(
+    { async reply(text) { unauthCbReplies.push(text); }, async answerCbQuery() {} },
+    { data: 'ADMIN_CONFIG_MENU', userId: '55110022', username: '@cust_tg_bal' }
+  );
+  assert.match(unauthCbReplies[0], /akses.*ditolak/i);
+
+  // 2. Admin /admin & ADMIN_CONFIG_MENU exposes all 6 required config menus
+  const adminPanelReplies: Array<{ text: string; buttons?: Array<Array<{ text: string; callbackData?: string }>> }> = [];
+  await dispatchTelegramCommand(
+    {
+      async reply(text, buttons) {
+        adminPanelReplies.push({ text, buttons });
+      },
+    },
+    { userId: adminTgId, username: '@owner_tg', text: '/admin' }
+  );
+  const panelBtnTexts = (adminPanelReplies[0].buttons || []).flat().map((b) => b.text);
+  assert.ok(panelBtnTexts.includes('⚙️ Konfigurasi Bot'));
+
+  const cfgReplies: Array<{ text: string; buttons?: Array<Array<{ text: string; callbackData?: string }>> }> = [];
+  const sendCmd = async (text: string) => {
+    await dispatchTelegramCommand(
+      {
+        async reply(replyText, buttons) {
+          cfgReplies.push({ text: replyText, buttons });
+        },
+      },
+      { userId: adminTgId, username: '@owner_tg', text }
+    );
+  };
+  const sendCb = async (data: string) => {
+    await dispatchTelegramCallback(
+      {
+        async reply(replyText, buttons) {
+          cfgReplies.push({ text: replyText, buttons });
+        },
+        async answerCbQuery() {},
+      },
+      { data, userId: adminTgId, username: '@owner_tg' }
+    );
+  };
+
+  await sendCb('ADMIN_CONFIG_MENU');
+  const cfgBtnTexts = (cfgReplies.at(-1)?.buttons || []).flat().map((b) => b.text);
+  assert.deepEqual(cfgBtnTexts, [
+    '📝 Set Deskripsi',
+    '🔄 Refresh Harga',
+    '💹 Set Margin',
+    '💳 Set Saldo User',
+    '🎟️ Buat Voucher',
+    '🤖 Set Bot WA',
+    '🔙 Kembali ke Admin',
+  ]);
+
+  // 3. Interactive Set Deskripsi Global + Per-SKU
+  await sendCb('ADMIN_CFG_DESC_GLOBAL');
+  await sendCmd('Catatan via Telegram Admin');
+  assert.equal(getConfirmationDescription(), 'Catatan via Telegram Admin');
+  await sendCb('ADMIN_CFG_DESC_CLEAR');
+  assert.equal(getConfirmationDescription(), null);
+
+  await sendCb('ADMIN_CFG_DESC_PRODUCT');
+  await sendCmd('TSEL10 | Deskripsi SKU dari Telegram');
+  assert.equal(getProductBySkuOrId('TSEL10')?.description, 'Deskripsi SKU dari Telegram');
+
+  // 4. Interactive Set Margin
+  await sendCb('ADMIN_CFG_MARGIN_PERCENT');
+  await sendCmd('6 2500');
+  const updatedMargin = getGlobalMarginRule();
+  assert.equal(updatedMargin.type, 'PERCENT');
+  assert.equal(updatedMargin.value, 6);
+  assert.equal(updatedMargin.maxMargin, 2500);
+
+  // 5. Interactive Set Saldo User (Kredit Refund Internal)
+  await sendCb('ADMIN_CFG_BALANCE');
+  const balBefore = getCustomerRefundCreditTotal(cust.id);
+  await sendCmd(`${cust.customer_code} +15000 Kompensasi admin telegram`);
+  assert.equal(getCustomerRefundCreditTotal(cust.id), balBefore + 15000);
+  assert.match(cfgReplies.at(-1)!.text, /Saldo Kredit Refund Internal Diperbarui/);
+
+  // 6. Interactive Buat Voucher
+  await sendCb('ADMIN_CFG_VOUCHER');
+  await sendCmd('TGBOT15 FIXED 2000 10 0 0 Voucher Khusus TG');
+  const createdVoucher = listCoupons().find((c) => c.code === 'TGBOT15');
+  assert.ok(createdVoucher);
+  assert.equal(createdVoucher.discount_type, 'FIXED');
+  assert.equal(createdVoucher.discount_value, 2000);
+
+  // 7. Interactive Set Bot WA menu & Refresh Harga Demo simulation
+  await sendCb('ADMIN_CFG_WABOT');
+  const waMenuBtns = (cfgReplies.at(-1)?.buttons || []).flat().map((b) => b.text);
+  assert.ok(waMenuBtns.includes('🔄 Reconnect WA'));
+  assert.ok(waMenuBtns.includes('🧹 Reset Sesi WA'));
+  assert.ok(waMenuBtns.includes('🔑 Minta Pairing Code'));
+
+  const syncDemo = await runBotDemoInteraction({
+    platform: 'TELEGRAM',
+    senderRole: 'ADMIN',
+    inputType: 'CALLBACK',
+    callbackData: 'ADMIN_CFG_SYNC',
+    actor: { id: 'testowner', role: 'OWNER' },
+  });
+  assert.match(syncDemo.replies[0].text, /Refresh Harga Digiflazz/);
+
+  // 8. Verify Telegram-only config commands do NOT exist on WhatsApp bot
+  const waConfigReplies: string[] = [];
+  await handleWhatsappCommand(
+    {
+      async sendMessage(_jid, content) {
+        waConfigReplies.push('text' in content ? content.text : content.caption || '');
+        return undefined;
+      },
+    },
+    '62899007701',
+    '!konfigurasi',
+    'Admin WA',
+    { now: 99_000 }
+  );
+  assert.match(waConfigReplies[0], /belum memahami perintah "!konfigurasi"/i);
 });
 
 test.after(() => {

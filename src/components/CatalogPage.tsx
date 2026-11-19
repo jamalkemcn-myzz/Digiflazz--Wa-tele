@@ -43,6 +43,7 @@ export function CatalogPage({ initialTab = 'products', permissions }: { initialT
   const [newProd, setNewProd] = useState({
     sku: '',
     name: '',
+    description: '',
     categoryId: '',
     supplierPrice: '',
     marginType: '' as '' | 'FIXED' | 'PERCENT',
@@ -201,6 +202,7 @@ export function CatalogPage({ initialTab = 'products', permissions }: { initialT
     setNewProd({
       sku: p.sku,
       name: p.name,
+      description: p.description ?? '',
       categoryId: p.category_id ? String(p.category_id) : '',
       supplierPrice: String(p.supplier_price),
       marginType: p.margin_type ?? '',
@@ -212,7 +214,7 @@ export function CatalogPage({ initialTab = 'products', permissions }: { initialT
 
   function resetProductForm() {
     setEditingSku(null);
-    setNewProd({ sku: '', name: '', categoryId: '', supplierPrice: '', marginType: '', marginValue: '', maxMargin: '' });
+    setNewProd({ sku: '', name: '', description: '', categoryId: '', supplierPrice: '', marginType: '', marginValue: '', maxMargin: '' });
   }
 
   async function handleSaveProduct(e: React.FormEvent) {
@@ -231,6 +233,7 @@ export function CatalogPage({ initialTab = 'products', permissions }: { initialT
       await api.saveProduct({
         sku: newProd.sku.trim(),
         name: newProd.name.trim(),
+        description: newProd.description.trim() || null,
         categoryId: newProd.categoryId ? Number(newProd.categoryId) : null,
         supplierPrice: Number(newProd.supplierPrice),
         marginType: newProd.marginType || null,
@@ -736,6 +739,21 @@ export function CatalogPage({ initialTab = 'products', permissions }: { initialT
                   </div>
                 )}
               </div>
+
+              <div>
+                <label htmlFor="prod-description" className="block text-xs font-medium text-slate-400 mb-1">
+                  Keterangan Konfirmasi (Opsional)
+                </label>
+                <input
+                  id="prod-description"
+                  type="text"
+                  maxLength={500}
+                  value={newProd.description}
+                  onChange={(e) => setNewProd({ ...newProd, description: e.target.value })}
+                  placeholder="Contoh: Proses cepat 1-5 menit. Kosongkan jika tidak perlu."
+                  className="w-full px-3 py-1.5 text-xs bg-[#0d1422] border border-[#28354e] text-slate-100 placeholder:text-slate-500 rounded-lg"
+                />
+              </div>
             </form>
           )}
 
@@ -802,6 +820,11 @@ export function CatalogPage({ initialTab = 'products', permissions }: { initialT
                         <td className="py-3 px-4 font-mono text-xs font-semibold text-[#4b8bff]">{p.sku}</td>
                         <td className="py-3 px-4 font-medium text-slate-100">
                           <div>{p.name}</div>
+                          {p.description && (
+                            <div className="text-[11px] text-slate-400 mt-0.5 line-clamp-2">
+                              Keterangan: {p.description}
+                            </div>
+                          )}
                           {p.margin_type && p.margin_value !== null && (
                             <div className="text-[11px] font-mono text-slate-400">
                               Override: {p.margin_type} ({p.margin_value}{p.margin_type === 'PERCENT' ? '%' : ''}{p.max_margin ? `, maks ${formatRp(p.max_margin)}` : ''})

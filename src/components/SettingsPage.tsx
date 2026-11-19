@@ -26,14 +26,18 @@ export function SettingsPage({ permissions }: { permissions: string[] }) {
     outboundIp: string | null;
     balanceCheck: { ok: boolean; balance?: number; errorMessage?: string };
   } | null>(null);
+  const [confDesc, setConfDesc] = useState('');
+  const [confDescBusy, setConfDescBusy] = useState(false);
 
   const canManageAdmins = permissions.includes('admins:manage');
+  const canWriteSettings = permissions.includes('settings:write');
 
   async function load() {
     setLoading(true);
     try {
       const res = await api.getSettings();
       setData(res.data);
+      setConfDesc(res.data.confirmationDescription ?? '');
     } catch (err) {
       setMessage({ type: 'err', text: err instanceof Error ? err.message : 'Gagal memuat pengaturan' });
     } finally {
@@ -97,6 +101,25 @@ export function SettingsPage({ permissions }: { permissions: string[] }) {
       setMessage({ type: 'err', text: err instanceof Error ? err.message : 'Gagal menjalankan diagnostik Digiflazz' });
     } finally {
       setDiagBusy(false);
+    }
+  }
+
+  async function handleSaveConfirmationDescription(nextValue: string | null) {
+    setConfDescBusy(true);
+    setMessage(null);
+    try {
+      const res = await api.setConfirmationDescription(nextValue);
+      const saved = res.data.confirmationDescription ?? '';
+      setConfDesc(saved);
+      setData((prev: any) => (prev ? { ...prev, confirmationDescription: res.data.confirmationDescription } : prev));
+      setMessage({
+        type: 'ok',
+        text: saved ? 'Keterangan konfirmasi pembayaran berhasil disimpan.' : 'Keterangan konfirmasi pembayaran dikosongkan.',
+      });
+    } catch (err) {
+      setMessage({ type: 'err', text: err instanceof Error ? err.message : 'Gagal menyimpan keterangan konfirmasi' });
+    } finally {
+      setConfDescBusy(false);
     }
   }
 
@@ -270,6 +293,49 @@ export function SettingsPage({ permissions }: { permissions: string[] }) {
             />
           </div>
         )}
+      </div>
+
+      {/* Keterangan Konfirmasi Pembayaran (Opsional) */}
+      <div className="bg-[#131c2e] border border-[#1f2b42] rounded-lg p-6 space-y-3">
+        <div>
+          <h3 className="text-sm font-semibold text-slate-100">Keterangan Konfirmasi Pembayaran (Opsional)</h3>
+          <p className="text-xs text-slate-400 mt-0.5">
+            Catatan global ini ditampilkan pada menu Konfirmasi Pesanan Anda (WhatsApp & Telegram) apabila diisi. Jika kosong, baris catatan dilewati secara otomatis. Anda juga dapat menambahkan keterangan per produk pada menu Katalog.
+          </p>
+        </div>
+        <textarea
+          id="confirmation-description"
+          rows={3}
+          maxLength={500}
+          disabled={!canWriteSettings || confDescBusy}
+          value={confDesc}
+          onChange={(e) => setConfDesc(e.target.value)}
+          placeholder="Contoh: Pastikan nomor tujuan aktif dan tidak dalam masa tenggang sebelum membayar."
+          className="w-full px-3 py-2 text-sm bg-[#0d1422] border border-[#28354e] text-slate-100 placeholder:text-slate-500 rounded-lg disabled:opacity-60"
+        />
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <span className="text-[11px] font-mono text-slate-500 tabular-nums">{confDesc.length}/500 karakter</span>
+          {canWriteSettings && (
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                disabled={confDescBusy}
+                onClick={() => void handleSaveConfirmationDescription(null)}
+                className="px-3 py-1.5 text-xs font-medium text-slate-200 bg-[#192233] border border-[#2a3852] rounded-lg hover:bg-[#232e42] disabled:opacity-50 cursor-pointer whitespace-nowrap"
+              >
+                Kosongkan
+              </button>
+              <button
+                type="button"
+                disabled={confDescBusy}
+                onClick={() => void handleSaveConfirmationDescription(confDesc.trim() || null)}
+                className="px-4 py-1.5 text-xs font-semibold text-white bg-[#1668ff] rounded-lg hover:bg-[#2574ff] disabled:opacity-50 cursor-pointer whitespace-nowrap"
+              >
+                {confDescBusy ? 'Menyimpan...' : 'Simpan Keterangan'}
+              </button>
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Safe Config Summary */}

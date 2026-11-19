@@ -35,7 +35,7 @@ export function formatStartMessage(params: {
   shopName: string;
   userId: string;
   isAdmin: boolean;
-  totalUsers: number;
+  totalUsers?: number;
 }): string {
   const name = resolveDisplayName(params.displayName, params.username);
   return (
@@ -43,8 +43,7 @@ export function formatStartMessage(params: {
     `Selamat datang di ${params.shopName} — Layanan Pelanggan.\n` +
     `Silakan pilih menu lewat tombol praktis di bawah tanpa perlu mengetik perintah manual:\n\n` +
     `• ID User: ${params.userId}\n` +
-    `• Status: ${params.isAdmin ? 'Admin' : 'Member'}\n` +
-    `• Total Pengguna Bot: ${params.totalUsers.toLocaleString('id-ID')}`
+    `• Status: ${params.isAdmin ? 'Admin' : 'Member'}`
   );
 }
 

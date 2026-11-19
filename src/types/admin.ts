@@ -181,6 +181,7 @@ export interface ProductItem {
   id: number;
   sku: string;
   name: string;
+  description?: string | null;
   category_id: number | null;
   category_name?: string | null;
   brand: string | null;
