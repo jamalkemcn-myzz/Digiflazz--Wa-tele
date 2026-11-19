@@ -128,11 +128,38 @@ async function bootstrap() {
     app.use(vite.middlewares);
   } else {
     const distDir = path.resolve(process.cwd(), 'dist');
-    if (fs.existsSync(distDir)) {
+    const distIndexPath = path.join(distDir, 'index.html');
+    if (!fs.existsSync(distIndexPath)) {
+      logger.warn('Production dist/index.html not found; running automatic Vite build...', {
+        service: 'http',
+      });
+      try {
+        const { build } = await import('vite');
+        await build();
+        logger.info('Automatic Vite production build completed', { service: 'http' });
+      } catch (err) {
+        logger.error('Automatic Vite production build failed', {
+          service: 'http',
+          details: { error: err instanceof Error ? err.message : String(err) },
+        });
+      }
+    }
+
+    if (fs.existsSync(distIndexPath)) {
       app.use(express.static(distDir));
       app.get('*', (req, res, next) => {
         if (req.path.startsWith('/api/')) return next();
-        res.sendFile(path.join(distDir, 'index.html'));
+        res.sendFile(distIndexPath);
+      });
+    } else {
+      app.get('*', (req, res, next) => {
+        if (req.path.startsWith('/api/')) return next();
+        res
+          .status(503)
+          .type('html')
+          .send(
+            '<!doctype html><html><body style="font-family:sans-serif;padding:24px;background:#0b1120;color:#e2e8f0;"><h2>Frontend belum ter-build (dist/index.html tidak ditemukan)</h2><p>Jalankan <code>npm run build</code> lalu restart server.</p></body></html>'
+          );
       });
     }
   }
