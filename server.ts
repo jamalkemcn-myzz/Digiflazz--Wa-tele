@@ -101,10 +101,27 @@ async function bootstrap() {
 
   if (config.nodeEnv !== 'production') {
     const { createServer: createViteServer } = await import('vite');
+    const appHost = (() => {
+      try {
+        return new URL(config.appUrl).hostname;
+      } catch {
+        return '';
+      }
+    })();
+    const allowedHosts = Array.from(
+      new Set([
+        'dashboard.myzzstore.my.id',
+        '.run.app',
+        '.trycloudflare.com',
+        'localhost',
+        '127.0.0.1',
+        ...(appHost ? [appHost] : []),
+      ])
+    );
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
-        allowedHosts: ['dashboard.myzzstore.my.id', 'localhost', '127.0.0.1'],
+        allowedHosts,
       },
       appType: 'spa',
     });
