@@ -2618,6 +2618,79 @@ test('Telegram-Only Admin Config Menus (Deskripsi, Refresh Harga, Margin, Kredit
   assert.match(waConfigReplies[0], /belum memahami perintah "!konfigurasi"/i);
 });
 
+test('Telegram QRIS waiting status notice, direct IPv4 primary upload & 5s default payment poll interval', async () => {
+  const { validateAndLoadConfig } = await import('../config/env');
+  const { setBotSession } = await import('../bots/bot-session');
+  const { dispatchTelegramCallback } = await import('../bots/telegram.callback-handler');
+  const { listProducts } = await import('./product.service');
+
+  // 1. Default PAYMENT_POLL_INTERVAL_SECONDS is 5s
+  const defaultCfg = validateAndLoadConfig({});
+  assert.equal(defaultCfg.scheduler.paymentPollIntervalSeconds, 5);
+  const envExRaw = fs.readFileSync(path.resolve(process.cwd(), '.env.example'), 'utf8');
+  assert.match(envExRaw, /^PAYMENT_POLL_INTERVAL_SECONDS=5$/m);
+
+  // 2. CONFIRM_ORDER triggers sendStatusMessage BEFORE QRIS upload and dismisses it cleanly after delivery
+  const activeProducts = listProducts({ onlyActive: true, limit: 1 }).items;
+  assert.ok(activeProducts.length > 0);
+  const sampleProduct = activeProducts[0];
+  const userId = '77441122';
+
+  setBotSession(
+    'TELEGRAM',
+    userId,
+    {
+      mode: 'AWAITING_ORDER_CONFIRMATION',
+      sku: sampleProduct.sku,
+      productName: sampleProduct.name,
+      sellingPrice: sampleProduct.selling_price,
+      discountAmount: 0,
+      estimatedTotal: sampleProduct.selling_price + 11,
+      destination: '081234561122',
+      couponCode: null,
+      updatedAt: Date.now(),
+    },
+    true
+  );
+
+  const timeline: string[] = [];
+  const cbAnswers: string[] = [];
+
+  await dispatchTelegramCallback(
+    {
+      async reply(text) {
+        timeline.push(`reply:${text}`);
+      },
+      async sendStatusMessage(text) {
+        timeline.push(`status_show:${text}`);
+        return async () => {
+          timeline.push('status_dismiss');
+        };
+      },
+      async sendQris() {
+        timeline.push('send_qris');
+        return 3344;
+      },
+      async answerCbQuery(text) {
+        if (text) cbAnswers.push(text);
+      },
+      async deleteSourceMessage() {
+        timeline.push('delete_confirm');
+      },
+    },
+    { data: 'CONFIRM_ORDER', userId, username: '@wait_tester', sourceMessageId: 5001 },
+    { dryRun: true }
+  );
+
+  assert.ok(cbAnswers.some((t) => /Membuat QRIS pembayaran/i.test(t)));
+  const statusShowIdx = timeline.findIndex((e) => e.startsWith('status_show:') && /membuat QRIS pembayaran/i.test(e));
+  const sendQrisIdx = timeline.indexOf('send_qris');
+  const dismissIdx = timeline.indexOf('status_dismiss');
+  assert.ok(statusShowIdx !== -1);
+  assert.ok(sendQrisIdx > statusShowIdx);
+  assert.ok(dismissIdx > sendQrisIdx);
+});
+
 test.after(() => {
   closeDb();
   fs.rmSync(tempDir, { recursive: true, force: true });

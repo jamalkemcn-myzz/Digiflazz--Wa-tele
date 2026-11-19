@@ -44,7 +44,7 @@ import {
   type TelegramReplyTransport,
 } from './telegram.command-handler';
 import { handleTelegramAdminConfigCallback } from './telegram.admin-config';
-import { sendTelegramQrisInvoice } from './telegram.notification.service';
+import { deleteTelegramMessageSafely, sendTelegramQrisInvoice } from './telegram.notification.service';
 import {
   acquireOrderExecutionLock,
   clearBotSession,
@@ -113,7 +113,9 @@ export async function dispatchTelegramCallback(
       if (transport.deleteSourceMessage) {
         await transport.deleteSourceMessage();
       }
-      if (transport.answerCbQuery) await transport.answerCbQuery();
+      if (transport.answerCbQuery) {
+        await transport.answerCbQuery('⏳ Membuat QRIS pembayaran...', false);
+      }
       await executeTelegramOrder(transport, {
         userId,
         username: input.username,
@@ -611,12 +613,31 @@ export function registerTelegramCallbacks(bot: Telegraf): void {
       },
       async sendQris(caption: string, qris?: { qrString?: string; qrUrl?: string }, buttons?: TelegramInlineButton[][]) {
         if (!chatId) return null;
-        await ctx.telegram.sendChatAction(chatId, 'upload_photo').catch(() => undefined);
+        void ctx.telegram.sendChatAction(chatId, 'upload_photo').catch(() => undefined);
         const msgId = await sendTelegramQrisInvoice(bot, chatId, caption, qris, toMarkupKeyboard(buttons));
         if (msgId) {
           recordTelegramBotMessageId(chatId, msgId);
         }
         return msgId;
+      },
+      async sendStatusMessage(text: string) {
+        if (!chatId) return undefined;
+        let sentMsgId: number | null = null;
+        try {
+          const sent = await ctx.reply(toTelegramHtml(text), { parse_mode: 'HTML' });
+          sentMsgId = sent.message_id;
+        } catch {
+          const sent = await ctx.reply(text).catch(() => null);
+          sentMsgId = sent?.message_id ?? null;
+        }
+        void ctx.telegram.sendChatAction(chatId, 'upload_photo').catch(() => undefined);
+        if (!sentMsgId) return undefined;
+        let dismissed = false;
+        return async () => {
+          if (dismissed) return;
+          dismissed = true;
+          await deleteTelegramMessageSafely(bot, chatId, sentMsgId);
+        };
       },
       async answerCbQuery(text?: string, showAlert?: boolean) {
         await answerOnce(text, showAlert);

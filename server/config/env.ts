@@ -179,7 +179,7 @@ export function validateAndLoadConfig(env: NodeJS.ProcessEnv = process.env): App
   let uniqueCodeMax = 99;
   let linkExpiryMinutes = 5;
   let linkMaxAttempts = 5;
-  let paymentPollSeconds = 15;
+  let paymentPollSeconds = 5;
   let supplierPollSeconds = 30;
   let reconciliationSeconds = 60;
   let notificationRetrySeconds = 30;
@@ -238,7 +238,7 @@ export function validateAndLoadConfig(env: NodeJS.ProcessEnv = process.env): App
     }
     linkExpiryMinutes = parseIntBounded('ACCOUNT_LINK_CODE_EXPIRY_MINUTES', env.ACCOUNT_LINK_CODE_EXPIRY_MINUTES, 5, 1, 60);
     linkMaxAttempts = parseIntBounded('ACCOUNT_LINK_MAX_ATTEMPTS', env.ACCOUNT_LINK_MAX_ATTEMPTS, 5, 1, 20);
-    paymentPollSeconds = parseIntBounded('PAYMENT_POLL_INTERVAL_SECONDS', env.PAYMENT_POLL_INTERVAL_SECONDS, 15, 5, 3600);
+    paymentPollSeconds = parseIntBounded('PAYMENT_POLL_INTERVAL_SECONDS', env.PAYMENT_POLL_INTERVAL_SECONDS, 5, 5, 3600);
     supplierPollSeconds = parseIntBounded('SUPPLIER_POLL_INTERVAL_SECONDS', env.SUPPLIER_POLL_INTERVAL_SECONDS, 30, 5, 3600);
     reconciliationSeconds = parseIntBounded('RECONCILIATION_INTERVAL_SECONDS', env.RECONCILIATION_INTERVAL_SECONDS, 60, 10, 3600);
     notificationRetrySeconds = parseIntBounded('NOTIFICATION_RETRY_INTERVAL_SECONDS', env.NOTIFICATION_RETRY_INTERVAL_SECONDS, 30, 5, 3600);

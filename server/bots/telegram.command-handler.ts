@@ -86,6 +86,7 @@ export interface TelegramInlineButton {
 export interface TelegramReplyTransport {
   reply(text: string, buttons?: TelegramInlineButton[][]): Promise<void>;
   sendQris?(caption: string, qris?: { qrString?: string; qrUrl?: string }, buttons?: TelegramInlineButton[][]): Promise<number | null>;
+  sendStatusMessage?(text: string): Promise<(() => Promise<void>) | void>;
   answerCbQuery?(text?: string, showAlert?: boolean): Promise<void>;
   deleteSourceMessage?(): Promise<void>;
 }
@@ -252,11 +253,31 @@ function createTelegrafTransport(bot: Telegraf, ctx: Context): TelegramReplyTran
     },
     async sendQris(caption: string, qris?: { qrString?: string; qrUrl?: string }, buttons?: TelegramInlineButton[][]) {
       if (!chatId) return null;
+      void bot.telegram.sendChatAction(chatId, 'upload_photo').catch(() => undefined);
       const msgId = await sendTelegramQrisInvoice(bot, chatId, caption, qris, toMarkupKeyboard(buttons));
       if (msgId) {
         recordTelegramBotMessageId(chatId, msgId);
       }
       return msgId;
+    },
+    async sendStatusMessage(text: string) {
+      if (!chatId) return undefined;
+      let sentMsgId: number | null = null;
+      try {
+        const sent = await bot.telegram.sendMessage(chatId, toTelegramHtml(text), { parse_mode: 'HTML' });
+        sentMsgId = sent.message_id;
+      } catch {
+        const sent = await bot.telegram.sendMessage(chatId, text).catch(() => null);
+        sentMsgId = sent?.message_id ?? null;
+      }
+      void bot.telegram.sendChatAction(chatId, 'upload_photo').catch(() => undefined);
+      if (!sentMsgId) return undefined;
+      let dismissed = false;
+      return async () => {
+        if (dismissed) return;
+        dismissed = true;
+        await deleteTelegramMessageSafely(bot, chatId, sentMsgId);
+      };
     },
   };
 }
@@ -785,82 +806,93 @@ export async function executeTelegramOrder(
   if (resolvedCoupon) {
     clearPendingVoucher('TELEGRAM', params.userId, params.dryRun);
   }
-  const result = params.dryRun
-    ? previewOrderDryRun({
-        platform: 'TELEGRAM',
-        platformUserId: params.userId,
-        productSkuOrId: params.sku,
-        destination: params.destination,
-        couponCode: resolvedCoupon,
-      })
-    : await createOrder({
-        platform: 'TELEGRAM',
-        platformUserId: params.userId,
-        platformUsername: params.username ?? null,
-        productSkuOrId: params.sku,
-        destination: params.destination,
-        couponCode: resolvedCoupon,
-      });
+  const dismissStatus = transport.sendStatusMessage
+    ? await transport.sendStatusMessage(
+        '⏳ *Sedang membuat QRIS pembayaran...*\nMohon tunggu sebentar ya Kak, gambar QRIS sedang disiapkan.'
+      )
+    : undefined;
 
-  if (!result.ok || !result.transaction) {
-    if (result.activeInvoice) {
-      const a = result.activeInvoice;
-      await transport.reply(
-        `Halo Kak, ${result.errorMessage}\n\nID: ${a.transaction_id}\nProduk: ${a.product_name_snapshot}\nNominal: Rp${a.payment_amount.toLocaleString('id-ID')}`,
-        [
+  try {
+    const result = params.dryRun
+      ? previewOrderDryRun({
+          platform: 'TELEGRAM',
+          platformUserId: params.userId,
+          productSkuOrId: params.sku,
+          destination: params.destination,
+          couponCode: resolvedCoupon,
+        })
+      : await createOrder({
+          platform: 'TELEGRAM',
+          platformUserId: params.userId,
+          platformUsername: params.username ?? null,
+          productSkuOrId: params.sku,
+          destination: params.destination,
+          couponCode: resolvedCoupon,
+        });
+
+    if (!result.ok || !result.transaction) {
+      if (dismissStatus) await dismissStatus();
+      if (result.activeInvoice) {
+        const a = result.activeInvoice;
+        await transport.reply(
+          `Halo Kak, ${result.errorMessage}\n\nID: ${a.transaction_id}\nProduk: ${a.product_name_snapshot}\nNominal: Rp${a.payment_amount.toLocaleString('id-ID')}`,
           [
-            { text: '🔍 Cek Status Invoice', callbackData: `STATUS_${a.transaction_id}` },
-            { text: '🚫 Batalkan Pesanan', callbackData: `CANCEL_TX_${a.transaction_id}` },
-          ],
-          [{ text: '🏠 Menu Utama', callbackData: 'MAIN_MENU' }],
-        ]
+            [
+              { text: '🔍 Cek Status Invoice', callbackData: `STATUS_${a.transaction_id}` },
+              { text: '🚫 Batalkan Pesanan', callbackData: `CANCEL_TX_${a.transaction_id}` },
+            ],
+            [{ text: '🏠 Menu Utama', callbackData: 'MAIN_MENU' }],
+          ]
+        );
+        return;
+      }
+      await transport.reply(
+        `Maaf Kak, ${result.errorMessage || 'pesanan belum dapat diproses.'}`,
+        TG_NAV_BACK_BUTTONS
       );
       return;
     }
-    await transport.reply(
-      `Maaf Kak, ${result.errorMessage || 'pesanan belum dapat diproses.'}`,
-      TG_NAV_BACK_BUTTONS
-    );
-    return;
-  }
 
-  const tx = result.transaction;
-  const originalPaymentUrl =
-    result.qris?.qrUrl && !result.qris.qrUrl.startsWith('data:') ? result.qris.qrUrl : undefined;
-  const caption =
-    `Terima kasih Kak! Pesanan siap dibayar:\n\n` +
-    `INVOICE PEMBAYARAN QRIS\n` +
-    `ID: ${tx.transaction_id}\n` +
-    `Produk: ${tx.product_name_snapshot}\n` +
-    `Tujuan: ${maskDestination(tx.destination)}\n` +
-    (tx.discount_snapshot > 0 ? `Diskon: -Rp${tx.discount_snapshot.toLocaleString('id-ID')}\n` : '') +
-    `Kode Unik: ${tx.unique_code}\n` +
-    `Total Bayar: Rp${tx.payment_amount.toLocaleString('id-ID')}\n` +
-    (originalPaymentUrl ? `Link Pembayaran: ${originalPaymentUrl}\n` : '') +
-    `Kedaluwarsa: ${new Date(tx.expired_at!).toLocaleTimeString('id-ID')} (${config.transaction.invoiceExpiryMinutes} menit)\n\n` +
-    `Scan QRIS atau klik Link Pembayaran di atas dengan nominal TEPAT Rp${tx.payment_amount.toLocaleString('id-ID')} ya Kak.\n` +
-    `Ketik /batal atau tekan Batalkan Pesanan untuk membatalkan (minimal 30 detik setelah pesanan dibuat).` +
-    (params.dryRun ? `\n\n[Mode Demo: pratinjau invoice & QRIS, transaksi tidak disimpan ke database]` : '');
+    const tx = result.transaction;
+    const originalPaymentUrl =
+      result.qris?.qrUrl && !result.qris.qrUrl.startsWith('data:') ? result.qris.qrUrl : undefined;
+    const caption =
+      `Terima kasih Kak! Pesanan siap dibayar:\n\n` +
+      `INVOICE PEMBAYARAN QRIS\n` +
+      `ID: ${tx.transaction_id}\n` +
+      `Produk: ${tx.product_name_snapshot}\n` +
+      `Tujuan: ${maskDestination(tx.destination)}\n` +
+      (tx.discount_snapshot > 0 ? `Diskon: -Rp${tx.discount_snapshot.toLocaleString('id-ID')}\n` : '') +
+      `Kode Unik: ${tx.unique_code}\n` +
+      `Total Bayar: Rp${tx.payment_amount.toLocaleString('id-ID')}\n` +
+      (originalPaymentUrl ? `Link Pembayaran: ${originalPaymentUrl}\n` : '') +
+      `Kedaluwarsa: ${new Date(tx.expired_at!).toLocaleTimeString('id-ID')} (${config.transaction.invoiceExpiryMinutes} menit)\n\n` +
+      `Scan QRIS atau klik Link Pembayaran di atas dengan nominal TEPAT Rp${tx.payment_amount.toLocaleString('id-ID')} ya Kak.\n` +
+      `Ketik /batal atau tekan Batalkan Pesanan untuk membatalkan (minimal 30 detik setelah pesanan dibuat).` +
+      (params.dryRun ? `\n\n[Mode Demo: pratinjau invoice & QRIS, transaksi tidak disimpan ke database]` : '');
 
-  const qrisButtons: TelegramInlineButton[][] = [
-    [
-      { text: '🔍 Cek Status Pembayaran', callbackData: `STATUS_${tx.transaction_id}` },
-      { text: '🚫 Batalkan Pesanan', callbackData: `CANCEL_TX_${tx.transaction_id}` },
-    ],
-    [{ text: '🏠 Menu Utama', callbackData: 'MAIN_MENU' }],
-  ];
+    const qrisButtons: TelegramInlineButton[][] = [
+      [
+        { text: '🔍 Cek Status Pembayaran', callbackData: `STATUS_${tx.transaction_id}` },
+        { text: '🚫 Batalkan Pesanan', callbackData: `CANCEL_TX_${tx.transaction_id}` },
+      ],
+      [{ text: '🏠 Menu Utama', callbackData: 'MAIN_MENU' }],
+    ];
 
-  if (transport.sendQris) {
-    const msgId = await transport.sendQris(caption, result.qris, qrisButtons);
-    if (!params.dryRun && msgId) {
-      saveQrMessageReference(tx.transaction_id, {
-        platform: 'TELEGRAM',
-        chatId: params.userId,
-        messageId: msgId,
-      });
+    if (transport.sendQris) {
+      const msgId = await transport.sendQris(caption, result.qris, qrisButtons);
+      if (!params.dryRun && msgId) {
+        saveQrMessageReference(tx.transaction_id, {
+          platform: 'TELEGRAM',
+          chatId: params.userId,
+          messageId: msgId,
+        });
+      }
+    } else {
+      await transport.reply(caption, qrisButtons);
     }
-  } else {
-    await transport.reply(caption, qrisButtons);
+  } finally {
+    if (dismissStatus) await dismissStatus();
   }
 }
 

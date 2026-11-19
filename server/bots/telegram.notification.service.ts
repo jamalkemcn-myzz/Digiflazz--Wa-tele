@@ -164,34 +164,34 @@ async function uploadPhotoResilient(
   const token = bot.telegram.token;
   const apiRoot = bot.telegram.options?.apiRoot;
 
-  try {
-    const msg = await bot.telegram.sendPhoto(
-      chatId,
-      { source: imageBuffer, filename },
-      { caption: safeCaption, ...replyMarkup }
-    );
-    return msg.message_id;
-  } catch (firstErr) {
-    if (!token) throw firstErr;
-
-    logger.warn('Telegraf sendPhoto retry via direct IPv4 multipart upload', {
-      service: 'telegram-notify',
-      details: { error: firstErr instanceof Error ? firstErr.message : 'unknown' },
-    });
-
-    // Direct IPv4 Connection:close with exact Content-Length bypasses keepAlive/chunked socket hang up on Docker/Pterodactyl
-    return await sendTelegramPhotoDirectIpv4({
-      apiRoot,
-      token,
-      chatId,
-      caption: safeCaption,
-      imageBuffer,
-      filename,
-      mimeType,
-      inlineReplyMarkup,
-      family: 4,
-    });
+  if (token) {
+    try {
+      // Direct IPv4 Connection:close with exact Content-Length avoids keepAlive/chunked upload hangs on Docker/Pterodactyl
+      return await sendTelegramPhotoDirectIpv4({
+        apiRoot,
+        token,
+        chatId,
+        caption: safeCaption,
+        imageBuffer,
+        filename,
+        mimeType,
+        inlineReplyMarkup,
+        family: 4,
+      });
+    } catch (directErr) {
+      logger.warn('Direct IPv4 sendPhoto failed, falling back to Telegraf sendPhoto', {
+        service: 'telegram-notify',
+        details: { error: directErr instanceof Error ? directErr.message : 'unknown' },
+      });
+    }
   }
+
+  const msg = await bot.telegram.sendPhoto(
+    chatId,
+    { source: imageBuffer, filename },
+    { caption: safeCaption, ...replyMarkup }
+  );
+  return msg.message_id;
 }
 
 export async function sendTelegramText(bot: Telegraf, chatId: string, text: string): Promise<boolean> {

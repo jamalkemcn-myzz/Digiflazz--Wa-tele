@@ -1,3 +1,6 @@
+import http from 'node:http';
+import https from 'node:https';
+
 export function appendRawFormatToQrisUrl(qrUrl: string): string {
   const trimmed = qrUrl.trim();
   if (!trimmed || trimmed.startsWith('data:')) {
@@ -17,7 +20,77 @@ export function appendRawFormatToQrisUrl(qrUrl: string): string {
   }
 }
 
-export async function fetchQrisImageBuffer(qrUrl: string, timeoutMs = 15_000): Promise<Buffer> {
+function downloadBufferIpv4(targetUrl: string, timeoutMs: number, redirectsLeft = 3): Promise<Buffer> {
+  return new Promise<Buffer>((resolve, reject) => {
+    let parsed: URL;
+    try {
+      parsed = new URL(targetUrl);
+    } catch {
+      reject(new Error('URL gambar QRIS tidak valid'));
+      return;
+    }
+
+    const isHttp = parsed.protocol === 'http:';
+    const requestFn = isHttp ? http.request : https.request;
+    const req = requestFn(
+      {
+        protocol: parsed.protocol,
+        hostname: parsed.hostname,
+        port: parsed.port || (isHttp ? 80 : 443),
+        path: `${parsed.pathname}${parsed.search}`,
+        method: 'GET',
+        agent: false,
+        family: 4,
+        timeout: timeoutMs,
+        headers: {
+          Accept: 'image/png,image/jpeg,image/webp,image/*,*/*',
+          'User-Agent': 'PPOB-Bot-Ecosystem/1.0',
+          Connection: 'close',
+        },
+      },
+      (res) => {
+        const status = res.statusCode || 0;
+        const location = res.headers.location;
+        if (status >= 300 && status < 400 && location && redirectsLeft > 0) {
+          res.resume();
+          const nextUrl = new URL(location, parsed).toString();
+          downloadBufferIpv4(nextUrl, timeoutMs, redirectsLeft - 1).then(resolve, reject);
+          return;
+        }
+
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk: Buffer) => chunks.push(chunk));
+        res.on('end', () => {
+          if (status < 200 || status >= 300) {
+            reject(new Error(`Gagal mengunduh gambar QRIS (HTTP ${status || 500})`));
+            return;
+          }
+          const contentType = String(res.headers['content-type'] || '').toLowerCase();
+          if (contentType.includes('text/html') || contentType.includes('application/json')) {
+            reject(new Error(`URL QRIS mengembalikan tipe konten bukan gambar (${contentType})`));
+            return;
+          }
+          const buffer = Buffer.concat(chunks);
+          if (buffer.length === 0) {
+            reject(new Error('Gambar QRIS yang diunduh kosong'));
+            return;
+          }
+          resolve(buffer);
+        });
+      }
+    );
+
+    req.on('timeout', () => {
+      req.destroy(new Error(`Unduh gambar QRIS timeout (${timeoutMs}ms)`));
+    });
+    req.on('error', (err) => {
+      reject(err);
+    });
+    req.end();
+  });
+}
+
+export async function fetchQrisImageBuffer(qrUrl: string, timeoutMs = 10_000): Promise<Buffer> {
   const trimmed = qrUrl.trim();
   if (!trimmed) {
     throw new Error('URL gambar QRIS kosong');
@@ -41,36 +114,11 @@ export async function fetchQrisImageBuffer(qrUrl: string, timeoutMs = 15_000): P
   let lastErr: unknown;
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      const response = await fetch(downloadUrl, {
-        method: 'GET',
-        redirect: 'follow',
-        headers: {
-          Accept: 'image/png,image/jpeg,image/webp,image/*,*/*',
-          'User-Agent': 'PPOB-Bot-Ecosystem/1.0',
-          Connection: 'close',
-        },
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-
-      if (!response.ok) {
-        throw new Error(`Gagal mengunduh gambar QRIS (HTTP ${response.status})`);
-      }
-
-      const contentType = (response.headers.get('content-type') || '').toLowerCase();
-      if (contentType.includes('text/html') || contentType.includes('application/json')) {
-        throw new Error(`URL QRIS mengembalikan tipe konten bukan gambar (${contentType})`);
-      }
-
-      const arrayBuf = await response.arrayBuffer();
-      const buffer = Buffer.from(arrayBuf);
-      if (buffer.length === 0) {
-        throw new Error('Gambar QRIS yang diunduh kosong');
-      }
-      return buffer;
+      return await downloadBufferIpv4(downloadUrl, timeoutMs);
     } catch (err) {
       lastErr = err;
       if (attempt < 2) {
-        await new Promise((r) => setTimeout(r, 350));
+        await new Promise((r) => setTimeout(r, 200));
       }
     }
   }
