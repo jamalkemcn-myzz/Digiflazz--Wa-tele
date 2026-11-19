@@ -2236,6 +2236,101 @@ test('getDigiflazzEnvDiagnostic detects unquoted #, container override, dev- key
   }
 });
 
+test('Telegram CONFIRM_ORDER double-tap never sends expired-session message before QRIS is delivered', async () => {
+  const { setBotSession, clearBotSession } = await import('../bots/bot-session');
+  const { dispatchTelegramCallback } = await import('../bots/telegram.callback-handler');
+  const { listProducts } = await import('./product.service');
+
+  const activeProducts = listProducts({ onlyActive: true, limit: 1 }).items;
+  assert.ok(activeProducts.length > 0);
+  const sampleProduct = activeProducts[0];
+  const userId = '99112233';
+  const sourceMessageId = 4567;
+
+  setBotSession(
+    'TELEGRAM',
+    userId,
+    {
+      mode: 'AWAITING_ORDER_CONFIRMATION',
+      sku: sampleProduct.sku,
+      productName: sampleProduct.name,
+      sellingPrice: sampleProduct.selling_price,
+      discountAmount: 0,
+      estimatedTotal: sampleProduct.selling_price + 25,
+      destination: '081234567890',
+      couponCode: null,
+      updatedAt: Date.now(),
+    },
+    true
+  );
+
+  const replies: string[] = [];
+  const qrDeliveries: string[] = [];
+  const cbAnswers: Array<{ text?: string; showAlert?: boolean }> = [];
+  let deleteCalls = 0;
+
+  const makeTransport = () => ({
+    async reply(text: string) {
+      replies.push(text);
+    },
+    async sendQris(caption: string) {
+      await new Promise((r) => setTimeout(r, 40));
+      qrDeliveries.push(caption);
+      return 8881;
+    },
+    async answerCbQuery(text?: string, showAlert?: boolean) {
+      cbAnswers.push({ text, showAlert });
+    },
+    async deleteSourceMessage() {
+      deleteCalls++;
+    },
+  });
+
+  // 1. Concurrent double-tap on CONFIRM_ORDER while QRIS is still being uploaded
+  await Promise.all([
+    dispatchTelegramCallback(
+      makeTransport(),
+      { data: 'CONFIRM_ORDER', userId, username: '@buyer1', sourceMessageId },
+      { dryRun: true }
+    ),
+    dispatchTelegramCallback(
+      makeTransport(),
+      { data: 'CONFIRM_ORDER', userId, username: '@buyer1', sourceMessageId },
+      { dryRun: true }
+    ),
+  ]);
+
+  assert.equal(qrDeliveries.length, 1);
+  assert.equal(deleteCalls, 1);
+  assert.equal(
+    replies.some((r) => r.includes('Sesi konfirmasi pesanan sudah berakhir')),
+    false
+  );
+  assert.ok(cbAnswers.some((a) => (a.text || '').includes('Sedang membuat invoice QRIS')));
+
+  // 2. Delayed duplicate tap arriving right after execution on the same sourceMessageId
+  await dispatchTelegramCallback(
+    makeTransport(),
+    { data: 'CONFIRM_ORDER', userId, username: '@buyer1', sourceMessageId },
+    { dryRun: true }
+  );
+  assert.equal(qrDeliveries.length, 1);
+  assert.equal(
+    replies.some((r) => r.includes('Sesi konfirmasi pesanan sudah berakhir')),
+    false
+  );
+  assert.ok(cbAnswers.some((a) => (a.text || '').includes('Invoice QRIS baru saja diproses')));
+
+  // 3. Genuine expired session (different user without active confirmation) still informs user properly
+  clearBotSession('TELEGRAM', '99112299', true);
+  await dispatchTelegramCallback(
+    makeTransport(),
+    { data: 'CONFIRM_ORDER', userId: '99112299', username: '@buyer2', sourceMessageId: 9999 },
+    { dryRun: true }
+  );
+  assert.ok(replies.some((r) => r.includes('Sesi konfirmasi pesanan sudah berakhir ya Kak')));
+});
+
 test.after(() => {
   closeDb();
   fs.rmSync(tempDir, { recursive: true, force: true });

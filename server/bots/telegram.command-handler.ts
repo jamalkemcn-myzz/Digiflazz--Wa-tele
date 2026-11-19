@@ -43,12 +43,15 @@ import { isMaintenanceMode, setMaintenanceMode } from '../services/settings.serv
 import { centralScheduler } from '../workers/scheduler';
 import { sendTelegramQrisInvoice, deleteTelegramMessageSafely } from './telegram.notification.service';
 import {
+  acquireOrderExecutionLock,
   clearBotSession,
   clearPendingVoucher,
   consumeTelegramBotMessageIds,
   getBotSession,
   getPendingVoucher,
+  markOrderConfirmedRecently,
   recordTelegramBotMessageId,
+  releaseOrderExecutionLock,
   setBotSession,
   setPendingVoucher,
 } from './bot-session';
@@ -946,14 +949,22 @@ export async function dispatchTelegramCommand(
 
     if (session?.mode === 'AWAITING_ORDER_CONFIRMATION') {
       if (['ya', 'iya', 'ok', 'oke', 'lanjut', 'konfirmasi', 'y'].includes(cmd)) {
-        await executeTelegramOrder(transport, {
-          userId: input.userId,
-          username: input.username,
-          sku: session.sku,
-          destination: session.destination,
-          couponCode: session.couponCode || null,
-          dryRun,
-        });
+        if (!acquireOrderExecutionLock('TELEGRAM', input.userId, dryRun)) {
+          return;
+        }
+        try {
+          markOrderConfirmedRecently('TELEGRAM', input.userId, dryRun);
+          await executeTelegramOrder(transport, {
+            userId: input.userId,
+            username: input.username,
+            sku: session.sku,
+            destination: session.destination,
+            couponCode: session.couponCode || null,
+            dryRun,
+          });
+        } finally {
+          releaseOrderExecutionLock('TELEGRAM', input.userId, dryRun);
+        }
         return;
       }
       if (['tidak', 'no', 'n', 'nggak', 'gak'].includes(cmd)) {

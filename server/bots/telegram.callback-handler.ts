@@ -44,7 +44,16 @@ import {
   type TelegramReplyTransport,
 } from './telegram.command-handler';
 import { sendTelegramQrisInvoice } from './telegram.notification.service';
-import { clearBotSession, getBotSession, recordTelegramBotMessageId } from './bot-session';
+import {
+  acquireOrderExecutionLock,
+  clearBotSession,
+  getBotSession,
+  isOrderExecutionInFlight,
+  markOrderConfirmedRecently,
+  recordTelegramBotMessageId,
+  releaseOrderExecutionLock,
+  wasOrderConfirmedRecently,
+} from './bot-session';
 
 export function formatTelegramStatusAlertText(text: string): string {
   const clean = text.trim();
@@ -54,7 +63,13 @@ export function formatTelegramStatusAlertText(text: string): string {
 
 export async function dispatchTelegramCallback(
   transport: TelegramReplyTransport,
-  input: { data: string; userId?: string | null; username?: string | null; displayName?: string | null },
+  input: {
+    data: string;
+    userId?: string | null;
+    username?: string | null;
+    displayName?: string | null;
+    sourceMessageId?: number | null;
+  },
   options?: { dryRun?: boolean; demoAdmin?: { role: AdminRole; platformUserId: string } | null }
 ): Promise<void> {
   const dryRun = Boolean(options?.dryRun);
@@ -63,6 +78,72 @@ export async function dispatchTelegramCallback(
     if (transport.answerCbQuery) await transport.answerCbQuery();
     return;
   }
+
+  if (data === 'CONFIRM_ORDER') {
+    const userId = input.userId || 'guest';
+    if (!acquireOrderExecutionLock('TELEGRAM', userId, dryRun)) {
+      if (transport.answerCbQuery) {
+        await transport.answerCbQuery('Sedang membuat invoice QRIS, mohon tunggu...', false);
+      }
+      return;
+    }
+
+    try {
+      const session = getBotSession('TELEGRAM', userId, dryRun);
+      if (session?.mode !== 'AWAITING_ORDER_CONFIRMATION') {
+        if (wasOrderConfirmedRecently('TELEGRAM', userId, dryRun, input.sourceMessageId)) {
+          if (transport.answerCbQuery) {
+            await transport.answerCbQuery('Invoice QRIS baru saja diproses, silakan cek pesan terbaru.', false);
+          }
+          return;
+        }
+        if (transport.deleteSourceMessage) {
+          await transport.deleteSourceMessage();
+        }
+        if (transport.answerCbQuery) await transport.answerCbQuery();
+        await transport.reply(
+          'Sesi konfirmasi pesanan sudah berakhir ya Kak. Silakan pilih produk kembali.',
+          TG_NAV_BACK_BUTTONS
+        );
+        return;
+      }
+
+      markOrderConfirmedRecently('TELEGRAM', userId, dryRun, input.sourceMessageId);
+      if (transport.deleteSourceMessage) {
+        await transport.deleteSourceMessage();
+      }
+      if (transport.answerCbQuery) await transport.answerCbQuery();
+      await executeTelegramOrder(transport, {
+        userId,
+        username: input.username,
+        sku: session.sku,
+        destination: session.destination,
+        couponCode: session.couponCode || null,
+        dryRun,
+      });
+      return;
+    } finally {
+      releaseOrderExecutionLock('TELEGRAM', userId, dryRun);
+    }
+  }
+
+  if (data === 'CANCEL_CONFIRM_ORDER') {
+    const userId = input.userId || 'guest';
+    if (isOrderExecutionInFlight('TELEGRAM', userId, dryRun)) {
+      if (transport.answerCbQuery) {
+        await transport.answerCbQuery('Invoice QRIS sedang dibuat, silakan tunggu sebentar.', false);
+      }
+      return;
+    }
+    if (transport.deleteSourceMessage) {
+      await transport.deleteSourceMessage();
+    }
+    clearBotSession('TELEGRAM', userId, dryRun);
+    if (transport.answerCbQuery) await transport.answerCbQuery();
+    await transport.reply('Pembuatan pesanan dibatalkan sebelum QRIS dibuat.', TG_NAV_BACK_BUTTONS);
+    return;
+  }
+
   const isAlertOnlyCallback = data.startsWith('STATUS_');
   if (!isAlertOnlyCallback && transport.deleteSourceMessage) {
     await transport.deleteSourceMessage();
@@ -220,34 +301,7 @@ export async function dispatchTelegramCallback(
     return;
   }
 
-  if (data === 'CONFIRM_ORDER') {
-    const userId = input.userId || 'guest';
-    const session = getBotSession('TELEGRAM', userId, dryRun);
-    if (transport.answerCbQuery) await transport.answerCbQuery();
-    if (session?.mode !== 'AWAITING_ORDER_CONFIRMATION') {
-      await transport.reply(
-        'Sesi konfirmasi pesanan sudah berakhir ya Kak. Silakan pilih produk kembali.',
-        TG_NAV_BACK_BUTTONS
-      );
-      return;
-    }
-    await executeTelegramOrder(transport, {
-      userId,
-      username: input.username,
-      sku: session.sku,
-      destination: session.destination,
-      couponCode: session.couponCode || null,
-      dryRun,
-    });
-    return;
-  }
 
-  if (data === 'CANCEL_CONFIRM_ORDER') {
-    clearBotSession('TELEGRAM', input.userId || 'guest', dryRun);
-    if (transport.answerCbQuery) await transport.answerCbQuery();
-    await transport.reply('Pembuatan pesanan dibatalkan sebelum QRIS dibuat.', TG_NAV_BACK_BUTTONS);
-    return;
-  }
 
   if (data.startsWith('CANCEL_TX_') && input.userId) {
     const txId = data.replace('CANCEL_TX_', '').trim();
@@ -520,9 +574,9 @@ export function registerTelegramCallbacks(bot: Telegraf): void {
       await ctx.answerCbQuery(text, showAlert ? { show_alert: true } : undefined).catch(() => undefined);
     };
 
-    // Immediately acknowledge non-alert callbacks so Telegram removes the button loading spinner right away;
-    // for STATUS_* callbacks we wait for DB lookup so we can display the popup alert text (show_alert: true).
-    if (!data.startsWith('STATUS_')) {
+    // Immediately acknowledge non-alert, non-confirmation callbacks so Telegram removes the spinner right away;
+    // STATUS_* waits for DB lookup alert text, and CONFIRM_ORDER / CANCEL_CONFIRM_ORDER answer right after lock check.
+    if (!data.startsWith('STATUS_') && data !== 'CONFIRM_ORDER' && data !== 'CANCEL_CONFIRM_ORDER') {
       void answerOnce();
     }
 
@@ -565,11 +619,16 @@ export function registerTelegramCallbacks(bot: Telegraf): void {
       },
     };
     const { displayName, username } = extractTelegramUserMeta(ctx.from);
+    const sourceMessageId =
+      ctx.callbackQuery && 'message' in ctx.callbackQuery && ctx.callbackQuery.message
+        ? ctx.callbackQuery.message.message_id
+        : null;
     await dispatchTelegramCallback(transport, {
       data,
       userId: ctx.from ? String(ctx.from.id) : null,
       username,
       displayName,
+      sourceMessageId,
     });
     if (cleanupPromise) {
       await cleanupPromise;

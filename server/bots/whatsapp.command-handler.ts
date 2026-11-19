@@ -44,10 +44,12 @@ import {
 import { isMaintenanceMode, setMaintenanceMode } from '../services/settings.service';
 import { centralScheduler } from '../workers/scheduler';
 import {
+  acquireOrderExecutionLock,
   clearBotSession,
   clearPendingVoucher,
   getBotSession,
   getPendingVoucher,
+  releaseOrderExecutionLock,
   setBotSession,
   setPendingVoucher,
 } from './bot-session';
@@ -1455,13 +1457,20 @@ export async function handleWhatsappCommand(
   const session = getBotSession('WHATSAPP', jid, dryRun);
   if (session?.mode === 'AWAITING_ORDER_CONFIRMATION') {
     if (['ya', 'iya', 'ok', 'oke', 'lanjut', 'konfirmasi', 'y'].includes(cmd)) {
-      await executeWhatsappOrder(sock, jid, {
-        sku: session.sku,
-        destination: session.destination,
-        couponCode: session.couponCode || null,
-        pushName,
-        dryRun,
-      });
+      if (!acquireOrderExecutionLock('WHATSAPP', jid, dryRun)) {
+        return;
+      }
+      try {
+        await executeWhatsappOrder(sock, jid, {
+          sku: session.sku,
+          destination: session.destination,
+          couponCode: session.couponCode || null,
+          pushName,
+          dryRun,
+        });
+      } finally {
+        releaseOrderExecutionLock('WHATSAPP', jid, dryRun);
+      }
       return;
     }
     if (['tidak', 'no', 'n', 'nggak', 'gak'].includes(cmd)) {
