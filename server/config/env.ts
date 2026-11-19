@@ -1,4 +1,5 @@
 import dotenv from 'dotenv';
+import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
@@ -525,3 +526,160 @@ export function getSafeConfigSummary(cfg: AppConfig = config) {
     readiness: getIntegrationReadiness(cfg),
   };
 }
+
+export interface DigiflazzEnvDiagnostic {
+  configured: boolean;
+  baseUrl: string;
+  usernameMasked: string;
+  usernameLength: number;
+  apiKeyMode: 'DEVELOPMENT' | 'PRODUCTION' | 'EMPTY';
+  apiKeyLength: number;
+  envFileExists: boolean;
+  overriddenByContainerEnv: boolean;
+  warnings: string[];
+}
+
+export function maskDigiflazzUsername(username: string): string {
+  const clean = username.trim();
+  if (!clean) return '(kosong)';
+  if (clean.length <= 2) return `${clean[0]}***`;
+  if (clean.length <= 5) return `${clean[0]}***${clean[clean.length - 1]}`;
+  return `${clean.slice(0, 2)}***${clean.slice(-2)}`;
+}
+
+function inspectRawEnvLine(rawContent: string, key: string): {
+  present: boolean;
+  hasUnquotedHash: boolean;
+  hasWhitespacePadding: boolean;
+} {
+  const lines = rawContent.split(/\r?\n/);
+  let present = false;
+  let hasUnquotedHash = false;
+  let hasWhitespacePadding = false;
+
+  const lineRegex = new RegExp(`^\\s*(?:export\\s+)?${key}\\s*=(.*)$`);
+  for (const line of lines) {
+    const match = line.match(lineRegex);
+    if (!match) continue;
+    present = true;
+    const rhs = match[1] ?? '';
+    const trimmed = rhs.trim();
+    if (!trimmed) continue;
+    const isQuoted =
+      (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+      (trimmed.startsWith("'") && trimmed.endsWith("'")) ||
+      (trimmed.startsWith('`') && trimmed.endsWith('`'));
+    if (!isQuoted && trimmed.includes('#')) {
+      hasUnquotedHash = true;
+    }
+    if (rhs !== rhs.trim() && !isQuoted) {
+      hasWhitespacePadding = true;
+    }
+  }
+
+  return { present, hasUnquotedHash, hasWhitespacePadding };
+}
+
+export function getDigiflazzEnvDiagnostic(options?: {
+  cfg?: AppConfig;
+  env?: NodeJS.ProcessEnv;
+  cwd?: string;
+}): DigiflazzEnvDiagnostic {
+  const cfg = options?.cfg ?? config;
+  const env = options?.env ?? process.env;
+  const cwd = options?.cwd ?? process.cwd();
+
+  const username = cfg.digiflazz.username;
+  const apiKey = cfg.digiflazz.apiKey;
+  const warnings: string[] = [];
+
+  const envPath = path.resolve(cwd, '.env');
+  const envFileExists = fs.existsSync(envPath);
+  let overriddenByContainerEnv = false;
+
+  if (envFileExists) {
+    try {
+      const rawContent = fs.readFileSync(envPath, 'utf8');
+      const parsedDotenv = dotenv.parse(rawContent);
+
+      const userLine = inspectRawEnvLine(rawContent, 'DIGIFLAZZ_USERNAME');
+      const keyLine = inspectRawEnvLine(rawContent, 'DIGIFLAZZ_API_KEY');
+
+      if (keyLine.hasUnquotedHash) {
+        warnings.push(
+          'Baris DIGIFLAZZ_API_KEY di .env mengandung tanda "#" tanpa tanda kutip — parser dotenv memotong nilai setelah "#". Bungkus dengan tanda kutip ganda ("...").'
+        );
+      }
+      if (userLine.hasUnquotedHash) {
+        warnings.push(
+          'Baris DIGIFLAZZ_USERNAME di .env mengandung tanda "#" tanpa tanda kutip. Bungkus dengan tanda kutip ganda ("...").'
+        );
+      }
+      if (userLine.hasWhitespacePadding || keyLine.hasWhitespacePadding) {
+        warnings.push('Terdapat spasi berlebih pada baris DIGIFLAZZ_USERNAME atau DIGIFLAZZ_API_KEY di .env.');
+      }
+
+      if (
+        (parsedDotenv.DIGIFLAZZ_USERNAME !== undefined &&
+          (env.DIGIFLAZZ_USERNAME ?? '') !== parsedDotenv.DIGIFLAZZ_USERNAME) ||
+        (parsedDotenv.DIGIFLAZZ_API_KEY !== undefined &&
+          (env.DIGIFLAZZ_API_KEY ?? '') !== parsedDotenv.DIGIFLAZZ_API_KEY)
+      ) {
+        overriddenByContainerEnv = true;
+        warnings.push(
+          'Nilai DIGIFLAZZ di .env berbeda dengan environment aktif proses — kemungkinan tertimpa oleh CUSTOM_ENVIRONMENT_VARIABLES / Startup panel Pterodactyl atau server belum di-Restart.'
+        );
+      }
+    } catch {
+      warnings.push('File .env ditemukan tetapi gagal dibaca saat pemeriksaan diagnostik.');
+    }
+  } else {
+    warnings.push('File .env tidak ditemukan di direktori kerja server (kredensial hanya berasal dari environment container jika diisi).');
+  }
+
+  if (!username) {
+    warnings.push('DIGIFLAZZ_USERNAME kosong.');
+  } else {
+    if (username.includes('@')) {
+      warnings.push('DIGIFLAZZ_USERNAME berisi "@". Digiflazz mewajibkan Username API dari menu Atur Koneksi → API, bukan email login.');
+    }
+    if (/\s/.test(username)) {
+      warnings.push('DIGIFLAZZ_USERNAME mengandung spasi — pastikan tidak ada spasi saat copy-paste.');
+    }
+  }
+
+  const apiKeyMode: DigiflazzEnvDiagnostic['apiKeyMode'] = !apiKey
+    ? 'EMPTY'
+    : apiKey.toLowerCase().startsWith('dev-')
+      ? 'DEVELOPMENT'
+      : 'PRODUCTION';
+
+  if (!apiKey) {
+    warnings.push('DIGIFLAZZ_API_KEY kosong.');
+  } else {
+    if (/\s/.test(apiKey)) {
+      warnings.push('DIGIFLAZZ_API_KEY mengandung spasi — pastikan tidak ada spasi di dalam API key.');
+    }
+    if (/[\u200B-\u200D\uFEFF\u00A0]/.test(apiKey) || /[\u200B-\u200D\uFEFF\u00A0]/.test(username)) {
+      warnings.push('Terdeteksi karakter Unicode tak terlihat (zero-width/non-breaking space) pada kredensial Digiflazz.');
+    }
+    if (apiKeyMode === 'DEVELOPMENT') {
+      warnings.push(
+        'API Key terdeteksi mode DEVELOPMENT (awalan dev-). Jika IP server terdaftar di IP Production pada Digiflazz, gunakan Production Key (atau pindahkan IP server ke IP Development).'
+      );
+    }
+  }
+
+  return {
+    configured: Boolean(username && apiKey),
+    baseUrl: cfg.digiflazz.baseUrl,
+    usernameMasked: maskDigiflazzUsername(username),
+    usernameLength: username.length,
+    apiKeyMode,
+    apiKeyLength: apiKey.length,
+    envFileExists,
+    overriddenByContainerEnv,
+    warnings,
+  };
+}
+

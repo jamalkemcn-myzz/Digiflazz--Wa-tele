@@ -14,3 +14,4 @@ data/whatsapp-session/
 backups/
 logs/
 .playwright-cli/
+public/assets/aistudio/

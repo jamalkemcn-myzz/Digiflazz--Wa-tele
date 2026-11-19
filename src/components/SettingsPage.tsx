@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { HardDriveDownload, ShieldAlert, UserPlus, RefreshCw, RotateCcw, Plus, X } from 'lucide-react';
+import { HardDriveDownload, ShieldAlert, UserPlus, RefreshCw, RotateCcw, Plus, X, Activity } from 'lucide-react';
 import { api } from '../api/client';
 
 export function SettingsPage({ permissions }: { permissions: string[] }) {
@@ -20,6 +20,12 @@ export function SettingsPage({ permissions }: { permissions: string[] }) {
     Record<number, { platform: 'TELEGRAM' | 'WHATSAPP' | 'DASHBOARD'; platformUserId: string }>
   >({});
   const [confirmFullReset, setConfirmFullReset] = useState(false);
+  const [diagBusy, setDiagBusy] = useState(false);
+  const [diagProbe, setDiagProbe] = useState<{
+    checkedAt: string;
+    outboundIp: string | null;
+    balanceCheck: { ok: boolean; balance?: number; errorMessage?: string };
+  } | null>(null);
 
   const canManageAdmins = permissions.includes('admins:manage');
 
@@ -73,6 +79,24 @@ export function SettingsPage({ permissions }: { permissions: string[] }) {
       setMessage({ type: 'err', text: err instanceof Error ? err.message : 'Backup gagal' });
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function handleRunDigiflazzDiagnostic() {
+    setDiagBusy(true);
+    setMessage(null);
+    try {
+      const res = await api.runDigiflazzDiagnostic();
+      setDiagProbe({
+        checkedAt: res.data.checkedAt,
+        outboundIp: res.data.outboundIp,
+        balanceCheck: res.data.balanceCheck,
+      });
+      setData((prev: any) => (prev ? { ...prev, digiflazzDiagnostic: res.data.env } : prev));
+    } catch (err) {
+      setMessage({ type: 'err', text: err instanceof Error ? err.message : 'Gagal menjalankan diagnostik Digiflazz' });
+    } finally {
+      setDiagBusy(false);
     }
   }
 
@@ -285,6 +309,112 @@ export function SettingsPage({ permissions }: { permissions: string[] }) {
           </div>
         </div>
       </div>
+
+      {/* Digiflazz Safe Diagnostic */}
+      {data.digiflazzDiagnostic && (
+        <div className="bg-[#131c2e] border border-[#1f2b42] rounded-lg overflow-hidden">
+          <div className="px-5 py-4 border-b border-[#1f2b42] flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h3 className="text-sm font-semibold text-slate-100">Diagnostik Aman Digiflazz (Tanpa Secret)</h3>
+              <p className="text-xs text-slate-400">
+                Memeriksa nilai yang benar-benar terbaca oleh server dari <code className="font-mono text-[#60a5fa]">.env</code> / environment container serta IP keluar server.
+              </p>
+            </div>
+            <button
+              type="button"
+              disabled={diagBusy}
+              onClick={() => void handleRunDigiflazzDiagnostic()}
+              className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-[#1668ff] rounded-lg hover:bg-[#2574ff] disabled:opacity-50 cursor-pointer whitespace-nowrap"
+            >
+              <Activity className="w-3.5 h-3.5" />
+              {diagBusy ? 'Menguji...' : 'Uji Koneksi & Cek IP Keluar'}
+            </button>
+          </div>
+
+          <div className="p-5 space-y-4 text-xs">
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+              <div className="p-3 bg-[#0f1727] border border-[#1f2b42] rounded-lg">
+                <p className="text-slate-400">Username API Terbaca</p>
+                <p className="font-mono font-semibold text-slate-100 mt-1">
+                  {data.digiflazzDiagnostic.usernameMasked}{' '}
+                  <span className="text-slate-400 font-normal">({data.digiflazzDiagnostic.usernameLength} char)</span>
+                </p>
+              </div>
+              <div className="p-3 bg-[#0f1727] border border-[#1f2b42] rounded-lg">
+                <p className="text-slate-400">Mode & Panjang API Key</p>
+                <p
+                  className={`font-mono font-semibold mt-1 ${
+                    data.digiflazzDiagnostic.apiKeyMode === 'PRODUCTION'
+                      ? 'text-emerald-400'
+                      : data.digiflazzDiagnostic.apiKeyMode === 'DEVELOPMENT'
+                        ? 'text-amber-400'
+                        : 'text-red-400'
+                  }`}
+                >
+                  {data.digiflazzDiagnostic.apiKeyMode}{' '}
+                  <span className="text-slate-400 font-normal">({data.digiflazzDiagnostic.apiKeyLength} char)</span>
+                </p>
+              </div>
+              <div className="p-3 bg-[#0f1727] border border-[#1f2b42] rounded-lg">
+                <p className="text-slate-400">Sumber Konfigurasi</p>
+                <p className="font-mono font-semibold text-slate-100 mt-1">
+                  {data.digiflazzDiagnostic.envFileExists ? '.env ditemukan' : '.env tidak ada'}
+                  {data.digiflazzDiagnostic.overriddenByContainerEnv ? ' (Tertimpa Env Panel!)' : ''}
+                </p>
+              </div>
+              <div className="p-3 bg-[#0f1727] border border-[#1f2b42] rounded-lg">
+                <p className="text-slate-400">IP Publik Keluar Server</p>
+                <p className="font-mono font-semibold text-[#60a5fa] mt-1">
+                  {diagProbe ? diagProbe.outboundIp || 'Gagal deteksi IP' : 'Klik Uji Koneksi'}
+                </p>
+              </div>
+            </div>
+
+            {data.digiflazzDiagnostic.warnings.length > 0 && (
+              <div className="p-3.5 bg-amber-950/40 border border-amber-800/60 rounded-lg space-y-1.5">
+                <p className="font-semibold text-amber-300">Peringatan Terdeteksi:</p>
+                <ul className="list-disc pl-5 space-y-1 text-amber-200">
+                  {data.digiflazzDiagnostic.warnings.map((w: string, idx: number) => (
+                    <li key={idx}>{w}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            {diagProbe && (
+              <div
+                className={`p-3.5 rounded-lg border ${
+                  diagProbe.balanceCheck.ok
+                    ? 'bg-emerald-950/40 border-emerald-800/60 text-emerald-200'
+                    : 'bg-red-950/40 border-red-800/60 text-red-200'
+                }`}
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="font-semibold">
+                    Hasil Uji Endpoint /cek-saldo:{' '}
+                    {diagProbe.balanceCheck.ok
+                      ? `BERHASIL (Saldo: Rp ${Number(diagProbe.balanceCheck.balance || 0).toLocaleString('id-ID')})`
+                      : `GAGAL — ${diagProbe.balanceCheck.errorMessage || 'Tidak diketahui'}`}
+                  </span>
+                  <span className="font-mono text-[11px] opacity-80">
+                    {new Date(diagProbe.checkedAt).toLocaleString('id-ID')}
+                  </span>
+                </div>
+                {!diagProbe.balanceCheck.ok && diagProbe.balanceCheck.errorMessage?.includes('RC 41') && (
+                  <p className="mt-2 text-xs text-red-200/90">
+                    Tip RC 41: Cocokkan apakah IP keluar <code className="font-mono">{diagProbe.outboundIp || 'server'}</code> terdaftar di kolom <strong>IP Production</strong> atau <strong>IP Development</strong> pada Digiflazz. Jika terdaftar di IP Production, API Key wajib menggunakan <strong>Production Key</strong> (bukan <code className="font-mono">dev-...</code>), dan pastikan tidak terpotong karakter <code className="font-mono">#</code> tanpa kutip di <code className="font-mono">.env</code>.
+                  </p>
+                )}
+                {!diagProbe.balanceCheck.ok && diagProbe.balanceCheck.errorMessage?.includes('RC 45') && (
+                  <p className="mt-2 text-xs text-red-200/90">
+                    Tip RC 45: Daftarkan IP keluar <code className="font-mono">{diagProbe.outboundIp || 'server'}</code> pada whitelist IP di dashboard Digiflazz (Atur Koneksi → API).
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Backup Management */}
       <div className="bg-[#131c2e] border border-[#1f2b42] rounded-lg overflow-hidden">

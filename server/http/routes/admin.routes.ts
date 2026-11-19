@@ -1,6 +1,6 @@
 import { Router, type Request, type Response } from 'express';
 import { getDb } from '../../database/connection';
-import { config, getSafeConfigSummary } from '../../config/env';
+import { config, getSafeConfigSummary, getDigiflazzEnvDiagnostic } from '../../config/env';
 import { requireDashboardAuth, requirePermission } from '../middleware/auth';
 import { adminRateLimiter } from '../middleware/rate-limit';
 import {
@@ -615,6 +615,7 @@ adminRouter.get('/settings', requirePermission('settings:read'), (_req: Request,
     data: {
       maintenanceMode: isMaintenanceMode(),
       config: getSafeConfigSummary(),
+      digiflazzDiagnostic: getDigiflazzEnvDiagnostic(),
       productAutoRefresh: {
         config: productAutoRefresh,
         summary: formatProductAutoRefreshSummary(productAutoRefresh, config.timezone),
@@ -622,6 +623,53 @@ adminRouter.get('/settings', requirePermission('settings:read'), (_req: Request,
       backupFiles: listBackupFiles(),
       backupLogs: listBackupLogs(20),
       admins: listAdmins(),
+    },
+  });
+});
+
+adminRouter.post('/settings/digiflazz-diagnostic', requirePermission('settings:read'), async (req: Request, res: Response) => {
+  const env = getDigiflazzEnvDiagnostic();
+
+  let outboundIp: string | null = null;
+  try {
+    const ipRes = await fetch('https://api.ipify.org?format=json', {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (ipRes.ok) {
+      const ipJson = (await ipRes.json()) as { ip?: unknown };
+      if (typeof ipJson?.ip === 'string' && ipJson.ip.trim()) {
+        outboundIp = ipJson.ip.trim();
+      }
+    }
+  } catch {
+    outboundIp = null;
+  }
+
+  const balanceCheck = await digiflazzService.checkBalance();
+
+  recordAuditLog({
+    actorId: req.admin!.username,
+    actorRole: req.admin!.role,
+    action: 'DIGIFLAZZ_DIAGNOSTIC_CHECK',
+    targetType: 'DIGIFLAZZ',
+    details: {
+      apiKeyMode: env.apiKeyMode,
+      balanceOk: balanceCheck.ok,
+      outboundIp,
+    },
+  });
+
+  res.json({
+    ok: true,
+    data: {
+      checkedAt: new Date().toISOString(),
+      env,
+      outboundIp,
+      balanceCheck: {
+        ok: balanceCheck.ok,
+        balance: balanceCheck.balance,
+        errorMessage: balanceCheck.errorMessage,
+      },
     },
   });
 });

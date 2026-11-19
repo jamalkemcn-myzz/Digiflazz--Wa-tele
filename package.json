@@ -6,6 +6,9 @@
   "scripts": {
     "dev": "tsx server.ts",
     "start": "tsx --expose-gc server.ts",
+    "start:prod": "npm run build && npm start",
+    "start:update": "git fetch origin main && git reset --hard origin/main && npm install && npm run build && npm start",
+    "dev:update": "git fetch origin main && git reset --hard origin/main && npm install && npm run dev",
     "build": "vite build",
     "preview": "vite preview",
     "migrate": "tsx server/scripts/migrate.ts",

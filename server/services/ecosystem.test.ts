@@ -2178,6 +2178,64 @@ test('4 Group Log Routing: Service, All Tx Admin, Unmasked Success Admin, and Ce
   }
 });
 
+test('getDigiflazzEnvDiagnostic detects unquoted #, container override, dev- key, and never leaks secrets', async () => {
+  const { getDigiflazzEnvDiagnostic, validateAndLoadConfig } = await import('../config/env');
+  const diagDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pulsasync-diag-'));
+
+  try {
+    // Case 1: unquoted # in .env + dev- prefix + overridden env
+    fs.writeFileSync(
+      path.join(diagDir, '.env'),
+      'DIGIFLAZZ_USERNAME=yuxoxuD24abc\nDIGIFLAZZ_API_KEY=dev-secret#cut\n',
+      'utf8'
+    );
+    const mockEnv1: NodeJS.ProcessEnv = {
+      DIGIFLAZZ_USERNAME: 'yuxoxuD24abc',
+      DIGIFLAZZ_API_KEY: 'dev-different-override',
+    };
+    const cfg1 = validateAndLoadConfig(mockEnv1);
+    const d1 = getDigiflazzEnvDiagnostic({ cfg: cfg1, env: mockEnv1, cwd: diagDir });
+
+    assert.equal(d1.configured, true);
+    assert.equal(d1.usernameMasked, 'yu***bc');
+    assert.equal(d1.usernameLength, 12);
+    assert.equal(d1.apiKeyMode, 'DEVELOPMENT');
+    assert.equal(d1.apiKeyLength, 'dev-different-override'.length);
+    assert.equal(d1.envFileExists, true);
+    assert.equal(d1.overriddenByContainerEnv, true);
+    assert.ok(d1.warnings.some((w) => w.includes('tanda "#"')));
+    assert.ok(d1.warnings.some((w) => w.includes('tertimpa')));
+    assert.ok(d1.warnings.some((w) => w.includes('DEVELOPMENT')));
+    // Never leak actual API key or full username
+    const serialized1 = JSON.stringify(d1);
+    assert.equal(serialized1.includes('dev-different-override'), false);
+    assert.equal(serialized1.includes('dev-secret'), false);
+    assert.equal(serialized1.includes('yuxoxuD24abc'), false);
+
+    // Case 2: clean quoted Production key matching env -> zero warnings
+    const prodKey = 'prodKey#WithHash9999';
+    fs.writeFileSync(
+      path.join(diagDir, '.env'),
+      `DIGIFLAZZ_USERNAME="yuxoxuD24abc"\nDIGIFLAZZ_API_KEY="${prodKey}"\n`,
+      'utf8'
+    );
+    const mockEnv2: NodeJS.ProcessEnv = {
+      DIGIFLAZZ_USERNAME: 'yuxoxuD24abc',
+      DIGIFLAZZ_API_KEY: prodKey,
+    };
+    const cfg2 = validateAndLoadConfig(mockEnv2);
+    const d2 = getDigiflazzEnvDiagnostic({ cfg: cfg2, env: mockEnv2, cwd: diagDir });
+
+    assert.equal(d2.apiKeyMode, 'PRODUCTION');
+    assert.equal(d2.apiKeyLength, prodKey.length);
+    assert.equal(d2.overriddenByContainerEnv, false);
+    assert.deepEqual(d2.warnings, []);
+    assert.equal(JSON.stringify(d2).includes(prodKey), false);
+  } finally {
+    fs.rmSync(diagDir, { recursive: true, force: true });
+  }
+});
+
 test.after(() => {
   closeDb();
   fs.rmSync(tempDir, { recursive: true, force: true });

@@ -256,6 +256,30 @@ export const api = {
   },
 
   getSettings: () => requestJson<{ ok: true; data: any }>('/api/admin/settings'),
+  runDigiflazzDiagnostic: () =>
+    requestJson<{
+      ok: true;
+      data: {
+        checkedAt: string;
+        env: {
+          configured: boolean;
+          baseUrl: string;
+          usernameMasked: string;
+          usernameLength: number;
+          apiKeyMode: 'DEVELOPMENT' | 'PRODUCTION' | 'EMPTY';
+          apiKeyLength: number;
+          envFileExists: boolean;
+          overriddenByContainerEnv: boolean;
+          warnings: string[];
+        };
+        outboundIp: string | null;
+        balanceCheck: {
+          ok: boolean;
+          balance?: number;
+          errorMessage?: string;
+        };
+      };
+    }>('/api/admin/settings/digiflazz-diagnostic', { method: 'POST' }),
   setMaintenanceMode: (enabled: boolean, reason?: string) =>
     requestJson<{ ok: true; data: { maintenanceMode: boolean } }>('/api/admin/settings/maintenance', {
       method: 'PUT',
