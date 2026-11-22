@@ -645,6 +645,277 @@ export function handleVerifiedPaymentPaid(
   return result;
 }
 
+export function computeNextRetryRefId(transactionId: string, currentSupplierRef?: string | null): string {
+  const current = (currentSupplierRef || '').trim();
+  const match = /-R(\d+)$/.exec(current);
+  const nextSeq = match ? Number(match[1]) + 1 : 1;
+  return `${transactionId}-R${nextSeq}`;
+}
+
+export interface SupplierRetryEligibility {
+  found: boolean;
+  eligible: boolean;
+  reason: string;
+  nextRefId?: string;
+  digiflazzConfigured: boolean;
+  hadAutoRefund?: boolean;
+  refundAmount?: number;
+}
+
+export class SupplierRetryError extends Error {
+  statusCode: number;
+  constructor(message: string, statusCode = 400) {
+    super(message);
+    this.name = 'SupplierRetryError';
+    this.statusCode = statusCode;
+  }
+}
+
+function reversePriorRefundLedgerIfPresent(
+  txDb: ReturnType<typeof getDb>,
+  tx: Pick<TransactionRow, 'transaction_id' | 'customer_id'>,
+  actorId: string,
+  actorSource: string,
+  retryRefId: string
+): { reversed: boolean; amount: number } {
+  const row = txDb
+    .prepare(
+      `SELECT COALESCE(SUM(
+         CASE
+           WHEN entry_type = 'REFUND_CREDIT' THEN amount
+           WHEN entry_type = 'MANUAL_ADJUSTMENT_DEBIT' THEN -amount
+           ELSE 0
+         END
+       ), 0) as net_refund
+       FROM refund_ledger
+       WHERE transaction_id = ? AND customer_id = ?`
+    )
+    .get(tx.transaction_id, tx.customer_id) as { net_refund: number } | undefined;
+
+  const netRefund = Math.max(0, Number(row?.net_refund ?? 0));
+  if (netRefund <= 0) {
+    return { reversed: false, amount: 0 };
+  }
+
+  const now = new Date().toISOString();
+  const ledgerId = `LDG-${crypto.randomBytes(6).toString('hex').toUpperCase()}`;
+  txDb
+    .prepare(
+      `INSERT INTO refund_ledger (ledger_id, customer_id, transaction_id, entry_type, amount, description, actor_id, actor_source, created_at)
+       VALUES (?, ?, ?, 'MANUAL_ADJUSTMENT_DEBIT', ?, ?, ?, ?, ?)`
+    )
+    .run(
+      ledgerId,
+      tx.customer_id,
+      tx.transaction_id,
+      netRefund,
+      `Reversal otomatis kredit refund karena tembak ulang Digiflazz SUKSES (ref: ${retryRefId})`,
+      actorId,
+      actorSource,
+      now
+    );
+
+  return { reversed: true, amount: netRefund };
+}
+
+function emitSupplierSuccessEffects(
+  tx: TransactionRow,
+  cusCustomerCode: string,
+  resp: { sn?: string | null; refId?: string | null },
+  finishNow: string
+): void {
+  const db = getDb();
+
+  notifyCustomerForTransaction({
+    transactionId: tx.transaction_id,
+    customerId: tx.customer_id,
+    eventKey: 'success',
+    messageType: 'TRANSACTION_SUCCESS',
+    text:
+      `Pesanan Anda BERHASIL diproses!\n` +
+      `ID: ${tx.transaction_id}\n` +
+      `Produk: ${tx.product_name_snapshot}\n` +
+      `Tujuan: ${maskDestination(tx.destination)}\n` +
+      (resp.sn ? `SN / Token: ${resp.sn}\n` : '') +
+      `Terima kasih telah bertransaksi.`,
+  });
+
+  const productMeta = db
+    .prepare(
+      `SELECT p.brand, c.name as category_name
+       FROM products p
+       LEFT JOIN categories c ON c.id = p.category_id
+       WHERE p.id = ?`
+    )
+    .get(tx.product_id) as { brand: string | null; category_name: string | null } | undefined;
+
+  const identity =
+    (db
+      .prepare(
+        `SELECT platform_user_id, platform_username
+         FROM customer_identities
+         WHERE customer_id = ? AND platform = ?
+         LIMIT 1`
+      )
+      .get(tx.customer_id, tx.platform) as
+      | { platform_user_id: string; platform_username: string | null }
+      | undefined) ||
+    (db
+      .prepare(
+        `SELECT platform_user_id, platform_username
+         FROM customer_identities
+         WHERE customer_id = ?
+         ORDER BY id ASC
+         LIMIT 1`
+      )
+      .get(tx.customer_id) as
+      | { platform_user_id: string; platform_username: string | null }
+      | undefined);
+
+  emitTransactionLogToGroups({
+    eventKey: 'success',
+    transactionId: tx.transaction_id,
+    customerCode: cusCustomerCode,
+    productName: tx.product_name_snapshot,
+    destination: tx.destination,
+    platform: tx.platform,
+    amount: tx.payment_amount,
+    status: 'SUCCESS',
+    note: `Sukses Digiflazz${resp.sn ? ` SN:${resp.sn}` : ''}`,
+  });
+
+  const successPayload = {
+    transactionId: tx.transaction_id,
+    platform: tx.platform,
+    customerCode: cusCustomerCode,
+    platformUserId: identity?.platform_user_id ?? null,
+    platformUsername: identity?.platform_username ?? null,
+    categoryName: productMeta?.category_name ?? null,
+    brand: productMeta?.brand ?? null,
+    productSku: tx.product_sku_snapshot,
+    productName: tx.product_name_snapshot,
+    destination: tx.destination,
+    sn: resp.sn ?? null,
+    supplierPrice: tx.supplier_price_snapshot,
+    margin: tx.margin_snapshot,
+    discount: tx.discount_snapshot,
+    uniqueCode: tx.unique_code,
+    paymentAmount: tx.payment_amount,
+    supplierReference: resp.refId ?? tx.supplier_reference ?? null,
+    gatewayReference: tx.gateway_reference ?? null,
+    completedAt: finishNow,
+  };
+
+  emitSuccessAdminLogToGroups(successPayload);
+  emitTestimonyToGroups(successPayload);
+}
+
+export function checkSupplierRetryEligibility(
+  transactionId: string,
+  supplier: DigiflazzService = digiflazzService
+): SupplierRetryEligibility {
+  const db = getDb();
+  const digiflazzConfigured = supplier.isConfigured();
+
+  const tx = db
+    .prepare('SELECT * FROM transactions WHERE transaction_id = ?')
+    .get(transactionId) as TransactionRow | undefined;
+
+  if (!tx) {
+    return {
+      found: false,
+      eligible: false,
+      reason: 'Transaksi tidak ditemukan',
+      digiflazzConfigured,
+    };
+  }
+
+  if (tx.payment_status !== 'PAID') {
+    return {
+      found: true,
+      eligible: false,
+      reason: 'Pembayaran belum LUNAS (tidak boleh menembak supplier)',
+      digiflazzConfigured,
+    };
+  }
+
+  if (tx.supplier_status === 'SUCCESS' || tx.transaction_status === 'SUCCESS') {
+    return {
+      found: true,
+      eligible: false,
+      reason: 'Transaksi supplier sudah SUKSES',
+      digiflazzConfigured,
+    };
+  }
+
+  if (
+    tx.supplier_status === 'PENDING' ||
+    tx.supplier_status === 'PROCESSING' ||
+    tx.supplier_status === 'UNKNOWN' ||
+    tx.transaction_status === 'SUPPLIER_PENDING' ||
+    tx.transaction_status === 'SUPPLIER_PROCESSING' ||
+    tx.transaction_status === 'UNKNOWN'
+  ) {
+    return {
+      found: true,
+      eligible: false,
+      reason: 'Status Digiflazz belum gagal definitif (masih PENDING/UNKNOWN — gunakan Inquiry & Rekonsiliasi)',
+      digiflazzConfigured,
+    };
+  }
+
+  if (tx.supplier_status !== 'FAILED' || !['FAILED', 'REFUNDED'].includes(tx.transaction_status)) {
+    return {
+      found: true,
+      eligible: false,
+      reason: `Tembak ulang hanya diizinkan jika Digiflazz benar-benar FAILED (saat ini: supplier=${tx.supplier_status}, status=${tx.transaction_status})`,
+      digiflazzConfigured,
+    };
+  }
+
+  const job = db
+    .prepare('SELECT status, locked_by, locked_at FROM supplier_jobs WHERE transaction_id = ?')
+    .get(transactionId) as { status: string; locked_by: string | null; locked_at: string | null } | undefined;
+
+  if (job) {
+    if (['PENDING', 'PROCESSING', 'UNKNOWN', 'COMPLETED'].includes(job.status)) {
+      return {
+        found: true,
+        eligible: false,
+        reason: `Job supplier masih berstatus ${job.status}`,
+        digiflazzConfigured,
+      };
+    }
+    const staleCutoff = new Date(Date.now() - 120_000).toISOString();
+    if (job.locked_by && job.locked_at && job.locked_at >= staleCutoff) {
+      return {
+        found: true,
+        eligible: false,
+        reason: 'Transaksi sedang diproses oleh worker/admin lain',
+        digiflazzConfigured,
+      };
+    }
+  }
+
+  const existingRefund = db
+    .prepare('SELECT amount FROM refunds WHERE transaction_id = ?')
+    .get(transactionId) as { amount: number } | undefined;
+
+  const nextRefId = computeNextRetryRefId(tx.transaction_id, tx.supplier_reference);
+
+  return {
+    found: true,
+    eligible: true,
+    reason: existingRefund
+      ? `Digiflazz gagal definitif. Siap ditembak ulang dengan ref_id baru ${nextRefId} (kredit refund Rp${existingRefund.amount.toLocaleString('id-ID')} otomatis dibalik jika sukses).`
+      : `Digiflazz gagal definitif. Siap ditembak ulang dengan ref_id baru ${nextRefId}.`,
+    nextRefId,
+    digiflazzConfigured,
+    hadAutoRefund: Boolean(existingRefund),
+    refundAmount: existingRefund?.amount,
+  };
+}
+
 export async function processSingleSupplierJob(
   transactionId: string,
   workerId: string,
@@ -698,18 +969,19 @@ export async function processSingleSupplierJob(
     return { handled: false };
   }
 
-  // Guard: if already attempted or supplier_reference exists, use INQUIRY instead of new purchase
+  // Guard: always poll/inquire using active supplier_reference (e.g. ...-R1 after manual retry)
+  const activeRefId = tx.supplier_reference?.trim() || tx.transaction_id;
   const isFirstAttempt = job.attempts === 0 && !tx.supplier_reference;
   const resp = isFirstAttempt
     ? await supplier.purchase({
         sku: tx.product_sku_snapshot,
         destination: tx.destination,
-        refId: tx.transaction_id,
+        refId: activeRefId,
       })
     : await supplier.inquire({
         sku: tx.product_sku_snapshot,
         destination: tx.destination,
-        refId: tx.transaction_id,
+        refId: activeRefId,
       });
 
   const nextAttempts = job.attempts + 1;
@@ -727,6 +999,14 @@ export async function processSingleSupplierJob(
            WHERE id = ?`
         )
         .run(nextAttempts, finishNow, finishNow, job.id);
+
+      reversePriorRefundLedgerIfPresent(
+        txDb,
+        tx,
+        'DIGIFLAZZ',
+        'SUPPLIER_POLL_AFTER_RETRY',
+        resp.refId || activeRefId
+      );
     }, db);
 
     transitionTransactionStatus(
@@ -736,95 +1016,19 @@ export async function processSingleSupplierJob(
       `Transaksi supplier sukses${resp.sn ? ` (SN: ${resp.sn})` : ''}`,
       {
         supplierStatus: 'SUCCESS',
-        supplierReference: resp.refId,
+        supplierReference: resp.refId || activeRefId,
         supplierSn: resp.sn ?? null,
         supplierMessage: resp.message ?? 'Sukses',
         completedAt: finishNow,
       }
     );
 
-    notifyCustomerForTransaction({
-      transactionId: tx.transaction_id,
-      customerId: tx.customer_id,
-      eventKey: 'success',
-      messageType: 'TRANSACTION_SUCCESS',
-      text:
-        `Pesanan Anda BERHASIL diproses!\n` +
-        `ID: ${tx.transaction_id}\n` +
-        `Produk: ${tx.product_name_snapshot}\n` +
-        `Tujuan: ${maskDestination(tx.destination)}\n` +
-        (resp.sn ? `SN / Token: ${resp.sn}\n` : '') +
-        `Terima kasih telah bertransaksi.`,
-    });
-
-    const productMeta = db
-      .prepare(
-        `SELECT p.brand, c.name as category_name
-         FROM products p
-         LEFT JOIN categories c ON c.id = p.category_id
-         WHERE p.id = ?`
-      )
-      .get(tx.product_id) as { brand: string | null; category_name: string | null } | undefined;
-
-    const identity =
-      (db
-        .prepare(
-          `SELECT platform_user_id, platform_username
-           FROM customer_identities
-           WHERE customer_id = ? AND platform = ?
-           LIMIT 1`
-        )
-        .get(tx.customer_id, tx.platform) as
-        | { platform_user_id: string; platform_username: string | null }
-        | undefined) ||
-      (db
-        .prepare(
-          `SELECT platform_user_id, platform_username
-           FROM customer_identities
-           WHERE customer_id = ?
-           ORDER BY id ASC
-           LIMIT 1`
-        )
-        .get(tx.customer_id) as
-        | { platform_user_id: string; platform_username: string | null }
-        | undefined);
-
-    emitTransactionLogToGroups({
-      eventKey: 'success',
-      transactionId: tx.transaction_id,
-      customerCode: cus.customer_code,
-      productName: tx.product_name_snapshot,
-      destination: tx.destination,
-      platform: tx.platform,
-      amount: tx.payment_amount,
-      status: 'SUCCESS',
-      note: `Sukses Digiflazz${resp.sn ? ` SN:${resp.sn}` : ''}`,
-    });
-
-    const successPayload = {
-      transactionId: tx.transaction_id,
-      platform: tx.platform,
-      customerCode: cus.customer_code,
-      platformUserId: identity?.platform_user_id ?? null,
-      platformUsername: identity?.platform_username ?? null,
-      categoryName: productMeta?.category_name ?? null,
-      brand: productMeta?.brand ?? null,
-      productSku: tx.product_sku_snapshot,
-      productName: tx.product_name_snapshot,
-      destination: tx.destination,
-      sn: resp.sn ?? null,
-      supplierPrice: tx.supplier_price_snapshot,
-      margin: tx.margin_snapshot,
-      discount: tx.discount_snapshot,
-      uniqueCode: tx.unique_code,
-      paymentAmount: tx.payment_amount,
-      supplierReference: resp.refId ?? tx.supplier_reference ?? null,
-      gatewayReference: tx.gateway_reference ?? null,
-      completedAt: finishNow,
-    };
-
-    emitSuccessAdminLogToGroups(successPayload);
-    emitTestimonyToGroups(successPayload);
+    emitSupplierSuccessEffects(
+      tx,
+      cus.customer_code,
+      { sn: resp.sn ?? null, refId: resp.refId || activeRefId },
+      finishNow
+    );
 
     return { handled: true, status: 'SUCCESS' };
   }
@@ -848,16 +1052,31 @@ export async function processSingleSupplierJob(
       `Supplier gagal definitif: ${resp.message || resp.rc || 'Gagal'}`,
       {
         supplierStatus: 'FAILED',
-        supplierReference: resp.refId,
+        supplierReference: resp.refId || activeRefId,
         supplierMessage: resp.message ?? 'Gagal definitif',
       }
     );
 
-    processAutomaticRefund(
-      tx.transaction_id,
-      'DIGIFLAZZ_DEFINITIVE_FAILURE',
-      resp.message || 'Transaksi gagal definitif di supplier'
-    );
+    const existingRefund = db
+      .prepare('SELECT id FROM refunds WHERE transaction_id = ?')
+      .get(tx.transaction_id) as { id: number } | undefined;
+
+    if (existingRefund) {
+      // Transaction had already been auto-refunded previously (e.g. before a manual retry that became PENDING then FAILED)
+      transitionTransactionStatus(
+        tx.transaction_id,
+        'REFUNDED',
+        'DIGIFLAZZ',
+        'Transaksi kembali gagal setelah tembak ulang; kredit refund internal sebelumnya tetap berlaku',
+        { completedAt: finishNow }
+      );
+    } else {
+      processAutomaticRefund(
+        tx.transaction_id,
+        'DIGIFLAZZ_DEFINITIVE_FAILURE',
+        resp.message || 'Transaksi gagal definitif di supplier'
+      );
+    }
 
     return { handled: true, status: 'FAILED' };
   }
@@ -885,7 +1104,7 @@ export async function processSingleSupplierJob(
         `Pesanan masih PENDING di supplier (${resp.message || 'Menunggu hasil'})`,
         {
           supplierStatus: 'PENDING',
-          supplierReference: resp.refId,
+          supplierReference: resp.refId || activeRefId,
           supplierMessage: resp.message ?? 'Pending',
         }
       );
@@ -935,7 +1154,7 @@ export async function processSingleSupplierJob(
       `Status supplier UNKNOWN (${resp.errorMessage || 'Perlu inquiry lanjutan'})`,
       {
         supplierStatus: 'UNKNOWN',
-        supplierReference: resp.refId || tx.supplier_reference,
+        supplierReference: resp.refId || activeRefId,
         supplierMessage: resp.errorMessage ?? 'Status belum pasti',
       }
     );
@@ -946,7 +1165,7 @@ export async function processSingleSupplierJob(
        WHERE transaction_id = ?`
     ).run(
       (resp.errorMessage || resp.message || 'Status belum pasti').slice(0, 250),
-      resp.refId || null,
+      resp.refId || activeRefId || null,
       finishNow,
       tx.transaction_id
     );
@@ -959,6 +1178,358 @@ export async function processSingleSupplierJob(
   });
 
   return { handled: true, status: 'UNKNOWN' };
+}
+
+export async function retryFailedSupplierTransaction(
+  transactionId: string,
+  actor: { id: string; role: string },
+  supplier: DigiflazzService = digiflazzService
+): Promise<{
+  transaction: TransactionRow;
+  retryRefId: string;
+  mappedStatus: 'SUCCESS' | 'FAILED' | 'PENDING' | 'UNKNOWN';
+  supplierMessage: string;
+  refundReversedAmount: number;
+}> {
+  if (!supplier.isConfigured()) {
+    throw new SupplierRetryError(
+      'Integrasi Digiflazz belum dikonfigurasi (DIGIFLAZZ_USERNAME / DIGIFLAZZ_API_KEY belum diisi)',
+      503
+    );
+  }
+
+  const db = getDb();
+  const lockOwner = `manual-retry:${actor.id}:${crypto.randomBytes(3).toString('hex')}`;
+  const nowIso = new Date().toISOString();
+  const staleCutoff = new Date(Date.now() - 120_000).toISOString();
+
+  // Atomically verify eligibility AND acquire supplier job lock so concurrent double-clicks cannot double-shoot
+  const locked = withTransaction((txDb) => {
+    const tx = txDb
+      .prepare('SELECT * FROM transactions WHERE transaction_id = ?')
+      .get(transactionId) as TransactionRow | undefined;
+
+    if (!tx) {
+      throw new SupplierRetryError('Transaksi tidak ditemukan', 404);
+    }
+
+    if (tx.payment_status !== 'PAID') {
+      throw new SupplierRetryError('Tembak ulang dilarang: pembayaran transaksi belum LUNAS', 400);
+    }
+
+    if (tx.supplier_status !== 'FAILED' || !['FAILED', 'REFUNDED'].includes(tx.transaction_status)) {
+      throw new SupplierRetryError(
+        `Tembak ulang hanya diizinkan jika Digiflazz benar-benar FAILED (saat ini: supplier=${tx.supplier_status}, status=${tx.transaction_status})`,
+        400
+      );
+    }
+
+    txDb
+      .prepare(
+        `INSERT OR IGNORE INTO supplier_jobs (transaction_id, status, attempts, next_attempt_at, created_at, updated_at)
+         VALUES (?, 'FAILED_DEFINITIVE', 1, ?, ?, ?)`
+      )
+      .run(transactionId, nowIso, nowIso, nowIso);
+
+    const job = txDb
+      .prepare('SELECT * FROM supplier_jobs WHERE transaction_id = ?')
+      .get(transactionId) as { id: number; status: string; attempts: number; locked_by: string | null; locked_at: string | null };
+
+    if (['PENDING', 'PROCESSING', 'UNKNOWN', 'COMPLETED'].includes(job.status)) {
+      throw new SupplierRetryError(`Tembak ulang dilarang: status job supplier masih ${job.status}`, 409);
+    }
+
+    const claim = txDb
+      .prepare(
+        `UPDATE supplier_jobs
+         SET locked_by = ?, locked_at = ?, updated_at = ?
+         WHERE id = ?
+           AND status = 'FAILED_DEFINITIVE'
+           AND (locked_at IS NULL OR locked_at < ?)`
+      )
+      .run(lockOwner, nowIso, nowIso, job.id, staleCutoff);
+
+    if (claim.changes === 0) {
+      throw new SupplierRetryError('Transaksi sedang ditembak ulang atau dikunci worker lain', 409);
+    }
+
+    const retryRefId = computeNextRetryRefId(tx.transaction_id, tx.supplier_reference);
+    return { tx, job, retryRefId };
+  }, db);
+
+  const { tx, job, retryRefId } = locked;
+  let resp: Awaited<ReturnType<DigiflazzService['purchase']>>;
+
+  try {
+    resp = await supplier.purchase({
+      sku: tx.product_sku_snapshot,
+      destination: tx.destination,
+      refId: retryRefId,
+    });
+  } catch (err) {
+    db.prepare('UPDATE supplier_jobs SET locked_by = NULL, locked_at = NULL, updated_at = ? WHERE id = ?').run(
+      new Date().toISOString(),
+      job.id
+    );
+    throw err;
+  }
+
+  const finishNow = new Date().toISOString();
+  const nextAttempts = job.attempts + 1;
+  const effectiveRefId = resp.refId?.trim() || retryRefId;
+  const cus = db.prepare('SELECT customer_code FROM customers WHERE id = ?').get(tx.customer_id) as {
+    customer_code: string;
+  };
+
+  if (resp.mappedStatus === 'SUCCESS') {
+    let refundReversedAmount = 0;
+    const updatedTx = withTransaction((txDb) => {
+      txDb
+        .prepare(
+          `UPDATE supplier_jobs
+           SET status = 'COMPLETED', attempts = ?, last_attempt_at = ?, last_error = NULL, locked_by = NULL, locked_at = NULL, updated_at = ?
+           WHERE id = ?`
+        )
+        .run(nextAttempts, finishNow, finishNow, job.id);
+
+      const rev = reversePriorRefundLedgerIfPresent(
+        txDb,
+        tx,
+        actor.id,
+        'ADMIN_RETRY_SUPPLIER',
+        effectiveRefId
+      );
+      refundReversedAmount = rev.amount;
+
+      txDb
+        .prepare(
+          `UPDATE transactions
+           SET transaction_status = 'SUCCESS',
+               supplier_status = 'SUCCESS',
+               supplier_reference = ?,
+               supplier_sn = ?,
+               supplier_message = ?,
+               completed_at = ?,
+               updated_at = ?
+           WHERE transaction_id = ?`
+        )
+        .run(
+          effectiveRefId,
+          resp.sn ?? null,
+          resp.message ?? 'Sukses',
+          finishNow,
+          finishNow,
+          tx.transaction_id
+        );
+
+      txDb
+        .prepare(
+          `INSERT INTO transaction_status_history (transaction_id, old_status, new_status, source, description, created_at)
+           VALUES (?, ?, 'SUCCESS', 'ADMIN_RETRY_SUPPLIER', ?, ?)`
+        )
+        .run(
+          tx.transaction_id,
+          tx.transaction_status,
+          `Tembak ulang manual Digiflazz oleh ${actor.id} SUKSES (ref: ${effectiveRefId}${resp.sn ? `, SN: ${resp.sn}` : ''})${refundReversedAmount > 0 ? ` — reversal refund Rp${refundReversedAmount.toLocaleString('id-ID')}` : ''}`,
+          finishNow
+        );
+
+      return txDb.prepare('SELECT * FROM transactions WHERE transaction_id = ?').get(tx.transaction_id) as TransactionRow;
+    }, db);
+
+    emitSupplierSuccessEffects(
+      updatedTx,
+      cus.customer_code,
+      { sn: resp.sn ?? null, refId: effectiveRefId },
+      finishNow
+    );
+
+    return {
+      transaction: updatedTx,
+      retryRefId: effectiveRefId,
+      mappedStatus: 'SUCCESS',
+      supplierMessage: resp.message ?? 'Sukses',
+      refundReversedAmount,
+    };
+  }
+
+  if (resp.mappedStatus === 'PENDING') {
+    const nextAttemptAt = new Date(
+      Date.now() + config.scheduler.supplierPollIntervalSeconds * 1000
+    ).toISOString();
+
+    const updatedTx = withTransaction((txDb) => {
+      txDb
+        .prepare(
+          `UPDATE supplier_jobs
+           SET status = 'PENDING', attempts = ?, last_attempt_at = ?, next_attempt_at = ?, last_error = NULL, locked_by = NULL, locked_at = NULL, updated_at = ?
+           WHERE id = ?`
+        )
+        .run(nextAttempts, finishNow, nextAttemptAt, finishNow, job.id);
+
+      txDb
+        .prepare(
+          `UPDATE transactions
+           SET transaction_status = 'SUPPLIER_PENDING',
+               supplier_status = 'PENDING',
+               supplier_reference = ?,
+               supplier_message = ?,
+               completed_at = NULL,
+               updated_at = ?
+           WHERE transaction_id = ?`
+        )
+        .run(effectiveRefId, resp.message ?? 'Pending', finishNow, tx.transaction_id);
+
+      txDb
+        .prepare(
+          `INSERT INTO transaction_status_history (transaction_id, old_status, new_status, source, description, created_at)
+           VALUES (?, ?, 'SUPPLIER_PENDING', 'ADMIN_RETRY_SUPPLIER', ?, ?)`
+        )
+        .run(
+          tx.transaction_id,
+          tx.transaction_status,
+          `Tembak ulang manual Digiflazz oleh ${actor.id} menghasilkan PENDING (ref: ${effectiveRefId}) — menunggu inquiry otomatis`,
+          finishNow
+        );
+
+      return txDb.prepare('SELECT * FROM transactions WHERE transaction_id = ?').get(tx.transaction_id) as TransactionRow;
+    }, db);
+
+    emitTransactionLogToGroups({
+      eventKey: 'supplier-pending',
+      transactionId: tx.transaction_id,
+      customerCode: cus.customer_code,
+      productName: tx.product_name_snapshot,
+      destination: tx.destination,
+      platform: tx.platform,
+      amount: tx.payment_amount,
+      status: 'SUPPLIER_PENDING',
+      note: `Tembak ulang manual (${effectiveRefId}) masih PENDING di Digiflazz`,
+    });
+
+    return {
+      transaction: updatedTx,
+      retryRefId: effectiveRefId,
+      mappedStatus: 'PENDING',
+      supplierMessage: resp.message ?? 'Pending',
+      refundReversedAmount: 0,
+    };
+  }
+
+  if (resp.mappedStatus === 'UNKNOWN') {
+    const nextAttemptAt = new Date(Date.now() + 30_000).toISOString();
+    const msg = resp.errorMessage ?? resp.message ?? 'Status belum pasti';
+
+    const updatedTx = withTransaction((txDb) => {
+      txDb
+        .prepare(
+          `UPDATE supplier_jobs
+           SET status = 'UNKNOWN', attempts = ?, last_attempt_at = ?, next_attempt_at = ?, last_error = ?, locked_by = NULL, locked_at = NULL, updated_at = ?
+           WHERE id = ?`
+        )
+        .run(nextAttempts, finishNow, nextAttemptAt, msg, finishNow, job.id);
+
+      txDb
+        .prepare(
+          `UPDATE transactions
+           SET transaction_status = 'UNKNOWN',
+               supplier_status = 'UNKNOWN',
+               supplier_reference = ?,
+               supplier_message = ?,
+               completed_at = NULL,
+               updated_at = ?
+           WHERE transaction_id = ?`
+        )
+        .run(effectiveRefId, msg, finishNow, tx.transaction_id);
+
+      txDb
+        .prepare(
+          `INSERT INTO transaction_status_history (transaction_id, old_status, new_status, source, description, created_at)
+           VALUES (?, ?, 'UNKNOWN', 'ADMIN_RETRY_SUPPLIER', ?, ?)`
+        )
+        .run(
+          tx.transaction_id,
+          tx.transaction_status,
+          `Tembak ulang manual Digiflazz oleh ${actor.id} menghasilkan status UNKNOWN (ref: ${effectiveRefId}): ${msg}`,
+          finishNow
+        );
+
+      return txDb.prepare('SELECT * FROM transactions WHERE transaction_id = ?').get(tx.transaction_id) as TransactionRow;
+    }, db);
+
+    return {
+      transaction: updatedTx,
+      retryRefId: effectiveRefId,
+      mappedStatus: 'UNKNOWN',
+      supplierMessage: msg,
+      refundReversedAmount: 0,
+    };
+  }
+
+  // FAILED again definitively
+  const failMessage = resp.message || 'Gagal definitif';
+  const existingRefund = withTransaction((txDb) => {
+    txDb
+      .prepare(
+        `UPDATE supplier_jobs
+         SET status = 'FAILED_DEFINITIVE', attempts = ?, last_attempt_at = ?, last_error = ?, locked_by = NULL, locked_at = NULL, updated_at = ?
+         WHERE id = ?`
+      )
+      .run(nextAttempts, finishNow, failMessage, finishNow, job.id);
+
+    const existingRef = txDb
+      .prepare('SELECT id FROM refunds WHERE transaction_id = ?')
+      .get(tx.transaction_id) as { id: number } | undefined;
+
+    const keptStatus: TransactionStatus = existingRef ? 'REFUNDED' : 'FAILED';
+
+    txDb
+      .prepare(
+        `UPDATE transactions
+         SET transaction_status = ?,
+             supplier_status = 'FAILED',
+             supplier_reference = ?,
+             supplier_message = ?,
+             updated_at = ?
+         WHERE transaction_id = ?`
+      )
+      .run(keptStatus, effectiveRefId, failMessage, finishNow, tx.transaction_id);
+
+    txDb
+      .prepare(
+        `INSERT INTO transaction_status_history (transaction_id, old_status, new_status, source, description, created_at)
+         VALUES (?, ?, ?, 'ADMIN_RETRY_SUPPLIER', ?, ?)`
+      )
+      .run(
+        tx.transaction_id,
+        tx.transaction_status,
+        keptStatus,
+        `Tembak ulang manual Digiflazz oleh ${actor.id} kembali GAGAL (ref: ${effectiveRefId}): ${failMessage}`,
+        finishNow
+      );
+
+    return existingRef;
+  }, db);
+
+  if (!existingRefund) {
+    processAutomaticRefund(
+      tx.transaction_id,
+      'DIGIFLAZZ_DEFINITIVE_FAILURE',
+      failMessage || 'Transaksi gagal definitif saat tembak ulang'
+    );
+  }
+
+  const finalTx = db
+    .prepare('SELECT * FROM transactions WHERE transaction_id = ?')
+    .get(tx.transaction_id) as TransactionRow;
+
+  return {
+    transaction: finalTx,
+    retryRefId: effectiveRefId,
+    mappedStatus: 'FAILED',
+    supplierMessage: failMessage,
+    refundReversedAmount: 0,
+  };
 }
 
 export function listTransactions(params: {

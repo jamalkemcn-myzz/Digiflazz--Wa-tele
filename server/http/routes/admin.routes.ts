@@ -7,6 +7,9 @@ import {
   getOverviewMetrics,
   listTransactions,
   getTransactionDetail,
+  checkSupplierRetryEligibility,
+  retryFailedSupplierTransaction,
+  SupplierRetryError,
 } from '../../services/transaction.service';
 import {
   listCategories,
@@ -110,13 +113,15 @@ adminRouter.get('/transactions', requirePermission('transactions:read'), (req: R
 });
 
 adminRouter.get('/transactions/:transactionId', requirePermission('transactions:read'), (req: Request, res: Response) => {
-  const detail = getTransactionDetail(String(req.params.transactionId));
+  const txId = String(req.params.transactionId);
+  const detail = getTransactionDetail(txId);
   if (!detail) {
     res.status(404).json({ ok: false, error: 'Transaksi tidak ditemukan' });
     return;
   }
-  const refundEligibility = checkTransactionRefundEligibility(String(req.params.transactionId));
-  res.json({ ok: true, data: { ...detail, refundEligibility } });
+  const refundEligibility = checkTransactionRefundEligibility(txId);
+  const supplierRetryEligibility = checkSupplierRetryEligibility(txId);
+  res.json({ ok: true, data: { ...detail, refundEligibility, supplierRetryEligibility } });
 });
 
 adminRouter.post(
@@ -135,6 +140,40 @@ adminRouter.post(
       });
       res.json({ ok: true, data: updated });
     } catch (err) {
+      next(err);
+    }
+  }
+);
+
+adminRouter.post(
+  '/transactions/:transactionId/retry-supplier',
+  requirePermission('transactions:reconcile'),
+  async (req: Request, res: Response, next) => {
+    try {
+      const txId = String(req.params.transactionId);
+      const result = await retryFailedSupplierTransaction(txId, {
+        id: req.admin!.username,
+        role: req.admin!.role,
+      });
+      recordAuditLog({
+        actorId: req.admin!.username,
+        actorRole: req.admin!.role,
+        action: 'TRANSACTION_MANUAL_SUPPLIER_RETRY',
+        targetType: 'TRANSACTION',
+        targetId: txId,
+        details: {
+          retryRefId: result.retryRefId,
+          mappedStatus: result.mappedStatus,
+          supplierMessage: result.supplierMessage,
+          refundReversedAmount: result.refundReversedAmount,
+        },
+      });
+      res.json({ ok: true, data: result });
+    } catch (err) {
+      if (err instanceof SupplierRetryError) {
+        res.status(err.statusCode).json({ ok: false, error: err.message });
+        return;
+      }
       next(err);
     }
   }

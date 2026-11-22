@@ -91,6 +91,19 @@ export const api = {
     requestJson<{ ok: true; data: any }>(`/api/admin/transactions/${encodeURIComponent(txId)}/reconcile`, {
       method: 'POST',
     }),
+  retrySupplierTransaction: (txId: string) =>
+    requestJson<{
+      ok: true;
+      data: {
+        transaction: any;
+        retryRefId: string;
+        mappedStatus: 'SUCCESS' | 'FAILED' | 'PENDING' | 'UNKNOWN';
+        supplierMessage: string;
+        refundReversedAmount: number;
+      };
+    }>(`/api/admin/transactions/${encodeURIComponent(txId)}/retry-supplier`, {
+      method: 'POST',
+    }),
 
   getProducts: (params: Record<string, string | number | undefined>) => {
     const qs = new URLSearchParams();

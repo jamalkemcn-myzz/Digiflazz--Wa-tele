@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useCallback } from 'react';
-import { Search, Eye, RefreshCw, X } from 'lucide-react';
+import { Search, Eye, RefreshCw, X, RotateCcw, AlertTriangle } from 'lucide-react';
 import { api } from '../api/client';
 import type { PaginationInfo, TransactionItem } from '../types/admin';
 
@@ -29,6 +29,8 @@ export function TransactionsPage({ permissions }: { permissions: string[] }) {
   const [selectedDetail, setSelectedDetail] = useState<any | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [reconciling, setReconciling] = useState(false);
+  const [retryingSupplier, setRetryingSupplier] = useState(false);
+  const [confirmRetryTxId, setConfirmRetryTxId] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
 
   const load = useCallback(async (page = 1) => {
@@ -57,9 +59,10 @@ export function TransactionsPage({ permissions }: { permissions: string[] }) {
     void load(1);
   }, [load]);
 
-  async function openDetail(txId: string) {
+  async function openDetail(txId: string, preConfirmRetry = false) {
     setDetailLoading(true);
     setFeedback(null);
+    setConfirmRetryTxId(preConfirmRetry ? txId : null);
     try {
       const res = await api.getTransactionDetail(txId);
       setSelectedDetail(res.data);
@@ -73,16 +76,49 @@ export function TransactionsPage({ permissions }: { permissions: string[] }) {
   async function handleReconcile(txId: string) {
     setReconciling(true);
     setFeedback(null);
+    setConfirmRetryTxId(null);
     try {
       await api.reconcileTransaction(txId);
-      setFeedback(`Rekonsiliasi / inquiry untuk ${txId} telah dijalankan.`);
       await openDetail(txId);
+      setFeedback(`Rekonsiliasi / inquiry untuk ${txId} telah dijalankan.`);
       await load(pagination.page);
     } catch (err) {
       setFeedback(err instanceof Error ? err.message : 'Rekonsiliasi gagal');
     } finally {
       setReconciling(false);
     }
+  }
+
+  async function handleRetrySupplier(txId: string) {
+    setRetryingSupplier(true);
+    setFeedback(null);
+    try {
+      const res = await api.retrySupplierTransaction(txId);
+      const result = res.data;
+      setConfirmRetryTxId(null);
+      await openDetail(txId);
+      const revText =
+        result.refundReversedAmount > 0
+          ? ` Kredit refund Rp${result.refundReversedAmount.toLocaleString('id-ID')} otomatis dibalik.`
+          : '';
+      setFeedback(
+        `Tembak ulang Digiflazz (${result.retryRefId}) → ${result.mappedStatus}: ${result.supplierMessage}.${revText}`
+      );
+      await load(pagination.page);
+    } catch (err) {
+      setFeedback(err instanceof Error ? err.message : 'Tembak ulang Digiflazz gagal dijalankan');
+    } finally {
+      setRetryingSupplier(false);
+    }
+  }
+
+  function isRowRetryCandidate(tx: TransactionItem): boolean {
+    return (
+      permissions.includes('transactions:reconcile') &&
+      tx.payment_status === 'PAID' &&
+      tx.supplier_status === 'FAILED' &&
+      (tx.transaction_status === 'FAILED' || tx.transaction_status === 'REFUNDED')
+    );
   }
 
   return (
@@ -240,14 +276,26 @@ export function TransactionsPage({ permissions }: { permissions: string[] }) {
                       {new Date(tx.created_at).toLocaleString('id-ID')}
                     </td>
                     <td className="py-3 px-4 text-right">
-                      <button
-                        onClick={() => void openDetail(tx.transaction_id)}
-                        aria-label={`Detail transaksi ${tx.transaction_id}`}
-                        className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-slate-200 bg-[#192233] border border-[#2a3852] rounded-md hover:bg-[#232e42] cursor-pointer whitespace-nowrap"
-                      >
-                        <Eye className="w-3.5 h-3.5" />
-                        Detail
-                      </button>
+                      <div className="inline-flex items-center justify-end gap-1.5">
+                        {isRowRetryCandidate(tx) && (
+                          <button
+                            onClick={() => void openDetail(tx.transaction_id, true)}
+                            aria-label={`Tembak ulang Digiflazz ${tx.transaction_id}`}
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold text-amber-200 bg-amber-950/60 border border-amber-700/70 rounded-md hover:bg-amber-900/70 cursor-pointer whitespace-nowrap"
+                          >
+                            <RotateCcw className="w-3.5 h-3.5" />
+                            Tembak Ulang
+                          </button>
+                        )}
+                        <button
+                          onClick={() => void openDetail(tx.transaction_id)}
+                          aria-label={`Detail transaksi ${tx.transaction_id}`}
+                          className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-slate-200 bg-[#192233] border border-[#2a3852] rounded-md hover:bg-[#232e42] cursor-pointer whitespace-nowrap"
+                        >
+                          <Eye className="w-3.5 h-3.5" />
+                          Detail
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 ))
@@ -298,7 +346,10 @@ export function TransactionsPage({ permissions }: { permissions: string[] }) {
                 </p>
               </div>
               <button
-                onClick={() => setSelectedDetail(null)}
+                onClick={() => {
+                  setSelectedDetail(null);
+                  setConfirmRetryTxId(null);
+                }}
                 aria-label="Tutup detail transaksi"
                 className="p-2 text-slate-400 hover:text-slate-100 rounded-lg cursor-pointer"
               >
@@ -369,17 +420,80 @@ export function TransactionsPage({ permissions }: { permissions: string[] }) {
                 )}
 
                 {permissions.includes('transactions:reconcile') && (
-                  <div className="flex items-center justify-between pt-3 border-t border-[#1f2b42]">
-                    <span className="text-xs text-slate-400">
-                      Kelayakan Refund: {selectedDetail.refundEligibility?.reason || '-'}
-                    </span>
-                    <button
-                      disabled={reconciling}
-                      onClick={() => void handleReconcile(selectedDetail.transaction.transaction_id)}
-                      className="px-4 py-2 text-xs font-semibold text-white bg-[#1668ff] rounded-lg hover:bg-[#2574ff] disabled:opacity-50 cursor-pointer whitespace-nowrap"
-                    >
-                      {reconciling ? 'Memeriksa...' : 'Inquiry & Rekonsiliasi Manual'}
-                    </button>
+                  <div className="pt-3 border-t border-[#1f2b42] space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div className="text-xs text-slate-400 space-y-0.5 max-w-md">
+                        <p>Kelayakan Refund: {selectedDetail.refundEligibility?.reason || '-'}</p>
+                        {selectedDetail.supplierRetryEligibility && (
+                          <p>Tembak Ulang Supplier: {selectedDetail.supplierRetryEligibility.reason}</p>
+                        )}
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        {selectedDetail.supplierRetryEligibility?.eligible &&
+                          confirmRetryTxId !== selectedDetail.transaction.transaction_id && (
+                            <button
+                              disabled={
+                                retryingSupplier ||
+                                reconciling ||
+                                !selectedDetail.supplierRetryEligibility.digiflazzConfigured
+                              }
+                              onClick={() => setConfirmRetryTxId(selectedDetail.transaction.transaction_id)}
+                              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-amber-100 bg-amber-600/90 border border-amber-500/70 rounded-lg hover:bg-amber-500 disabled:opacity-50 cursor-pointer whitespace-nowrap"
+                            >
+                              <RotateCcw className="w-3.5 h-3.5" />
+                              {selectedDetail.supplierRetryEligibility.digiflazzConfigured
+                                ? 'Tembak Ulang Digiflazz'
+                                : 'Digiflazz Belum Siap'}
+                            </button>
+                          )}
+                        <button
+                          disabled={reconciling || retryingSupplier}
+                          onClick={() => void handleReconcile(selectedDetail.transaction.transaction_id)}
+                          className="px-4 py-2 text-xs font-semibold text-white bg-[#1668ff] rounded-lg hover:bg-[#2574ff] disabled:opacity-50 cursor-pointer whitespace-nowrap"
+                        >
+                          {reconciling ? 'Memeriksa...' : 'Inquiry & Rekonsiliasi Manual'}
+                        </button>
+                      </div>
+                    </div>
+
+                    {selectedDetail.supplierRetryEligibility?.eligible &&
+                      confirmRetryTxId === selectedDetail.transaction.transaction_id && (
+                        <div className="p-3.5 rounded-lg bg-amber-950/50 border border-amber-700/70 space-y-2.5">
+                          <div className="flex items-start gap-2.5 text-xs text-amber-100">
+                            <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                            <div className="space-y-1">
+                              <p className="font-semibold">
+                                Konfirmasi Tembak Ulang Digiflazz ({selectedDetail.supplierRetryEligibility.nextRefId})
+                              </p>
+                              <p className="text-amber-200/90">
+                                Pesanan <span className="font-mono font-semibold">{selectedDetail.transaction.product_sku_snapshot}</span> ke{' '}
+                                <span className="font-mono font-semibold">{selectedDetail.transaction.destination_masked}</span> akan dikirim ulang ke Digiflazz menggunakan ref_id baru.
+                                {selectedDetail.supplierRetryEligibility.hadAutoRefund &&
+                                selectedDetail.supplierRetryEligibility.refundAmount
+                                  ? ` Jika berhasil, kredit refund sebelumnya sebesar ${formatRp(selectedDetail.supplierRetryEligibility.refundAmount)} akan dibalik otomatis di buku besar.`
+                                  : ''}
+                              </p>
+                            </div>
+                          </div>
+                          <div className="flex items-center justify-end gap-2">
+                            <button
+                              disabled={retryingSupplier}
+                              onClick={() => setConfirmRetryTxId(null)}
+                              className="px-3 py-1.5 text-xs font-medium text-slate-300 bg-[#192233] border border-[#2a3852] rounded-md hover:bg-[#232e42] disabled:opacity-50 cursor-pointer"
+                            >
+                              Batal
+                            </button>
+                            <button
+                              disabled={retryingSupplier}
+                              onClick={() => void handleRetrySupplier(selectedDetail.transaction.transaction_id)}
+                              className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold text-white bg-amber-600 rounded-md hover:bg-amber-500 disabled:opacity-50 cursor-pointer"
+                            >
+                              <RotateCcw className="w-3.5 h-3.5" />
+                              {retryingSupplier ? 'Menembak Ulang...' : 'Ya, Tembak Ulang Sekarang'}
+                            </button>
+                          </div>
+                        </div>
+                      )}
                   </div>
                 )}
 

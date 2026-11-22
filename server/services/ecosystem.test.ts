@@ -2915,6 +2915,232 @@ test('Hierarchical Brand -> Series -> Duration Filtering (Tri Happy/Combo/GetMor
   assert.ok(waConfirm.replies[0].text.includes('Tri Data Happy 1.5GB 1 Hari'));
 });
 
+test('Manual Digiflazz Retry (Tembak Ulang): strict FAILED-only guard, -R1/-R2 ref_id, refund reversal & HTTP API', async () => {
+  const { checkSupplierRetryEligibility, retryFailedSupplierTransaction } = await import('./transaction.service');
+  const gw = new TestPaymentGateway();
+  const db = getDb();
+
+  // Mock HTTP Digiflazz server for end-to-end HTTP endpoint & inquiry verification
+  const receivedDigiCalls: Array<{ ref_id: string; commands?: string }> = [];
+  let digiMode: 'FAIL' | 'PENDING' | 'SUCCESS' = 'FAIL';
+
+  const mockDigiServer = http.createServer((req, res) => {
+    if (req.url === '/transaction' && req.method === 'POST') {
+      const chunks: Buffer[] = [];
+      req.on('data', (c) => chunks.push(c));
+      req.on('end', () => {
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+          ref_id: string;
+          commands?: string;
+        };
+        receivedDigiCalls.push({ ref_id: body.ref_id, commands: body.commands });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        if (digiMode === 'FAIL') {
+          res.end(
+            JSON.stringify({
+              data: {
+                ref_id: body.ref_id,
+                status: 'Gagal',
+                rc: '50',
+                message: 'Transaksi Gagal',
+              },
+            })
+          );
+          return;
+        }
+        if (digiMode === 'PENDING') {
+          res.end(
+            JSON.stringify({
+              data: {
+                ref_id: body.ref_id,
+                status: 'Pending',
+                rc: '03',
+                message: 'Transaksi Pending',
+              },
+            })
+          );
+          return;
+        }
+        res.end(
+          JSON.stringify({
+            data: {
+              ref_id: body.ref_id,
+              status: 'Sukses',
+              rc: '00',
+              sn: 'SN-RETRY-778899',
+              message: 'Transaksi Sukses',
+            },
+          })
+        );
+      });
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+
+  await new Promise<void>((resolve) => mockDigiServer.listen(0, '127.0.0.1', resolve));
+  const digiPort = (mockDigiServer.address() as { port: number }).port;
+  process.env.DIGIFLAZZ_USERNAME = 'testuser';
+  process.env.DIGIFLAZZ_API_KEY = 'test-digi-key';
+  process.env.DIGIFLAZZ_BASE_URL = `http://127.0.0.1:${digiPort}`;
+  refreshConfig(process.env);
+
+  const app = createExpressApp();
+  const apiServer = await new Promise<http.Server>((resolve) => {
+    const s = app.listen(0, '127.0.0.1', () => resolve(s));
+  });
+  const apiPort = (apiServer.address() as { port: number }).port;
+  const authHeader = `Basic ${Buffer.from('testowner:test-strong-password-999').toString('base64')}`;
+
+  try {
+    // 1. Create unpaid order -> retry MUST be blocked
+    const unpaidOrder = await createOrder(
+      {
+        platform: 'TELEGRAM',
+        platformUserId: 'retry-test-user-01',
+        productSkuOrId: 'TSEL10',
+        destination: '081255110011',
+      },
+      gw
+    );
+    assert.equal(unpaidOrder.ok, true);
+    const unpaidTxId = unpaidOrder.transaction!.transaction_id;
+    const unpaidCheck = checkSupplierRetryEligibility(unpaidTxId);
+    assert.equal(unpaidCheck.eligible, false);
+    assert.match(unpaidCheck.reason, /belum LUNAS/i);
+
+    const unpaidApiRes = await fetch(`http://127.0.0.1:${apiPort}/api/admin/transactions/${unpaidTxId}/retry-supplier`, {
+      method: 'POST',
+      headers: { Authorization: authHeader },
+    });
+    assert.equal(unpaidApiRes.status, 400);
+
+    // 2. Mark PAID, first Digiflazz fails -> REFUNDED + credit recorded in refund_ledger
+    handleVerifiedPaymentPaid(unpaidTxId, 'TEST_CALLBACK', new Date().toISOString());
+    const supplier = new DigiflazzService();
+    digiMode = 'FAIL';
+    const firstRun = await processSingleSupplierJob(unpaidTxId, 'worker-1', supplier);
+    assert.equal(firstRun.status, 'FAILED');
+    assert.equal(receivedDigiCalls[receivedDigiCalls.length - 1].ref_id, unpaidTxId);
+
+    const txAfterFail = db.prepare('SELECT * FROM transactions WHERE transaction_id = ?').get(unpaidTxId) as {
+      customer_id: number;
+      transaction_status: string;
+      supplier_status: string;
+      payment_amount: number;
+    };
+    assert.equal(txAfterFail.supplier_status, 'FAILED');
+    assert.equal(txAfterFail.transaction_status, 'REFUNDED');
+    const refundBalBefore = getCustomerRefundCreditTotal(txAfterFail.customer_id);
+    assert.ok(refundBalBefore >= txAfterFail.payment_amount);
+
+    // 3. Detail endpoint reports eligible=true with -R1 and hadAutoRefund=true
+    const detailRes1 = await fetch(`http://127.0.0.1:${apiPort}/api/admin/transactions/${unpaidTxId}`, {
+      headers: { Authorization: authHeader },
+    });
+    assert.equal(detailRes1.status, 200);
+    const detailJson1 = (await detailRes1.json()) as {
+      ok: boolean;
+      data: { supplierRetryEligibility: { eligible: boolean; nextRefId: string; hadAutoRefund: boolean } };
+    };
+    assert.equal(detailJson1.data.supplierRetryEligibility.eligible, true);
+    assert.equal(detailJson1.data.supplierRetryEligibility.nextRefId, `${unpaidTxId}-R1`);
+    assert.equal(detailJson1.data.supplierRetryEligibility.hadAutoRefund, true);
+
+    // 4. First manual retry via HTTP -> Digiflazz returns FAILED again -> stays REFUNDED without double refund, supplier_reference=-R1
+    const retryRes1 = await fetch(`http://127.0.0.1:${apiPort}/api/admin/transactions/${unpaidTxId}/retry-supplier`, {
+      method: 'POST',
+      headers: { Authorization: authHeader },
+    });
+    assert.equal(retryRes1.status, 200);
+    const retryJson1 = (await retryRes1.json()) as {
+      ok: boolean;
+      data: { retryRefId: string; mappedStatus: string; refundReversedAmount: number; transaction: { supplier_reference: string; transaction_status: string } };
+    };
+    assert.equal(retryJson1.data.retryRefId, `${unpaidTxId}-R1`);
+    assert.equal(retryJson1.data.mappedStatus, 'FAILED');
+    assert.equal(retryJson1.data.refundReversedAmount, 0);
+    assert.equal(retryJson1.data.transaction.transaction_status, 'REFUNDED');
+    assert.equal(retryJson1.data.transaction.supplier_reference, `${unpaidTxId}-R1`);
+    assert.equal(receivedDigiCalls[receivedDigiCalls.length - 1].ref_id, `${unpaidTxId}-R1`);
+    assert.equal(getCustomerRefundCreditTotal(txAfterFail.customer_id), refundBalBefore);
+
+    // 5. Second retry -> Digiflazz returns PENDING with -R2 -> SUPPLIER_PENDING, further retry blocked while PENDING!
+    digiMode = 'PENDING';
+    const retryRes2 = await retryFailedSupplierTransaction(unpaidTxId, { id: 'testowner', role: 'OWNER' }, supplier);
+    assert.equal(retryRes2.retryRefId, `${unpaidTxId}-R2`);
+    assert.equal(retryRes2.mappedStatus, 'PENDING');
+    assert.equal(retryRes2.transaction.transaction_status, 'SUPPLIER_PENDING');
+    assert.equal(checkSupplierRetryEligibility(unpaidTxId).eligible, false);
+
+    // 6. Scheduled poll now inquires using -R2 (not old unpaidTxId) and resolves SUCCESS, reversing auto-refund!
+    db.prepare('UPDATE supplier_jobs SET next_attempt_at = ? WHERE transaction_id = ?').run(
+      new Date(Date.now() - 1000).toISOString(),
+      unpaidTxId
+    );
+    digiMode = 'SUCCESS';
+    const pollAfterRetry = await processSingleSupplierJob(unpaidTxId, 'worker-2', supplier);
+    assert.equal(pollAfterRetry.status, 'SUCCESS');
+    assert.equal(receivedDigiCalls[receivedDigiCalls.length - 1].ref_id, `${unpaidTxId}-R2`);
+    assert.equal(getCustomerRefundCreditTotal(txAfterFail.customer_id), refundBalBefore - txAfterFail.payment_amount);
+    assert.equal(checkSupplierRetryEligibility(unpaidTxId).eligible, false);
+
+    // 7. Also verify direct immediate SUCCESS on manual retry reverses refund and records audit log
+    const directOrder = await createOrder(
+      {
+        platform: 'TELEGRAM',
+        platformUserId: 'retry-test-user-02',
+        productSkuOrId: 'TSEL10',
+        destination: '081255110022',
+      },
+      gw
+    );
+    const directTxId = directOrder.transaction!.transaction_id;
+    handleVerifiedPaymentPaid(directTxId, 'TEST_CALLBACK', new Date().toISOString());
+    digiMode = 'FAIL';
+    await processSingleSupplierJob(directTxId, 'worker-3', supplier);
+    const cus2 = db.prepare('SELECT customer_id, payment_amount FROM transactions WHERE transaction_id = ?').get(directTxId) as {
+      customer_id: number;
+      payment_amount: number;
+    };
+    assert.equal(getCustomerRefundCreditTotal(cus2.customer_id), cus2.payment_amount);
+
+    digiMode = 'SUCCESS';
+    const retrySuccessHttp = await fetch(`http://127.0.0.1:${apiPort}/api/admin/transactions/${directTxId}/retry-supplier`, {
+      method: 'POST',
+      headers: { Authorization: authHeader },
+    });
+    assert.equal(retrySuccessHttp.status, 200);
+    const retrySuccessJson = (await retrySuccessHttp.json()) as {
+      ok: boolean;
+      data: { retryRefId: string; mappedStatus: string; refundReversedAmount: number; transaction: { transaction_status: string; supplier_sn: string } };
+    };
+    assert.equal(retrySuccessJson.data.retryRefId, `${directTxId}-R1`);
+    assert.equal(retrySuccessJson.data.mappedStatus, 'SUCCESS');
+    assert.equal(retrySuccessJson.data.refundReversedAmount, cus2.payment_amount);
+    assert.equal(retrySuccessJson.data.transaction.transaction_status, 'SUCCESS');
+    assert.equal(retrySuccessJson.data.transaction.supplier_sn, 'SN-RETRY-778899');
+    assert.equal(getCustomerRefundCreditTotal(cus2.customer_id), 0);
+
+    // Trying again after SUCCESS must return HTTP 400
+    const retryAgainHttp = await fetch(`http://127.0.0.1:${apiPort}/api/admin/transactions/${directTxId}/retry-supplier`, {
+      method: 'POST',
+      headers: { Authorization: authHeader },
+    });
+    assert.equal(retryAgainHttp.status, 400);
+
+    const auditRow = db
+      .prepare("SELECT action, details_safe FROM audit_logs WHERE action = 'TRANSACTION_MANUAL_SUPPLIER_RETRY' AND target_id = ? ORDER BY id DESC LIMIT 1")
+      .get(directTxId) as { action: string; details_safe: string } | undefined;
+    assert.ok(auditRow);
+    assert.ok(auditRow.details_safe.includes(`${directTxId}-R1`));
+  } finally {
+    await new Promise<void>((resolve) => apiServer.close(() => resolve()));
+    await new Promise<void>((resolve) => mockDigiServer.close(() => resolve()));
+  }
+});
+
 test.after(() => {
   closeDb();
   fs.rmSync(tempDir, { recursive: true, force: true });
