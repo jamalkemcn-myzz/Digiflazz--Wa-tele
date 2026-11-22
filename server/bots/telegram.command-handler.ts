@@ -6,6 +6,7 @@ import {
   listCategories,
   getCategoryById,
   listActiveBrandsInCategory,
+  analyzeBrandCatalog,
   listProducts,
   getProductBySkuOrId,
 } from '../services/product.service';
@@ -14,6 +15,12 @@ import {
   matchBrandForDetectedOperator,
   isTelecomCategoryName,
 } from '../domain/operator-prefix';
+import {
+  DURATION_BUCKET_META,
+  shouldShowDurationPicker,
+  shouldShowSeriesPicker,
+  type DurationBucket,
+} from '../domain/catalog-filter';
 import {
   resolveOrCreateCustomer,
   findCustomerByPlatform,
@@ -453,6 +460,197 @@ function buildBrandPickerButtons(
   return buttons;
 }
 
+function buildSeriesPickerButtons(
+  categoryId: number,
+  brand: string,
+  seriesSummaries: Array<{ series: string; productCount: number }>,
+  totalInBrand: number
+): TelegramInlineButton[][] {
+  const shown = seriesSummaries.slice(0, 16);
+  const buttons: TelegramInlineButton[][] = [];
+  for (let i = 0; i < shown.length; i += 2) {
+    buttons.push(
+      shown.slice(i, i + 2).map((s, offset) => ({
+        text: `📦 ${s.series} (${s.productCount})`,
+        callbackData: `SELSER_${i + offset}`,
+      }))
+    );
+  }
+  buttons.push([{ text: `📋 Semua Produk ${brand} (${totalInBrand})`, callbackData: 'SELALLSER' }]);
+  buttons.push([
+    { text: '🔍 Cari Produk', callbackData: 'CARI_SCOPE' },
+    { text: '🔄 Ganti Operator / Brand', callbackData: `CAT_${categoryId}_1` },
+  ]);
+  buttons.push([
+    { text: '📂 Kategori Lain', callbackData: 'CAT_LIST' },
+    { text: '🏠 Menu Utama', callbackData: 'MAIN_MENU' },
+  ]);
+  return buttons;
+}
+
+function buildDurationPickerButtons(
+  categoryId: number,
+  durationSummaries: Array<{
+    code: string;
+    emoji: string;
+    label: string;
+    productCount: number;
+  }>,
+  totalFiltered: number,
+  hasSeriesStep: boolean
+): TelegramInlineButton[][] {
+  const buttons: TelegramInlineButton[][] = durationSummaries.map((d) => [
+    {
+      text: `${d.emoji} ${d.label} · ${d.productCount} paket`,
+      callbackData: `SELDUR_${d.code}`,
+    },
+  ]);
+  buttons.push([{ text: `📋 Semua Durasi (${totalFiltered})`, callbackData: 'SELDUR_ALL' }]);
+  const navRow: TelegramInlineButton[] = [];
+  if (hasSeriesStep) {
+    navRow.push({ text: '🔙 Pilih Seri', callbackData: 'BACK_SERIES' });
+  }
+  navRow.push({ text: '🔄 Ganti Operator', callbackData: `CAT_${categoryId}_1` });
+  buttons.push(navRow);
+  buttons.push([
+    { text: '🔍 Cari Produk', callbackData: 'CARI_SCOPE' },
+    { text: '🏠 Menu Utama', callbackData: 'MAIN_MENU' },
+  ]);
+  return buttons;
+}
+
+export async function enterTelegramSeriesCatalog(
+  transport: TelegramReplyTransport,
+  params: {
+    userId: string;
+    categoryId: number;
+    categoryName?: string;
+    brand?: string;
+    series?: string;
+    hasSeriesStep?: boolean;
+    detectedDestination?: string;
+    detectedOperatorLabel?: string;
+    dryRun?: boolean;
+  }
+): Promise<void> {
+  const catName = params.categoryName || getCategoryById(params.categoryId)?.name || 'Produk';
+  const analysis = analyzeBrandCatalog(params.categoryId, params.brand, params.series);
+  const hasSeriesStep = params.hasSeriesStep ?? shouldShowSeriesPicker(analysis.seriesSummaries);
+
+  if (shouldShowDurationPicker(analysis.durationSummaries, analysis.filteredCount) && params.brand) {
+    setBotSession(
+      'TELEGRAM',
+      params.userId,
+      {
+        mode: 'DURATION_LIST',
+        categoryId: params.categoryId,
+        categoryName: catName,
+        brand: params.brand,
+        series: params.series,
+        hasSeriesStep,
+        durationBuckets: analysis.durationSummaries.map((d) => d.bucket),
+        detectedDestination: params.detectedDestination,
+        detectedOperatorLabel: params.detectedOperatorLabel,
+        updatedAt: Date.now(),
+      },
+      params.dryRun
+    );
+
+    const scopeLabel = params.series ? `*${params.brand} · ${params.series}*` : `*${params.brand}*`;
+    const destHint = params.detectedDestination
+      ? `Nomor *${params.detectedDestination}* terdeteksi *${params.detectedOperatorLabel || params.brand}*\n`
+      : '';
+    const lines = analysis.durationSummaries.map(
+      (d) => `${d.emoji} *${d.label}* — ${d.productCount} paket (mulai Rp${d.minPrice.toLocaleString('id-ID')})`
+    );
+    await transport.reply(
+      `${destHint}${scopeLabel} (${catName})\n\n` +
+        `Pilih durasi masa aktif paket agar lebih mudah dicari:\n${lines.join('\n')}`,
+      buildDurationPickerButtons(
+        params.categoryId,
+        analysis.durationSummaries,
+        analysis.filteredCount,
+        hasSeriesStep
+      )
+    );
+    return;
+  }
+
+  await sendTelegramProductPage(transport, {
+    page: 1,
+    categoryId: params.categoryId,
+    categoryName: catName,
+    brand: params.brand,
+    series: params.series,
+    hasSeriesStep,
+    hasDurationStep: false,
+    detectedDestination: params.detectedDestination,
+    detectedOperatorLabel: params.detectedOperatorLabel,
+    userId: params.userId,
+    dryRun: params.dryRun,
+  });
+}
+
+export async function enterTelegramBrandCatalog(
+  transport: TelegramReplyTransport,
+  params: {
+    userId: string;
+    categoryId: number;
+    categoryName?: string;
+    brand?: string;
+    detectedDestination?: string;
+    detectedOperatorLabel?: string;
+    dryRun?: boolean;
+  }
+): Promise<void> {
+  const catName = params.categoryName || getCategoryById(params.categoryId)?.name || 'Produk';
+  const analysis = analyzeBrandCatalog(params.categoryId, params.brand);
+
+  if (shouldShowSeriesPicker(analysis.seriesSummaries) && params.brand) {
+    const shown = analysis.seriesSummaries.slice(0, 16);
+    setBotSession(
+      'TELEGRAM',
+      params.userId,
+      {
+        mode: 'SERIES_LIST',
+        categoryId: params.categoryId,
+        categoryName: catName,
+        brand: params.brand,
+        seriesList: shown.map((s) => s.series),
+        detectedDestination: params.detectedDestination,
+        detectedOperatorLabel: params.detectedOperatorLabel,
+        updatedAt: Date.now(),
+      },
+      params.dryRun
+    );
+
+    const destHint = params.detectedDestination
+      ? `Nomor *${params.detectedDestination}* terdeteksi *${params.detectedOperatorLabel || params.brand}*\n`
+      : '';
+    const lines = shown.map(
+      (s) => `• *${s.series}* — ${s.productCount} paket (mulai Rp${s.minPrice.toLocaleString('id-ID')})`
+    );
+
+    await transport.reply(
+      `${destHint}*${params.brand}* (${catName})\n\n` +
+        `Pilih seri / jenis paket yang ingin dicari:\n${lines.join('\n')}`,
+      buildSeriesPickerButtons(params.categoryId, params.brand, shown, analysis.totalInBrand)
+    );
+    return;
+  }
+
+  await enterTelegramSeriesCatalog(transport, {
+    userId: params.userId,
+    categoryId: params.categoryId,
+    categoryName: catName,
+    brand: params.brand,
+    hasSeriesStep: false,
+    detectedDestination: params.detectedDestination,
+    detectedOperatorLabel: params.detectedOperatorLabel,
+    dryRun: params.dryRun,
+  });
+}
+
 export async function sendTelegramCategorySelection(
   transport: TelegramReplyTransport,
   params: { userId: string; categoryId: number; dryRun?: boolean }
@@ -461,11 +659,17 @@ export async function sendTelegramCategorySelection(
   const brands = listActiveBrandsInCategory(params.categoryId);
 
   if (brands.length <= 1) {
-    await sendTelegramProductPage(transport, {
-      page: 1,
-      categoryId: params.categoryId,
-      brand: brands[0]?.brand,
+    const existingSession = getBotSession('TELEGRAM', params.userId, params.dryRun);
+    const preservedDestination =
+      existingSession && 'detectedDestination' in existingSession
+        ? existingSession.detectedDestination
+        : undefined;
+    await enterTelegramBrandCatalog(transport, {
       userId: params.userId,
+      categoryId: params.categoryId,
+      categoryName: cat?.name || 'Produk',
+      brand: brands[0]?.brand,
+      detectedDestination: preservedDestination,
       dryRun: params.dryRun,
     });
     return;
@@ -474,7 +678,7 @@ export async function sendTelegramCategorySelection(
   const brandNames = brands.map((b) => b.brand);
   const existingSession = getBotSession('TELEGRAM', params.userId, params.dryRun);
   const preservedDestination =
-    existingSession?.mode === 'BRAND_LIST' || existingSession?.mode === 'PRODUCT_LIST'
+    existingSession && 'detectedDestination' in existingSession
       ? existingSession.detectedDestination
       : undefined;
 
@@ -503,7 +707,16 @@ export async function sendTelegramCategorySelection(
 
 export async function promptTelegramSearch(
   transport: TelegramReplyTransport,
-  params: { userId: string; categoryId?: number; dryRun?: boolean }
+  params: {
+    userId: string;
+    categoryId?: number;
+    brand?: string;
+    series?: string;
+    durationBucket?: DurationBucket | 'ALL';
+    detectedDestination?: string;
+    detectedOperatorLabel?: string;
+    dryRun?: boolean;
+  }
 ): Promise<void> {
   setBotSession(
     'TELEGRAM',
@@ -511,12 +724,19 @@ export async function promptTelegramSearch(
     {
       mode: 'AWAITING_SEARCH_QUERY',
       categoryId: params.categoryId,
+      brand: params.brand,
+      series: params.series,
+      durationBucket: params.durationBucket,
+      detectedDestination: params.detectedDestination,
+      detectedOperatorLabel: params.detectedOperatorLabel,
       updatedAt: Date.now(),
     },
     params.dryRun
   );
+  const scopeParts = [params.brand, params.series].filter(Boolean);
+  const scopeDesc = scopeParts.length > 0 ? ` di *${scopeParts.join(' · ')}*` : '';
   await transport.reply(
-    `Ketik kata kunci produk atau nominal yang ingin dicari (contoh: xl 10, telkomsel, ml 86, pln 50):`,
+    `Ketik kata kunci produk${scopeDesc} atau nominal yang ingin dicari (contoh: happy 12, 30 hari, xl 10, pln 50):`,
     [
       [
         { text: '📂 Kategori Produk', callbackData: 'CAT_LIST' },
@@ -531,8 +751,13 @@ export async function sendTelegramProductPage(
   params: {
     page: number;
     categoryId?: number;
+    categoryName?: string;
     brand?: string;
+    series?: string;
+    durationBucket?: DurationBucket | 'ALL';
     search?: string;
+    hasSeriesStep?: boolean;
+    hasDurationStep?: boolean;
     detectedDestination?: string;
     detectedOperatorLabel?: string;
     userId?: string;
@@ -544,28 +769,53 @@ export async function sendTelegramProductPage(
     limit: 6,
     categoryId: params.categoryId,
     brand: params.brand,
+    series: params.series,
+    durationBucket: params.durationBucket,
     search: params.search,
     onlyActive: true,
     sortBy: 'PRICE_ASC',
   });
 
   if (res.items.length === 0) {
+    const emptyNav: TelegramInlineButton[][] = [];
+    if (params.categoryId && params.brand) {
+      const row: TelegramInlineButton[] = [];
+      if (params.hasDurationStep || (params.durationBucket && params.durationBucket !== 'ALL')) {
+        row.push({ text: '⏱️ Ganti Durasi', callbackData: 'BACK_DUR' });
+      }
+      if (params.hasSeriesStep || params.series) {
+        row.push({ text: '🔙 Pilih Seri', callbackData: 'BACK_SERIES' });
+      }
+      if (row.length > 0) emptyNav.push(row);
+    }
+    emptyNav.push([
+      { text: '🔍 Cari Lagi', callbackData: params.brand ? 'CARI_SCOPE' : 'CARI_PRODUK' },
+      { text: '📂 Kategori Produk', callbackData: 'CAT_LIST' },
+    ]);
+    emptyNav.push([
+      { text: '📦 Semua Produk', callbackData: 'PROD_PAGE_1' },
+      { text: '🏠 Menu Utama', callbackData: 'MAIN_MENU' },
+    ]);
+
     await transport.reply(
       params.search
         ? `Maaf Kak, produk dengan kata kunci "${params.search}" belum ditemukan.`
-        : 'Maaf Kak, belum ada produk aktif di halaman ini saat ini.',
-      [
-        [
-          { text: '🔍 Cari Lagi', callbackData: 'CARI_PRODUK' },
-          { text: '📂 Kategori Produk', callbackData: 'CAT_LIST' },
-        ],
-        [
-          { text: '📦 Semua Produk', callbackData: 'PROD_PAGE_1' },
-          { text: '🏠 Menu Utama', callbackData: 'MAIN_MENU' },
-        ],
-      ]
+        : 'Maaf Kak, belum ada produk aktif di filter ini saat ini.',
+      emptyNav
     );
     return;
+  }
+
+  let hasSeriesStep = params.hasSeriesStep;
+  let hasDurationStep = params.hasDurationStep;
+  if (params.categoryId && params.brand && (hasSeriesStep === undefined || hasDurationStep === undefined)) {
+    const analysis = analyzeBrandCatalog(params.categoryId, params.brand, params.series);
+    if (hasSeriesStep === undefined) {
+      hasSeriesStep = shouldShowSeriesPicker(analysis.seriesSummaries);
+    }
+    if (hasDurationStep === undefined) {
+      hasDurationStep = shouldShowDurationPicker(analysis.durationSummaries, analysis.filteredCount);
+    }
   }
 
   if (params.userId) {
@@ -577,8 +827,15 @@ export async function sendTelegramProductPage(
         skus: res.items.map((p) => p.sku),
         page: params.page,
         categoryId: params.categoryId,
+        categoryName: params.categoryName,
         brand: params.brand,
+        series: params.series,
+        durationBucket: params.durationBucket,
+        search: params.search,
+        hasSeriesStep,
+        hasDurationStep,
         detectedDestination: params.detectedDestination,
+        detectedOperatorLabel: params.detectedOperatorLabel,
         updatedAt: Date.now(),
       },
       params.dryRun
@@ -607,7 +864,14 @@ export async function sendTelegramProductPage(
         )
       : -1;
 
+  const hasExtraFilter = Boolean(
+    params.series || (params.durationBucket && params.durationBucket !== 'ALL') || params.search
+  );
+
   const makePageCallback = (targetPage: number) => {
+    if (hasExtraFilter) {
+      return `PGFL_${targetPage}`;
+    }
     if (params.categoryId && params.brand) {
       return buildBrandCallbackData(
         params.categoryId,
@@ -638,9 +902,18 @@ export async function sendTelegramProductPage(
   if (navRow.length > 0) buttons.push(navRow);
 
   if (params.categoryId && params.brand) {
+    const filterBackRow: TelegramInlineButton[] = [];
+    if (hasDurationStep) {
+      filterBackRow.push({ text: '⏱️ Ganti Durasi', callbackData: 'BACK_DUR' });
+    }
+    if (hasSeriesStep) {
+      filterBackRow.push({ text: '📂 Ganti Seri', callbackData: 'BACK_SERIES' });
+    }
+    if (filterBackRow.length > 0) buttons.push(filterBackRow);
+
     buttons.push([
       { text: '🔄 Ganti Operator / Brand', callbackData: `CAT_${params.categoryId}_1` },
-      { text: '🔍 Cari Produk', callbackData: 'CARI_PRODUK' },
+      { text: '🔍 Cari Produk', callbackData: 'CARI_SCOPE' },
     ]);
     buttons.push([
       { text: '📂 Kategori Lain', callbackData: 'CAT_LIST' },
@@ -654,20 +927,28 @@ export async function sendTelegramProductPage(
     buttons.push([{ text: '🏠 Menu Utama', callbackData: 'MAIN_MENU' }]);
   }
 
+  const filterLabels: string[] = [];
+  if (params.series) filterLabels.push(params.series);
+  if (params.durationBucket && params.durationBucket !== 'ALL') {
+    filterLabels.push(DURATION_BUCKET_META[params.durationBucket].shortLabel);
+  }
+  if (params.search) filterLabels.push(`"${params.search}"`);
+  const filterSuffix = filterLabels.length > 0 ? ` · ${filterLabels.join(' · ')}` : '';
+
   let header: string;
   if (params.detectedDestination) {
     header =
-      `Nomor *${params.detectedDestination}* terdeteksi operator *${params.brand || params.detectedOperatorLabel}* (Hal ${params.page}/${res.pagination.totalPages}):\n` +
+      `Nomor *${params.detectedDestination}* terdeteksi operator *${params.brand || params.detectedOperatorLabel}*${filterSuffix} (Hal ${params.page}/${res.pagination.totalPages}):\n` +
       `${lines.join('\n')}\n\n` +
       `Tap produk di bawah untuk langsung lanjut konfirmasi pesanan ya Kak!`;
   } else if (params.brand) {
     header =
-      `Daftar *${params.brand}* (Hal ${params.page}/${res.pagination.totalPages}):\n` +
+      `Daftar *${params.brand}*${filterSuffix} (Hal ${params.page}/${res.pagination.totalPages}):\n` +
       `${lines.join('\n')}\n\n` +
       `Tap tombol produk di bawah untuk langsung memesan ya Kak!`;
   } else {
     header =
-      `Daftar Produk (Hal ${params.page}/${res.pagination.totalPages}):\n` +
+      `Daftar Produk${filterSuffix} (Hal ${params.page}/${res.pagination.totalPages}):\n` +
       `${lines.join('\n')}\n\n` +
       `Tap tombol produk di bawah untuk langsung memesan ya Kak!`;
   }
@@ -990,6 +1271,8 @@ export async function dispatchTelegramCommand(
         (session?.mode === 'AWAITING_DESTINATION' ||
           session?.mode === 'AWAITING_VOUCHER_CODE' ||
           session?.mode === 'BRAND_LIST' ||
+          session?.mode === 'SERIES_LIST' ||
+          session?.mode === 'DURATION_LIST' ||
           session?.mode === 'AWAITING_SEARCH_QUERY') &&
         !args[0]
       ) {
@@ -1066,13 +1349,13 @@ export async function dispatchTelegramCommand(
       if (detected) {
         const matchedBrand = matchBrandForDetectedOperator(session.brands, detected);
         if (matchedBrand) {
-          await sendTelegramProductPage(transport, {
-            page: 1,
+          await enterTelegramBrandCatalog(transport, {
+            userId: input.userId,
             categoryId: session.categoryId,
+            categoryName: session.categoryName,
             brand: matchedBrand,
             detectedDestination: detected.normalizedPhone,
             detectedOperatorLabel: detected.displayName,
-            userId: input.userId,
             dryRun,
           });
           return;
@@ -1100,6 +1383,41 @@ export async function dispatchTelegramCommand(
         page: 1,
         categoryId: session.categoryId,
         search: trimmed,
+        detectedDestination: session.detectedDestination,
+        userId: input.userId,
+        dryRun,
+      });
+      return;
+    }
+
+    if (session?.mode === 'SERIES_LIST' || session?.mode === 'DURATION_LIST') {
+      const detected = detectOperatorFromPhone(trimmed);
+      if (detected) {
+        const brands = listActiveBrandsInCategory(session.categoryId).map((b) => b.brand);
+        const matchedBrand = matchBrandForDetectedOperator(brands, detected);
+        if (matchedBrand) {
+          await enterTelegramBrandCatalog(transport, {
+            userId: input.userId,
+            categoryId: session.categoryId,
+            categoryName: session.categoryName,
+            brand: matchedBrand,
+            detectedDestination: detected.normalizedPhone,
+            detectedOperatorLabel: detected.displayName,
+            dryRun,
+          });
+          return;
+        }
+      }
+
+      await sendTelegramProductPage(transport, {
+        page: 1,
+        categoryId: session.categoryId,
+        categoryName: session.categoryName,
+        brand: session.brand,
+        series: session.mode === 'DURATION_LIST' ? session.series : undefined,
+        search: trimmed,
+        detectedDestination: session.detectedDestination,
+        detectedOperatorLabel: session.detectedOperatorLabel,
         userId: input.userId,
         dryRun,
       });
@@ -1110,7 +1428,12 @@ export async function dispatchTelegramCommand(
       await sendTelegramProductPage(transport, {
         page: 1,
         categoryId: session.categoryId,
+        brand: session.brand,
+        series: session.series,
+        durationBucket: session.durationBucket,
         search: trimmed,
+        detectedDestination: session.detectedDestination,
+        detectedOperatorLabel: session.detectedOperatorLabel,
         userId: input.userId,
         dryRun,
       });
@@ -1241,13 +1564,13 @@ export async function dispatchTelegramCommand(
           const brands = listActiveBrandsInCategory(pulsaCat.id).map((b) => b.brand);
           const matched = matchBrandForDetectedOperator(brands, detected);
           if (matched) {
-            await sendTelegramProductPage(transport, {
-              page: 1,
+            await enterTelegramBrandCatalog(transport, {
+              userId: input.userId,
               categoryId: pulsaCat.id,
+              categoryName: pulsaCat.name,
               brand: matched,
               detectedDestination: detected.normalizedPhone,
               detectedOperatorLabel: detected.displayName,
-              userId: input.userId,
               dryRun,
             });
             return;

@@ -20,6 +20,7 @@ import {
   getProductBySkuOrId,
   listActiveBrandsInCategory,
 } from '../services/product.service';
+import { durationBucketFromCode } from '../domain/catalog-filter';
 import {
   sendTelegramMainMenu,
   sendTelegramProfile,
@@ -27,6 +28,8 @@ import {
   handleTelegramVoucherCommand,
   sendTelegramCategoryList,
   sendTelegramCategorySelection,
+  enterTelegramBrandCatalog,
+  enterTelegramSeriesCatalog,
   promptTelegramSearch,
   sendTelegramProductPage,
   promptTelegramProductDestination,
@@ -207,6 +210,171 @@ export async function dispatchTelegramCallback(
     return;
   }
 
+  if (data === 'CARI_SCOPE') {
+    if (transport.answerCbQuery) await transport.answerCbQuery();
+    const userId = input.userId || 'guest';
+    const session = getBotSession('TELEGRAM', userId, dryRun);
+    await promptTelegramSearch(transport, {
+      userId,
+      categoryId: session && 'categoryId' in session ? session.categoryId : undefined,
+      brand: session && 'brand' in session ? session.brand : undefined,
+      series: session && 'series' in session ? session.series : undefined,
+      durationBucket: session?.mode === 'PRODUCT_LIST' ? session.durationBucket : undefined,
+      detectedDestination:
+        session && 'detectedDestination' in session ? session.detectedDestination : undefined,
+      detectedOperatorLabel:
+        session && 'detectedOperatorLabel' in session ? session.detectedOperatorLabel : undefined,
+      dryRun,
+    });
+    return;
+  }
+
+  if (data.startsWith('SELSER_')) {
+    const idx = Number(data.replace('SELSER_', ''));
+    const userId = input.userId || 'guest';
+    const session = getBotSession('TELEGRAM', userId, dryRun);
+    if (transport.answerCbQuery) await transport.answerCbQuery();
+    if (session?.mode === 'SERIES_LIST' && Number.isFinite(idx) && session.seriesList[idx]) {
+      await enterTelegramSeriesCatalog(transport, {
+        userId,
+        categoryId: session.categoryId,
+        categoryName: session.categoryName,
+        brand: session.brand,
+        series: session.seriesList[idx],
+        hasSeriesStep: true,
+        detectedDestination: session.detectedDestination,
+        detectedOperatorLabel: session.detectedOperatorLabel,
+        dryRun,
+      });
+      return;
+    }
+    await sendTelegramCategoryList(transport);
+    return;
+  }
+
+  if (data === 'SELALLSER') {
+    const userId = input.userId || 'guest';
+    const session = getBotSession('TELEGRAM', userId, dryRun);
+    if (transport.answerCbQuery) await transport.answerCbQuery();
+    if (session && (session.mode === 'SERIES_LIST' || session.mode === 'DURATION_LIST')) {
+      await enterTelegramSeriesCatalog(transport, {
+        userId,
+        categoryId: session.categoryId,
+        categoryName: session.categoryName,
+        brand: session.brand,
+        series: undefined,
+        hasSeriesStep: true,
+        detectedDestination: session.detectedDestination,
+        detectedOperatorLabel: session.detectedOperatorLabel,
+        dryRun,
+      });
+      return;
+    }
+    await sendTelegramCategoryList(transport);
+    return;
+  }
+
+  if (data.startsWith('SELDUR_')) {
+    const code = data.replace('SELDUR_', '').trim();
+    const bucket = durationBucketFromCode(code);
+    const userId = input.userId || 'guest';
+    const session = getBotSession('TELEGRAM', userId, dryRun);
+    if (transport.answerCbQuery) await transport.answerCbQuery();
+    if (bucket && session?.mode === 'DURATION_LIST') {
+      await sendTelegramProductPage(transport, {
+        page: 1,
+        categoryId: session.categoryId,
+        categoryName: session.categoryName,
+        brand: session.brand,
+        series: session.series,
+        durationBucket: bucket,
+        hasSeriesStep: session.hasSeriesStep,
+        hasDurationStep: true,
+        detectedDestination: session.detectedDestination,
+        detectedOperatorLabel: session.detectedOperatorLabel,
+        userId,
+        dryRun,
+      });
+      return;
+    }
+    await sendTelegramCategoryList(transport);
+    return;
+  }
+
+  if (data === 'BACK_SERIES') {
+    const userId = input.userId || 'guest';
+    const session = getBotSession('TELEGRAM', userId, dryRun);
+    if (transport.answerCbQuery) await transport.answerCbQuery();
+    if (
+      session &&
+      (session.mode === 'DURATION_LIST' || session.mode === 'PRODUCT_LIST') &&
+      session.categoryId &&
+      session.brand
+    ) {
+      await enterTelegramBrandCatalog(transport, {
+        userId,
+        categoryId: session.categoryId,
+        categoryName: session.categoryName,
+        brand: session.brand,
+        detectedDestination: session.detectedDestination,
+        detectedOperatorLabel: session.detectedOperatorLabel,
+        dryRun,
+      });
+      return;
+    }
+    await sendTelegramCategoryList(transport);
+    return;
+  }
+
+  if (data === 'BACK_DUR') {
+    const userId = input.userId || 'guest';
+    const session = getBotSession('TELEGRAM', userId, dryRun);
+    if (transport.answerCbQuery) await transport.answerCbQuery();
+    if (session?.mode === 'PRODUCT_LIST' && session.categoryId && session.brand) {
+      await enterTelegramSeriesCatalog(transport, {
+        userId,
+        categoryId: session.categoryId,
+        categoryName: session.categoryName,
+        brand: session.brand,
+        series: session.series,
+        hasSeriesStep: session.hasSeriesStep,
+        detectedDestination: session.detectedDestination,
+        detectedOperatorLabel: session.detectedOperatorLabel,
+        dryRun,
+      });
+      return;
+    }
+    await sendTelegramCategoryList(transport);
+    return;
+  }
+
+  if (data.startsWith('PGFL_')) {
+    const page = Number(data.replace('PGFL_', '')) || 1;
+    const userId = input.userId || 'guest';
+    const session = getBotSession('TELEGRAM', userId, dryRun);
+    if (transport.answerCbQuery) await transport.answerCbQuery();
+    if (session?.mode === 'PRODUCT_LIST') {
+      await sendTelegramProductPage(transport, {
+        page,
+        categoryId: session.categoryId,
+        categoryName: session.categoryName,
+        brand: session.brand,
+        series: session.series,
+        durationBucket: session.durationBucket,
+        search: session.search,
+        hasSeriesStep: session.hasSeriesStep,
+        hasDurationStep: session.hasDurationStep,
+        detectedDestination: session.detectedDestination,
+        detectedOperatorLabel: session.detectedOperatorLabel,
+        userId,
+        dryRun,
+      });
+      return;
+    }
+    await sendTelegramProductPage(transport, { page, userId, dryRun });
+    return;
+  }
+
   if (data.startsWith('CATBR_')) {
     const match = data.match(/^CATBR_(\d+)_(\d+)_(.+)$/);
     if (transport.answerCbQuery) await transport.answerCbQuery();
@@ -217,17 +385,33 @@ export async function dispatchTelegramCallback(
       const userId = input.userId || 'guest';
       const existingSession = getBotSession('TELEGRAM', userId, dryRun);
       const detectedDestination =
-        existingSession?.mode === 'BRAND_LIST' || existingSession?.mode === 'PRODUCT_LIST'
+        existingSession && 'detectedDestination' in existingSession
           ? existingSession.detectedDestination
           : undefined;
-      await sendTelegramProductPage(transport, {
-        page,
-        categoryId,
-        brand,
-        detectedDestination,
-        userId,
-        dryRun,
-      });
+      const detectedOperatorLabel =
+        existingSession && 'detectedOperatorLabel' in existingSession
+          ? existingSession.detectedOperatorLabel
+          : undefined;
+      if (page === 1) {
+        await enterTelegramBrandCatalog(transport, {
+          userId,
+          categoryId,
+          brand,
+          detectedDestination,
+          detectedOperatorLabel,
+          dryRun,
+        });
+      } else {
+        await sendTelegramProductPage(transport, {
+          page,
+          categoryId,
+          brand,
+          detectedDestination,
+          detectedOperatorLabel,
+          userId,
+          dryRun,
+        });
+      }
       return;
     }
   }
@@ -244,17 +428,33 @@ export async function dispatchTelegramCallback(
       const sessionBrand = existingSession?.mode === 'BRAND_LIST' ? existingSession.brands[brandIdx] : undefined;
       const brand = sessionBrand || listActiveBrandsInCategory(categoryId)[brandIdx]?.brand;
       const detectedDestination =
-        existingSession?.mode === 'BRAND_LIST' || existingSession?.mode === 'PRODUCT_LIST'
+        existingSession && 'detectedDestination' in existingSession
           ? existingSession.detectedDestination
           : undefined;
-      await sendTelegramProductPage(transport, {
-        page,
-        categoryId,
-        brand,
-        detectedDestination,
-        userId,
-        dryRun,
-      });
+      const detectedOperatorLabel =
+        existingSession && 'detectedOperatorLabel' in existingSession
+          ? existingSession.detectedOperatorLabel
+          : undefined;
+      if (page === 1) {
+        await enterTelegramBrandCatalog(transport, {
+          userId,
+          categoryId,
+          brand,
+          detectedDestination,
+          detectedOperatorLabel,
+          dryRun,
+        });
+      } else {
+        await sendTelegramProductPage(transport, {
+          page,
+          categoryId,
+          brand,
+          detectedDestination,
+          detectedOperatorLabel,
+          userId,
+          dryRun,
+        });
+      }
       return;
     }
   }

@@ -7,6 +7,7 @@ import {
   listCategories,
   getCategoryById,
   listActiveBrandsInCategory,
+  analyzeBrandCatalog,
   listProducts,
   getProductBySkuOrId,
 } from '../services/product.service';
@@ -15,6 +16,13 @@ import {
   matchBrandForDetectedOperator,
   isTelecomCategoryName,
 } from '../domain/operator-prefix';
+import {
+  DURATION_BUCKET_META,
+  durationBucketFromCode,
+  shouldShowDurationPicker,
+  shouldShowSeriesPicker,
+  type DurationBucket,
+} from '../domain/catalog-filter';
 import {
   resolveOrCreateCustomer,
   findCustomerByPlatform,
@@ -168,6 +176,12 @@ const WA_RESERVED_COMMANDS = new Set([
   'produk_hal',
   'produk_kat',
   'produk_brand',
+  'produk_filter',
+  'seri',
+  'durasi',
+  'kembali_seri',
+  'kembali_durasi',
+  'cari_scope',
   'pulsa',
   'cari_produk',
   'pilih',
@@ -395,6 +409,219 @@ function buildWhatsappBrandButtons(
   return buttonRows;
 }
 
+function buildWhatsappSeriesButtons(
+  categoryId: number,
+  brand: string,
+  seriesSummaries: Array<{ series: string; productCount: number }>,
+  totalInBrand: number
+): WhatsappQuickButton[][] {
+  const shown = seriesSummaries.slice(0, 14);
+  const buttonRows: WhatsappQuickButton[][] = [];
+  for (let i = 0; i < shown.length; i += 2) {
+    buttonRows.push(
+      shown.slice(i, i + 2).map((s, offset) => ({
+        text: `📦 ${i + offset + 1}. ${s.series} (${s.productCount})`,
+        replyText: `!seri ${i + offset}`,
+      }))
+    );
+  }
+  buttonRows.push([{ text: `📋 Semua Produk ${brand} (${totalInBrand})`, replyText: '!seri ALL' }]);
+  buttonRows.push([
+    { text: '🔍 Cari Produk', replyText: '!cari_scope' },
+    { text: '🔄 Ganti Operator / Brand', replyText: `!produk_kat ${categoryId} 1` },
+  ]);
+  buttonRows.push([
+    { text: '📂 Kategori Lain', replyText: '!kategori' },
+    { text: '🏠 Menu Utama', replyText: '!menu' },
+  ]);
+  return buttonRows;
+}
+
+function buildWhatsappDurationButtons(
+  categoryId: number,
+  durationSummaries: Array<{
+    code: string;
+    emoji: string;
+    label: string;
+    productCount: number;
+  }>,
+  totalFiltered: number,
+  hasSeriesStep: boolean
+): WhatsappQuickButton[][] {
+  const buttonRows: WhatsappQuickButton[][] = durationSummaries.map((d, idx) => [
+    {
+      text: `${d.emoji} ${idx + 1}. ${d.label} · ${d.productCount} paket`,
+      replyText: `!durasi ${d.code}`,
+    },
+  ]);
+  buttonRows.push([{ text: `📋 Semua Durasi (${totalFiltered})`, replyText: '!durasi ALL' }]);
+  const navRow: WhatsappQuickButton[] = [];
+  if (hasSeriesStep) {
+    navRow.push({ text: '🔙 Pilih Seri', replyText: '!kembali_seri' });
+  }
+  navRow.push({ text: '🔄 Ganti Operator', replyText: `!produk_kat ${categoryId} 1` });
+  buttonRows.push(navRow);
+  buttonRows.push([
+    { text: '🔍 Cari Produk', replyText: '!cari_scope' },
+    { text: '🏠 Menu Utama', replyText: '!menu' },
+  ]);
+  return buttonRows;
+}
+
+async function enterWhatsappSeriesCatalog(
+  sock: WhatsappReplyTransport,
+  jid: string,
+  params: {
+    categoryId: number;
+    categoryName?: string;
+    brand?: string;
+    series?: string;
+    hasSeriesStep?: boolean;
+    detectedDestination?: string;
+    detectedOperatorLabel?: string;
+  },
+  dryRun?: boolean
+) {
+  const catName = params.categoryName || getCategoryById(params.categoryId)?.name || 'Produk';
+  const analysis = analyzeBrandCatalog(params.categoryId, params.brand, params.series);
+  const hasSeriesStep = params.hasSeriesStep ?? shouldShowSeriesPicker(analysis.seriesSummaries);
+
+  if (shouldShowDurationPicker(analysis.durationSummaries, analysis.filteredCount) && params.brand) {
+    setBotSession(
+      'WHATSAPP',
+      jid,
+      {
+        mode: 'DURATION_LIST',
+        categoryId: params.categoryId,
+        categoryName: catName,
+        brand: params.brand,
+        series: params.series,
+        hasSeriesStep,
+        durationBuckets: analysis.durationSummaries.map((d) => d.bucket),
+        detectedDestination: params.detectedDestination,
+        detectedOperatorLabel: params.detectedOperatorLabel,
+        updatedAt: Date.now(),
+      },
+      dryRun
+    );
+
+    const scopeLabel = params.series ? `*${params.brand} · ${params.series}*` : `*${params.brand}*`;
+    const destHint = params.detectedDestination
+      ? `Nomor *${params.detectedDestination}* terdeteksi *${params.detectedOperatorLabel || params.brand}*\n`
+      : '';
+    const lines = analysis.durationSummaries
+      .map(
+        (d, idx) =>
+          `${idx + 1}. ${d.emoji} *${d.label}* (${d.productCount} paket, mulai Rp${d.minPrice.toLocaleString('id-ID')})`
+      )
+      .join('\n');
+
+    await sock.sendMessage(jid, {
+      text:
+        `${destHint}${scopeLabel} (${catName})\n\n` +
+        `Pilih durasi masa aktif paket agar lebih mudah dicari:\n${lines}\n\n` +
+        `Balas *!angka* (misal: *!1*) untuk memilih durasi, atau ketik *!kata_kunci* untuk mencari:`,
+      quickReplies: buildWhatsappDurationButtons(
+        params.categoryId,
+        analysis.durationSummaries,
+        analysis.filteredCount,
+        hasSeriesStep
+      ),
+    });
+    return;
+  }
+
+  await sendProductPage(
+    sock,
+    jid,
+    {
+      page: 1,
+      categoryId: params.categoryId,
+      categoryName: catName,
+      brand: params.brand,
+      series: params.series,
+      hasSeriesStep,
+      hasDurationStep: false,
+      detectedDestination: params.detectedDestination,
+      detectedOperatorLabel: params.detectedOperatorLabel,
+    },
+    dryRun
+  );
+}
+
+async function enterWhatsappBrandCatalog(
+  sock: WhatsappReplyTransport,
+  jid: string,
+  params: {
+    categoryId: number;
+    categoryName?: string;
+    brand?: string;
+    detectedDestination?: string;
+    detectedOperatorLabel?: string;
+  },
+  dryRun?: boolean
+) {
+  const catName = params.categoryName || getCategoryById(params.categoryId)?.name || 'Produk';
+  const analysis = analyzeBrandCatalog(params.categoryId, params.brand);
+
+  if (shouldShowSeriesPicker(analysis.seriesSummaries) && params.brand) {
+    const shown = analysis.seriesSummaries.slice(0, 14);
+    setBotSession(
+      'WHATSAPP',
+      jid,
+      {
+        mode: 'SERIES_LIST',
+        categoryId: params.categoryId,
+        categoryName: catName,
+        brand: params.brand,
+        seriesList: shown.map((s) => s.series),
+        detectedDestination: params.detectedDestination,
+        detectedOperatorLabel: params.detectedOperatorLabel,
+        updatedAt: Date.now(),
+      },
+      dryRun
+    );
+
+    const destHint = params.detectedDestination
+      ? `Nomor *${params.detectedDestination}* terdeteksi *${params.detectedOperatorLabel || params.brand}*\n`
+      : '';
+    const lines = shown
+      .map(
+        (s, idx) =>
+          `${idx + 1}. *${s.series}* (${s.productCount} paket, mulai Rp${s.minPrice.toLocaleString('id-ID')})`
+      )
+      .join('\n');
+
+    await sock.sendMessage(jid, {
+      text:
+        `${destHint}*${params.brand}* (${catName})\n\n` +
+        `Pilih seri / jenis paket yang ingin dicari:\n${lines}\n\n` +
+        `Balas *!angka* (misal: *!1*) untuk memilih seri, atau ketik *!kata_kunci* untuk mencari:`,
+      quickReplies: buildWhatsappSeriesButtons(
+        params.categoryId,
+        params.brand,
+        shown,
+        analysis.totalInBrand
+      ),
+    });
+    return;
+  }
+
+  await enterWhatsappSeriesCatalog(
+    sock,
+    jid,
+    {
+      categoryId: params.categoryId,
+      categoryName: catName,
+      brand: params.brand,
+      hasSeriesStep: false,
+      detectedDestination: params.detectedDestination,
+      detectedOperatorLabel: params.detectedOperatorLabel,
+    },
+    dryRun
+  );
+}
+
 async function sendCategoryBrandOrProducts(
   sock: WhatsappReplyTransport,
   jid: string,
@@ -405,10 +632,20 @@ async function sendCategoryBrandOrProducts(
   const brands = listActiveBrandsInCategory(categoryId);
 
   if (brands.length <= 1) {
-    await sendProductPage(
+    const existingSession = getBotSession('WHATSAPP', jid, dryRun);
+    const preservedDestination =
+      existingSession && 'detectedDestination' in existingSession
+        ? existingSession.detectedDestination
+        : undefined;
+    await enterWhatsappBrandCatalog(
       sock,
       jid,
-      { page: 1, categoryId, brand: brands[0]?.brand },
+      {
+        categoryId,
+        categoryName: cat?.name || 'Produk',
+        brand: brands[0]?.brand,
+        detectedDestination: preservedDestination,
+      },
       dryRun
     );
     return;
@@ -417,7 +654,7 @@ async function sendCategoryBrandOrProducts(
   const shown = brands.slice(0, 14);
   const existingSession = getBotSession('WHATSAPP', jid, dryRun);
   const preservedDestination =
-    existingSession?.mode === 'BRAND_LIST' || existingSession?.mode === 'PRODUCT_LIST'
+    existingSession && 'detectedDestination' in existingSession
       ? existingSession.detectedDestination
       : undefined;
 
@@ -456,7 +693,14 @@ async function sendCategoryBrandOrProducts(
 async function promptWhatsappSearch(
   sock: WhatsappReplyTransport,
   jid: string,
-  categoryId?: number,
+  params?: {
+    categoryId?: number;
+    brand?: string;
+    series?: string;
+    durationBucket?: DurationBucket | 'ALL';
+    detectedDestination?: string;
+    detectedOperatorLabel?: string;
+  },
   dryRun?: boolean
 ) {
   setBotSession(
@@ -464,14 +708,21 @@ async function promptWhatsappSearch(
     jid,
     {
       mode: 'AWAITING_SEARCH_QUERY',
-      categoryId,
+      categoryId: params?.categoryId,
+      brand: params?.brand,
+      series: params?.series,
+      durationBucket: params?.durationBucket,
+      detectedDestination: params?.detectedDestination,
+      detectedOperatorLabel: params?.detectedOperatorLabel,
       updatedAt: Date.now(),
     },
     dryRun
   );
+  const scopeParts = [params?.brand, params?.series].filter(Boolean);
+  const scopeDesc = scopeParts.length > 0 ? ` di *${scopeParts.join(' · ')}*` : '';
   await sock.sendMessage(jid, {
     text:
-      `Silakan ketik awalan *!* atau *.* diikuti kata kunci produk yang dicari (contoh: *!xl 10*, *!telkomsel*, *!ml 86*, *!pln 50*).`,
+      `Silakan ketik awalan *!* atau *.* diikuti kata kunci produk${scopeDesc} yang dicari (contoh: *!happy 12*, *!30 hari*, *!xl 10*, *!pln 50*).`,
     quickReplies: [
       [
         { text: '📂 Kategori Produk', replyText: '!kategori' },
@@ -487,8 +738,13 @@ async function sendProductPage(
   params: {
     page: number;
     categoryId?: number;
+    categoryName?: string;
     brand?: string;
+    series?: string;
+    durationBucket?: DurationBucket | 'ALL';
     search?: string;
+    hasSeriesStep?: boolean;
+    hasDurationStep?: boolean;
     detectedDestination?: string;
     detectedOperatorLabel?: string;
   },
@@ -499,28 +755,53 @@ async function sendProductPage(
     limit: 6,
     categoryId: params.categoryId,
     brand: params.brand,
+    series: params.series,
+    durationBucket: params.durationBucket,
     search: params.search,
     onlyActive: true,
     sortBy: 'PRICE_ASC',
   });
 
   if (res.items.length === 0) {
+    const emptyQuickReplies: WhatsappQuickButton[][] = [];
+    if (params.categoryId && params.brand) {
+      const row: WhatsappQuickButton[] = [];
+      if (params.hasDurationStep || (params.durationBucket && params.durationBucket !== 'ALL')) {
+        row.push({ text: '⏱️ Ganti Durasi', replyText: '!kembali_durasi' });
+      }
+      if (params.hasSeriesStep || params.series) {
+        row.push({ text: '🔙 Pilih Seri', replyText: '!kembali_seri' });
+      }
+      if (row.length > 0) emptyQuickReplies.push(row);
+    }
+    emptyQuickReplies.push([
+      { text: '🔍 Cari Produk', replyText: params.brand ? '!cari_scope' : '!cari_produk' },
+      { text: '📂 Lihat Kategori', replyText: '!kategori' },
+    ]);
+    emptyQuickReplies.push([
+      { text: '📦 Semua Produk', replyText: '!produk' },
+      { text: '🏠 Menu Utama', replyText: '!menu' },
+    ]);
+
     await sock.sendMessage(jid, {
       text: params.search
         ? `Maaf Kak, produk untuk kata kunci "${params.search}" belum ditemukan. Coba cari kata kunci lain atau lihat kategori.`
-        : 'Maaf Kak, belum ada produk aktif di daftar ini saat ini.',
-      quickReplies: [
-        [
-          { text: '🔍 Cari Produk', replyText: '!cari_produk' },
-          { text: '📂 Lihat Kategori', replyText: '!kategori' },
-        ],
-        [
-          { text: '📦 Semua Produk', replyText: '!produk' },
-          { text: '🏠 Menu Utama', replyText: '!menu' },
-        ],
-      ],
+        : 'Maaf Kak, belum ada produk aktif di filter ini saat ini.',
+      quickReplies: emptyQuickReplies,
     });
     return;
+  }
+
+  let hasSeriesStep = params.hasSeriesStep;
+  let hasDurationStep = params.hasDurationStep;
+  if (params.categoryId && params.brand && (hasSeriesStep === undefined || hasDurationStep === undefined)) {
+    const analysis = analyzeBrandCatalog(params.categoryId, params.brand, params.series);
+    if (hasSeriesStep === undefined) {
+      hasSeriesStep = shouldShowSeriesPicker(analysis.seriesSummaries);
+    }
+    if (hasDurationStep === undefined) {
+      hasDurationStep = shouldShowDurationPicker(analysis.durationSummaries, analysis.filteredCount);
+    }
   }
 
   setBotSession(
@@ -531,8 +812,15 @@ async function sendProductPage(
       skus: res.items.map((p) => p.sku),
       page: params.page,
       categoryId: params.categoryId,
+      categoryName: params.categoryName,
       brand: params.brand,
+      series: params.series,
+      durationBucket: params.durationBucket,
+      search: params.search,
+      hasSeriesStep,
+      hasDurationStep,
       detectedDestination: params.detectedDestination,
+      detectedOperatorLabel: params.detectedOperatorLabel,
       updatedAt: Date.now(),
     },
     dryRun
@@ -549,7 +837,14 @@ async function sendProductPage(
     },
   ]);
 
+  const hasExtraFilter = Boolean(
+    params.series || (params.durationBucket && params.durationBucket !== 'ALL') || params.search
+  );
+
   const makePageCmd = (targetPage: number) => {
+    if (hasExtraFilter) {
+      return `!produk_filter ${targetPage}`;
+    }
     if (params.categoryId && params.brand) {
       return `!produk_brand ${params.categoryId} ${targetPage} ${params.brand}`;
     }
@@ -575,9 +870,18 @@ async function sendProductPage(
   if (navRow.length > 0) buttonRows.push(navRow);
 
   if (params.categoryId && params.brand) {
+    const filterBackRow: WhatsappQuickButton[] = [];
+    if (hasDurationStep) {
+      filterBackRow.push({ text: '⏱️ Ganti Durasi', replyText: '!kembali_durasi' });
+    }
+    if (hasSeriesStep) {
+      filterBackRow.push({ text: '📂 Ganti Seri', replyText: '!kembali_seri' });
+    }
+    if (filterBackRow.length > 0) buttonRows.push(filterBackRow);
+
     buttonRows.push([
       { text: '🔄 Ganti Operator / Brand', replyText: `!produk_kat ${params.categoryId} 1` },
-      { text: '🔍 Cari Produk', replyText: '!cari_produk' },
+      { text: '🔍 Cari Produk', replyText: '!cari_scope' },
     ]);
     buttonRows.push([
       { text: '📂 Kategori Lain', replyText: '!kategori' },
@@ -591,20 +895,28 @@ async function sendProductPage(
     buttonRows.push([{ text: '🏠 Menu Utama', replyText: '!menu' }]);
   }
 
+  const filterLabels: string[] = [];
+  if (params.series) filterLabels.push(params.series);
+  if (params.durationBucket && params.durationBucket !== 'ALL') {
+    filterLabels.push(DURATION_BUCKET_META[params.durationBucket].shortLabel);
+  }
+  if (params.search) filterLabels.push(`"${params.search}"`);
+  const filterSuffix = filterLabels.length > 0 ? ` · ${filterLabels.join(' · ')}` : '';
+
   let headerText: string;
   if (params.detectedDestination) {
     headerText =
-      `*Nomor ${params.detectedDestination} Terdeteksi: ${params.brand || params.detectedOperatorLabel}* (Hal ${params.page}/${res.pagination.totalPages})\n` +
+      `*Nomor ${params.detectedDestination} Terdeteksi: ${params.brand || params.detectedOperatorLabel}*${filterSuffix} (Hal ${params.page}/${res.pagination.totalPages})\n` +
       `${lines.join('\n')}\n\n` +
       `Tap produk di bawah atau balas *!angka* (misal: *!1*) untuk langsung konfirmasi pesanan ya Kak!`;
   } else if (params.brand) {
     headerText =
-      `*Daftar ${params.brand}* (Hal ${params.page}/${res.pagination.totalPages})\n` +
+      `*Daftar ${params.brand}*${filterSuffix} (Hal ${params.page}/${res.pagination.totalPages})\n` +
       `${lines.join('\n')}\n\n` +
       `Tap tombol produk di bawah atau balas *!angka* (misal: *!1*) untuk memesan ya Kak!`;
   } else {
     headerText =
-      `*Daftar Produk (Hal ${params.page}/${res.pagination.totalPages})*\n` +
+      `*Daftar Produk${filterSuffix} (Hal ${params.page}/${res.pagination.totalPages})*\n` +
       `${lines.join('\n')}\n\n` +
       `Tap tombol produk di bawah atau balas *!angka* (misal: *!1*) untuk memesan ya Kak!`;
   }
@@ -1118,6 +1430,8 @@ export async function handleWhatsappCommand(
       ((activeSession?.mode === 'AWAITING_DESTINATION' ||
         activeSession?.mode === 'AWAITING_VOUCHER_CODE' ||
         activeSession?.mode === 'BRAND_LIST' ||
+        activeSession?.mode === 'SERIES_LIST' ||
+        activeSession?.mode === 'DURATION_LIST' ||
         activeSession?.mode === 'AWAITING_SEARCH_QUERY') &&
         !args[0]) ||
       withoutPrefix === '0'
@@ -1185,6 +1499,174 @@ export async function handleWhatsappCommand(
     return;
   }
 
+  if (cmd === 'cari_scope') {
+    const session = getBotSession('WHATSAPP', jid, dryRun);
+    await promptWhatsappSearch(
+      sock,
+      jid,
+      {
+        categoryId: session && 'categoryId' in session ? session.categoryId : undefined,
+        brand: session && 'brand' in session ? session.brand : undefined,
+        series: session && 'series' in session ? session.series : undefined,
+        durationBucket: session?.mode === 'PRODUCT_LIST' ? session.durationBucket : undefined,
+        detectedDestination:
+          session && 'detectedDestination' in session ? session.detectedDestination : undefined,
+        detectedOperatorLabel:
+          session && 'detectedOperatorLabel' in session ? session.detectedOperatorLabel : undefined,
+      },
+      dryRun
+    );
+    return;
+  }
+
+  if (cmd === 'seri') {
+    const session = getBotSession('WHATSAPP', jid, dryRun);
+    const arg = (args[0] || '').trim();
+    if (session && (session.mode === 'SERIES_LIST' || session.mode === 'DURATION_LIST')) {
+      if (arg.toUpperCase() === 'ALL') {
+        await enterWhatsappSeriesCatalog(
+          sock,
+          jid,
+          {
+            categoryId: session.categoryId,
+            categoryName: session.categoryName,
+            brand: session.brand,
+            series: undefined,
+            hasSeriesStep: true,
+            detectedDestination: session.detectedDestination,
+            detectedOperatorLabel: session.detectedOperatorLabel,
+          },
+          dryRun
+        );
+        return;
+      }
+      const idx = Number(arg);
+      if (session.mode === 'SERIES_LIST' && Number.isFinite(idx) && session.seriesList[idx]) {
+        await enterWhatsappSeriesCatalog(
+          sock,
+          jid,
+          {
+            categoryId: session.categoryId,
+            categoryName: session.categoryName,
+            brand: session.brand,
+            series: session.seriesList[idx],
+            hasSeriesStep: true,
+            detectedDestination: session.detectedDestination,
+            detectedOperatorLabel: session.detectedOperatorLabel,
+          },
+          dryRun
+        );
+        return;
+      }
+    }
+    await sendCategoryList(sock, jid, dryRun);
+    return;
+  }
+
+  if (cmd === 'durasi') {
+    const session = getBotSession('WHATSAPP', jid, dryRun);
+    const bucket = durationBucketFromCode(args[0]);
+    if (bucket && session?.mode === 'DURATION_LIST') {
+      await sendProductPage(
+        sock,
+        jid,
+        {
+          page: 1,
+          categoryId: session.categoryId,
+          categoryName: session.categoryName,
+          brand: session.brand,
+          series: session.series,
+          durationBucket: bucket,
+          hasSeriesStep: session.hasSeriesStep,
+          hasDurationStep: true,
+          detectedDestination: session.detectedDestination,
+          detectedOperatorLabel: session.detectedOperatorLabel,
+        },
+        dryRun
+      );
+      return;
+    }
+    await sendCategoryList(sock, jid, dryRun);
+    return;
+  }
+
+  if (cmd === 'kembali_seri') {
+    const session = getBotSession('WHATSAPP', jid, dryRun);
+    if (
+      session &&
+      (session.mode === 'DURATION_LIST' || session.mode === 'PRODUCT_LIST') &&
+      session.categoryId &&
+      session.brand
+    ) {
+      await enterWhatsappBrandCatalog(
+        sock,
+        jid,
+        {
+          categoryId: session.categoryId,
+          categoryName: session.categoryName,
+          brand: session.brand,
+          detectedDestination: session.detectedDestination,
+          detectedOperatorLabel: session.detectedOperatorLabel,
+        },
+        dryRun
+      );
+      return;
+    }
+    await sendCategoryList(sock, jid, dryRun);
+    return;
+  }
+
+  if (cmd === 'kembali_durasi') {
+    const session = getBotSession('WHATSAPP', jid, dryRun);
+    if (session?.mode === 'PRODUCT_LIST' && session.categoryId && session.brand) {
+      await enterWhatsappSeriesCatalog(
+        sock,
+        jid,
+        {
+          categoryId: session.categoryId,
+          categoryName: session.categoryName,
+          brand: session.brand,
+          series: session.series,
+          hasSeriesStep: session.hasSeriesStep,
+          detectedDestination: session.detectedDestination,
+          detectedOperatorLabel: session.detectedOperatorLabel,
+        },
+        dryRun
+      );
+      return;
+    }
+    await sendCategoryList(sock, jid, dryRun);
+    return;
+  }
+
+  if (cmd === 'produk_filter') {
+    const page = Math.max(1, Number(args[0]) || 1);
+    const session = getBotSession('WHATSAPP', jid, dryRun);
+    if (session?.mode === 'PRODUCT_LIST') {
+      await sendProductPage(
+        sock,
+        jid,
+        {
+          page,
+          categoryId: session.categoryId,
+          categoryName: session.categoryName,
+          brand: session.brand,
+          series: session.series,
+          durationBucket: session.durationBucket,
+          search: session.search,
+          hasSeriesStep: session.hasSeriesStep,
+          hasDurationStep: session.hasDurationStep,
+          detectedDestination: session.detectedDestination,
+          detectedOperatorLabel: session.detectedOperatorLabel,
+        },
+        dryRun
+      );
+      return;
+    }
+    await sendProductPage(sock, jid, { page }, dryRun);
+    return;
+  }
+
   if (cmd === 'pulsa') {
     const pulsaCat = listCategories(true).find((c) => /pulsa/i.test(c.name));
     if (pulsaCat) {
@@ -1195,12 +1677,12 @@ export async function handleWhatsappCommand(
           const brands = listActiveBrandsInCategory(pulsaCat.id).map((b) => b.brand);
           const matched = matchBrandForDetectedOperator(brands, detected);
           if (matched) {
-            await sendProductPage(
+            await enterWhatsappBrandCatalog(
               sock,
               jid,
               {
-                page: 1,
                 categoryId: pulsaCat.id,
+                categoryName: pulsaCat.name,
                 brand: matched,
                 detectedDestination: detected.normalizedPhone,
                 detectedOperatorLabel: detected.displayName,
@@ -1236,13 +1718,31 @@ export async function handleWhatsappCommand(
     const brand = args.slice(2).join(' ').trim() || undefined;
     const existingSession = getBotSession('WHATSAPP', jid, dryRun);
     const detectedDestination =
-      existingSession?.mode === 'BRAND_LIST' || existingSession?.mode === 'PRODUCT_LIST'
+      existingSession && 'detectedDestination' in existingSession
         ? existingSession.detectedDestination
         : undefined;
+    const detectedOperatorLabel =
+      existingSession && 'detectedOperatorLabel' in existingSession
+        ? existingSession.detectedOperatorLabel
+        : undefined;
+    if (categoryId && brand && page === 1) {
+      await enterWhatsappBrandCatalog(
+        sock,
+        jid,
+        {
+          categoryId,
+          brand,
+          detectedDestination,
+          detectedOperatorLabel,
+        },
+        dryRun
+      );
+      return;
+    }
     await sendProductPage(
       sock,
       jid,
-      { page, categoryId, brand, detectedDestination },
+      { page, categoryId, brand, detectedDestination, detectedOperatorLabel },
       dryRun
     );
     return;
@@ -1512,7 +2012,21 @@ export async function handleWhatsappCommand(
   }
 
   if (session?.mode === 'AWAITING_SEARCH_QUERY' && !WA_RESERVED_COMMANDS.has(cmd)) {
-    await sendProductPage(sock, jid, { page: 1, categoryId: session.categoryId, search: withoutPrefix }, dryRun);
+    await sendProductPage(
+      sock,
+      jid,
+      {
+        page: 1,
+        categoryId: session.categoryId,
+        brand: session.brand,
+        series: session.series,
+        durationBucket: session.durationBucket,
+        search: withoutPrefix,
+        detectedDestination: session.detectedDestination,
+        detectedOperatorLabel: session.detectedOperatorLabel,
+      },
+      dryRun
+    );
     return;
   }
 
@@ -1520,14 +2034,15 @@ export async function handleWhatsappCommand(
   if (session?.mode === 'BRAND_LIST' && !WA_RESERVED_COMMANDS.has(cmd)) {
     if (numericChoice !== null && numericChoice >= 1 && numericChoice <= session.brands.length) {
       const chosenBrand = session.brands[numericChoice - 1];
-      await sendProductPage(
+      await enterWhatsappBrandCatalog(
         sock,
         jid,
         {
-          page: 1,
           categoryId: session.categoryId,
+          categoryName: session.categoryName,
           brand: chosenBrand,
           detectedDestination: session.detectedDestination,
+          detectedOperatorLabel: session.detectedOperatorLabel,
         },
         dryRun
       );
@@ -1538,12 +2053,12 @@ export async function handleWhatsappCommand(
     if (detected) {
       const matchedBrand = matchBrandForDetectedOperator(session.brands, detected);
       if (matchedBrand) {
-        await sendProductPage(
+        await enterWhatsappBrandCatalog(
           sock,
           jid,
           {
-            page: 1,
             categoryId: session.categoryId,
+            categoryName: session.categoryName,
             brand: matchedBrand,
             detectedDestination: detected.normalizedPhone,
             detectedOperatorLabel: detected.displayName,
@@ -1576,7 +2091,136 @@ export async function handleWhatsappCommand(
     await sendProductPage(
       sock,
       jid,
-      { page: 1, categoryId: session.categoryId, search: withoutPrefix },
+      {
+        page: 1,
+        categoryId: session.categoryId,
+        search: withoutPrefix,
+        detectedDestination: session.detectedDestination,
+      },
+      dryRun
+    );
+    return;
+  }
+
+  if (session?.mode === 'SERIES_LIST' && !WA_RESERVED_COMMANDS.has(cmd)) {
+    if (numericChoice !== null && numericChoice >= 1 && numericChoice <= session.seriesList.length) {
+      const chosenSeries = session.seriesList[numericChoice - 1];
+      await enterWhatsappSeriesCatalog(
+        sock,
+        jid,
+        {
+          categoryId: session.categoryId,
+          categoryName: session.categoryName,
+          brand: session.brand,
+          series: chosenSeries,
+          hasSeriesStep: true,
+          detectedDestination: session.detectedDestination,
+          detectedOperatorLabel: session.detectedOperatorLabel,
+        },
+        dryRun
+      );
+      return;
+    }
+
+    const detected = detectOperatorFromPhone(withoutPrefix);
+    if (detected) {
+      const brands = listActiveBrandsInCategory(session.categoryId).map((b) => b.brand);
+      const matchedBrand = matchBrandForDetectedOperator(brands, detected);
+      if (matchedBrand) {
+        await enterWhatsappBrandCatalog(
+          sock,
+          jid,
+          {
+            categoryId: session.categoryId,
+            categoryName: session.categoryName,
+            brand: matchedBrand,
+            detectedDestination: detected.normalizedPhone,
+            detectedOperatorLabel: detected.displayName,
+          },
+          dryRun
+        );
+        return;
+      }
+    }
+
+    await sendProductPage(
+      sock,
+      jid,
+      {
+        page: 1,
+        categoryId: session.categoryId,
+        categoryName: session.categoryName,
+        brand: session.brand,
+        search: withoutPrefix,
+        detectedDestination: session.detectedDestination,
+        detectedOperatorLabel: session.detectedOperatorLabel,
+      },
+      dryRun
+    );
+    return;
+  }
+
+  if (session?.mode === 'DURATION_LIST' && !WA_RESERVED_COMMANDS.has(cmd)) {
+    if (
+      numericChoice !== null &&
+      numericChoice >= 1 &&
+      numericChoice <= session.durationBuckets.length
+    ) {
+      const chosenBucket = session.durationBuckets[numericChoice - 1];
+      await sendProductPage(
+        sock,
+        jid,
+        {
+          page: 1,
+          categoryId: session.categoryId,
+          categoryName: session.categoryName,
+          brand: session.brand,
+          series: session.series,
+          durationBucket: chosenBucket,
+          hasSeriesStep: session.hasSeriesStep,
+          hasDurationStep: true,
+          detectedDestination: session.detectedDestination,
+          detectedOperatorLabel: session.detectedOperatorLabel,
+        },
+        dryRun
+      );
+      return;
+    }
+
+    const detected = detectOperatorFromPhone(withoutPrefix);
+    if (detected) {
+      const brands = listActiveBrandsInCategory(session.categoryId).map((b) => b.brand);
+      const matchedBrand = matchBrandForDetectedOperator(brands, detected);
+      if (matchedBrand) {
+        await enterWhatsappBrandCatalog(
+          sock,
+          jid,
+          {
+            categoryId: session.categoryId,
+            categoryName: session.categoryName,
+            brand: matchedBrand,
+            detectedDestination: detected.normalizedPhone,
+            detectedOperatorLabel: detected.displayName,
+          },
+          dryRun
+        );
+        return;
+      }
+    }
+
+    await sendProductPage(
+      sock,
+      jid,
+      {
+        page: 1,
+        categoryId: session.categoryId,
+        categoryName: session.categoryName,
+        brand: session.brand,
+        series: session.series,
+        search: withoutPrefix,
+        detectedDestination: session.detectedDestination,
+        detectedOperatorLabel: session.detectedOperatorLabel,
+      },
       dryRun
     );
     return;

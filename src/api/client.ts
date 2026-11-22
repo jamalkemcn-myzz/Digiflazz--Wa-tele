@@ -280,54 +280,6 @@ export const api = {
         };
       };
     }>('/api/admin/settings/digiflazz-diagnostic', { method: 'POST' }),
-  fetchDigiflazzPascaPriceList: () =>
-    requestJson<{
-      ok: true;
-      data: {
-        checkedAt: string;
-        total: number;
-        items: Array<{
-          buyer_sku_code: string;
-          product_name: string;
-          category?: string;
-          brand?: string;
-          seller_name?: string;
-          admin?: number;
-          commission?: number;
-          buyer_product_status?: boolean;
-          seller_product_status?: boolean;
-          desc?: string;
-        }>;
-      };
-    }>('/api/admin/settings/digiflazz-pasca-pricelist', { method: 'POST' }),
-  testDigiflazzPascaInquiry: (payload: { sku: string; customerNo: string; testing?: boolean }) =>
-    requestJson<{
-      ok: true;
-      data: {
-        checkedAt: string;
-        result: {
-          ok: boolean;
-          refId: string;
-          httpStatus: number;
-          rc?: string;
-          rawStatus?: string;
-          message?: string;
-          customerName?: string;
-          customerNo?: string;
-          buyerSkuCode?: string;
-          price?: number;
-          admin?: number;
-          sellingPrice?: number;
-          sn?: string;
-          desc?: unknown;
-          rawBody?: unknown;
-          errorMessage?: string;
-        };
-      };
-    }>('/api/admin/settings/digiflazz-pasca-inquiry', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    }),
   setMaintenanceMode: (enabled: boolean, reason?: string) =>
     requestJson<{ ok: true; data: { maintenanceMode: boolean } }>('/api/admin/settings/maintenance', {
       method: 'PUT',

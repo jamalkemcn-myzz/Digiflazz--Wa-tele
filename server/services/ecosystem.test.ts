@@ -2691,81 +2691,228 @@ test('Telegram QRIS waiting status notice, direct IPv4 primary upload & 5s defau
   assert.ok(dismissIdx > sendQrisIdx);
 });
 
-test('DigiflazzClient postpaid pricelist (cmd: pasca) & inquiry probe (inq-pasca) return full desc and validate input', async () => {
-  const prevFetch = globalThis.fetch;
-  const captured: Array<{ url: string; body: Record<string, unknown> }> = [];
-  process.env.DIGIFLAZZ_USERNAME = 'testuser';
-  process.env.DIGIFLAZZ_API_KEY = 'prod-key-test';
-  refreshConfig(process.env);
+test('Hierarchical Brand -> Series -> Duration Filtering (Tri Happy/Combo/GetMore & Harian/Pekanan/Bulanan) on Telegram & WhatsApp', async () => {
+  const actor = { id: 'testowner', role: 'OWNER' as const };
+  const { createCategory } = await import('./product.service');
+  const {
+    extractProductSeries,
+    extractProductDurationDays,
+    classifyDurationBucket,
+  } = await import('../domain/catalog-filter');
 
-  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
-    const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
-    const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
-    captured.push({ url, body });
+  // 1. Unit checks for series & duration classification
+  assert.equal(extractProductSeries({ name: 'Tri Data Happy 3GB 3 Hari', type: 'Umum' }), 'Happy');
+  assert.equal(extractProductSeries({ name: 'Tri Data Combo 10GB 30 Hari', type: null }), 'Combo');
+  assert.equal(extractProductSeries({ name: 'Tri Paket GetMore 5GB 30 Hari', type: 'Data' }), 'GetMore');
+  assert.equal(extractProductSeries({ name: 'Tri Kuota AON 6GB 30H', type: '' }), 'AlwaysOn (AON)');
+  assert.equal(extractProductSeries({ name: 'Tri Paket Harian 1GB', type: 'Happy' }), 'Happy');
 
-    if (url.endsWith('/price-list')) {
-      return new Response(
-        JSON.stringify({
-          data: [
-            {
-              buyer_sku_code: 'post788098',
-              product_name: 'XL Axis Cuanku',
-              brand: 'XL Axis Cuanku',
-              seller_name: 'BAXIATAW',
-              admin: 500,
-              commission: 300,
-              buyer_product_status: true,
-              seller_product_status: true,
-            },
-          ],
-        }),
-        { status: 200, headers: { 'Content-Type': 'application/json' } }
-      );
+  assert.equal(extractProductDurationDays('Tri Data Happy 1GB 1 Hari'), 1);
+  assert.equal(extractProductDurationDays('Tri Data Happy 3GB 3 Hari'), 3);
+  assert.equal(extractProductDurationDays('Tri Data Happy 9GB 7 Hari'), 7);
+  assert.equal(extractProductDurationDays('Tri Data Happy 14GB 14Hr'), 14);
+  assert.equal(extractProductDurationDays('Tri Data Happy 30GB 28 Hari'), 28);
+  assert.equal(extractProductDurationDays('Tri Data Combo 10GB 1 Bulan'), 30);
+  assert.equal(extractProductDurationDays('Pulsa Tri 10.000'), null);
+
+  assert.equal(classifyDurationBucket('Tri Data Happy 1GB 1 Hari'), 'HARIAN');
+  assert.equal(classifyDurationBucket('Tri Data Happy 3GB 3 Hari'), 'HARIAN');
+  assert.equal(classifyDurationBucket('Tri Data Happy 9GB 7 Hari'), 'PEKANAN');
+  assert.equal(classifyDurationBucket('Tri Data Happy 30GB 28 Hari'), 'BULANAN');
+  assert.equal(classifyDurationBucket('Pulsa Tri 10.000'), 'LAINNYA');
+
+  // 2. Seed realistic Data category with TELKOMSEL & TRI (Happy 1d, 3d, 7d, 14d, 28d; Combo; GetMore)
+  const dataCat = createCategory({ name: 'Paket Data Seluler' }, actor);
+  upsertProduct(
+    { sku: 'TSEL_SS10', name: 'Telkomsel Super Seru 10GB 28 Hari', categoryId: dataCat.id, brand: 'TELKOMSEL', supplierPrice: 40000 },
+    actor
+  );
+  upsertProduct(
+    { sku: 'TRI_H1', name: 'Tri Data Happy 1.5GB 1 Hari', categoryId: dataCat.id, brand: 'TRI', type: 'Happy', supplierPrice: 4500 },
+    actor
+  );
+  upsertProduct(
+    { sku: 'TRI_H3', name: 'Tri Data Happy 3GB 3 Hari', categoryId: dataCat.id, brand: 'TRI', type: 'Happy', supplierPrice: 9000 },
+    actor
+  );
+  upsertProduct(
+    { sku: 'TRI_H7', name: 'Tri Data Happy 9GB 7 Hari', categoryId: dataCat.id, brand: 'TRI', type: 'Happy', supplierPrice: 19000 },
+    actor
+  );
+  upsertProduct(
+    { sku: 'TRI_H14', name: 'Tri Data Happy 14GB 14 Hari', categoryId: dataCat.id, brand: 'TRI', type: 'Happy', supplierPrice: 28000 },
+    actor
+  );
+  upsertProduct(
+    { sku: 'TRI_H28', name: 'Tri Data Happy 30GB 28 Hari', categoryId: dataCat.id, brand: 'TRI', type: 'Happy', supplierPrice: 52000 },
+    actor
+  );
+  upsertProduct(
+    { sku: 'TRI_C30', name: 'Tri Combo 12GB 30 Hari', categoryId: dataCat.id, brand: 'TRI', type: 'Umum', supplierPrice: 35000 },
+    actor
+  );
+  upsertProduct(
+    { sku: 'TRI_GM30', name: 'Tri GetMore 5GB 30 Hari', categoryId: dataCat.id, brand: 'TRI', type: 'Umum', supplierPrice: 24000 },
+    actor
+  );
+
+  // 3. Telegram Flow with Phone Auto-Detect (0896... -> TRI) -> Series -> Duration -> Product -> Confirm
+  const tgCat = await runBotDemoInteraction({
+    platform: 'TELEGRAM',
+    senderRole: 'CUSTOMER',
+    inputType: 'CALLBACK',
+    callbackData: `CAT_${dataCat.id}_1`,
+    senderId: '991122',
+    actor,
+  });
+  assert.match(tgCat.replies[0].text, /deteksi operator otomatis/i);
+
+  const tgAutoTri = await runBotDemoInteraction({
+    platform: 'TELEGRAM',
+    senderRole: 'CUSTOMER',
+    inputType: 'TEXT',
+    text: '089612345678',
+    senderId: '991122',
+    actor,
+  });
+  // Should land on SERIES_LIST showing Combo, GetMore, Happy
+  assert.match(tgAutoTri.replies[0].text, /Pilih seri \/ jenis paket/i);
+  assert.ok(tgAutoTri.replies[0].text.includes('089612345678'));
+  const tgSeriesBtns = (tgAutoTri.replies[0].buttons || []).flat();
+  tgSeriesBtns.forEach((b) => {
+    if (b.callbackData) {
+      assert.ok(Buffer.byteLength(b.callbackData, 'utf8') <= 64, `Callback too long: ${b.callbackData}`);
     }
+  });
+  const happyBtn = tgSeriesBtns.find((b) => b.text.includes('Happy'));
+  assert.ok(happyBtn?.callbackData?.startsWith('SELSER_'));
 
-    return new Response(
-      JSON.stringify({
-        data: {
-          ref_id: body.ref_id,
-          customer_no: body.customer_no,
-          customer_name: 'CUANKU TEST',
-          buyer_sku_code: body.buyer_sku_code,
-          admin: 500,
-          price: 15000,
-          selling_price: 15500,
-          status: 'Sukses',
-          rc: '00',
-          message: 'INQUIRY SUCCESS',
-          desc: { detail: [{ paket: 'Cuanku 10GB', harga: 15000 }] },
-        },
-      }),
-      { status: 200, headers: { 'Content-Type': 'application/json' } }
-    );
-  }) as typeof fetch;
+  // Tap Happy -> should show Duration Picker (Harian, Pekanan, Bulanan)
+  const tgHappyDurations = await runBotDemoInteraction({
+    platform: 'TELEGRAM',
+    senderRole: 'CUSTOMER',
+    inputType: 'CALLBACK',
+    callbackData: happyBtn!.callbackData!,
+    senderId: '991122',
+    actor,
+  });
+  assert.match(tgHappyDurations.replies[0].text, /Pilih durasi masa aktif/i);
+  const tgDurBtns = (tgHappyDurations.replies[0].buttons || []).flat();
+  assert.ok(tgDurBtns.some((b) => b.callbackData === 'SELDUR_H' && b.text.includes('Harian')));
+  assert.ok(tgDurBtns.some((b) => b.callbackData === 'SELDUR_P' && b.text.includes('Pekanan')));
+  assert.ok(tgDurBtns.some((b) => b.callbackData === 'SELDUR_B' && b.text.includes('Bulanan')));
 
-  try {
-    const client = new DigiflazzClient();
-    const listRes = await client.fetchPostpaidPriceList();
-    assert.equal(listRes.ok, true);
-    assert.equal(listRes.items.length, 1);
-    assert.equal(listRes.items[0].buyer_sku_code, 'post788098');
-    assert.equal(captured[0].body.cmd, 'pasca');
+  // Tap Harian -> should list ONLY TRI_H1 and TRI_H3, and include BACK_DUR & BACK_SERIES buttons
+  const tgHarianList = await runBotDemoInteraction({
+    platform: 'TELEGRAM',
+    senderRole: 'CUSTOMER',
+    inputType: 'CALLBACK',
+    callbackData: 'SELDUR_H',
+    senderId: '991122',
+    actor,
+  });
+  const harianText = tgHarianList.replies[0].text;
+  assert.ok(harianText.includes('Tri Data Happy 1.5GB 1 Hari'));
+  assert.ok(harianText.includes('Tri Data Happy 3GB 3 Hari'));
+  assert.equal(harianText.includes('Tri Data Happy 30GB 28 Hari'), false);
+  const harianBtns = (tgHarianList.replies[0].buttons || []).flat();
+  assert.ok(harianBtns.some((b) => b.callbackData === 'BACK_DUR'));
+  assert.ok(harianBtns.some((b) => b.callbackData === 'BACK_SERIES'));
 
-    const inqRes = await client.inquirePostpaidBill({
-      sku: 'post788098',
-      customerNo: '081712345678',
-      refId: 'INQ-TEST-1',
-    });
-    assert.equal(inqRes.ok, true);
-    assert.equal(inqRes.rc, '00');
-    assert.equal(inqRes.price, 15000);
-    assert.deepEqual(inqRes.desc, { detail: [{ paket: 'Cuanku 10GB', harga: 15000 }] });
-    assert.equal(captured[1].body.commands, 'inq-pasca');
-    assert.equal(captured[1].body.buyer_sku_code, 'post788098');
-    assert.equal(captured[1].body.customer_no, '081712345678');
-  } finally {
-    globalThis.fetch = prevFetch;
-  }
+  // Navigate back to Duration -> pick Bulanan -> then buy TRI_H28 skipping destination prompt!
+  const tgBackDur = await runBotDemoInteraction({
+    platform: 'TELEGRAM',
+    senderRole: 'CUSTOMER',
+    inputType: 'CALLBACK',
+    callbackData: 'BACK_DUR',
+    senderId: '991122',
+    actor,
+  });
+  assert.match(tgBackDur.replies[0].text, /Pilih durasi masa aktif/i);
+
+  const tgBulananList = await runBotDemoInteraction({
+    platform: 'TELEGRAM',
+    senderRole: 'CUSTOMER',
+    inputType: 'CALLBACK',
+    callbackData: 'SELDUR_B',
+    senderId: '991122',
+    actor,
+  });
+  assert.ok(tgBulananList.replies[0].text.includes('Tri Data Happy 30GB 28 Hari'));
+  assert.equal(tgBulananList.replies[0].text.includes('Tri Data Happy 1.5GB 1 Hari'), false);
+
+  const tgConfirmHappy = await runBotDemoInteraction({
+    platform: 'TELEGRAM',
+    senderRole: 'CUSTOMER',
+    inputType: 'CALLBACK',
+    callbackData: 'BUY_SKU_TRI_H28',
+    senderId: '991122',
+    actor,
+  });
+  assert.match(tgConfirmHappy.replies[0].text, /Konfirmasi Pesanan Anda/i);
+  assert.ok(tgConfirmHappy.replies[0].text.includes('089612345678'));
+  assert.ok(tgConfirmHappy.replies[0].text.includes('Tri Data Happy 30GB 28 Hari'));
+
+  // 4. WhatsApp Flow: Category -> !089612345678 -> Series -> Duration -> Product -> !1 Confirm
+  const waCat = await runBotDemoInteraction({
+    platform: 'WHATSAPP',
+    senderRole: 'CUSTOMER',
+    inputType: 'TEXT',
+    text: `!produk_kat ${dataCat.id} 1`,
+    senderId: '6289611122233',
+    actor,
+  });
+  assert.match(waCat.replies[0].text, /deteksi operator otomatis/i);
+
+  const waTriSeries = await runBotDemoInteraction({
+    platform: 'WHATSAPP',
+    senderRole: 'CUSTOMER',
+    inputType: 'TEXT',
+    text: '!089612345678',
+    senderId: '6289611122233',
+    actor,
+  });
+  assert.match(waTriSeries.replies[0].text, /Pilih seri \/ jenis paket/i);
+  const waSeriesButtons = (waTriSeries.replies[0].buttons || []).flat();
+  const waHappyBtn = waSeriesButtons.find((b) => b.text.includes('Happy'));
+  assert.ok(waHappyBtn?.replyText?.startsWith('!seri '));
+
+  // Click Happy quick button -> Duration List
+  const waHappyDur = await runBotDemoInteraction({
+    platform: 'WHATSAPP',
+    senderRole: 'CUSTOMER',
+    inputType: 'TEXT',
+    text: waHappyBtn!.replyText!,
+    senderId: '6289611122233',
+    actor,
+  });
+  assert.match(waHappyDur.replies[0].text, /Pilih durasi masa aktif/i);
+
+  // Reply !1 (Harian) -> Harian products
+  const waHarianList = await runBotDemoInteraction({
+    platform: 'WHATSAPP',
+    senderRole: 'CUSTOMER',
+    inputType: 'TEXT',
+    text: '!1',
+    senderId: '6289611122233',
+    actor,
+  });
+  assert.ok(waHarianList.replies[0].text.includes('Tri Data Happy 1.5GB 1 Hari'));
+  assert.ok(waHarianList.replies[0].text.includes('Tri Data Happy 3GB 3 Hari'));
+  assert.equal(waHarianList.replies[0].text.includes('Tri Data Happy 30GB 28 Hari'), false);
+
+  // Reply !1 (cheapest Harian: TRI_H1) -> straight to confirmation with 089612345678
+  const waConfirm = await runBotDemoInteraction({
+    platform: 'WHATSAPP',
+    senderRole: 'CUSTOMER',
+    inputType: 'TEXT',
+    text: '!1',
+    senderId: '6289611122233',
+    actor,
+  });
+  assert.match(waConfirm.replies[0].text, /Konfirmasi Pesanan Anda/i);
+  assert.ok(waConfirm.replies[0].text.includes('089612345678'));
+  assert.ok(waConfirm.replies[0].text.includes('Tri Data Happy 1.5GB 1 Hari'));
 });
 
 test.after(() => {

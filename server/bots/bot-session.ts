@@ -1,3 +1,5 @@
+import type { DurationBucket } from '../domain/catalog-filter';
+
 export type BotPlatformKey = 'WHATSAPP' | 'TELEGRAM';
 
 export type BotConversationState =
@@ -10,6 +12,29 @@ export type BotConversationState =
       categoryName: string;
       brands: string[];
       detectedDestination?: string;
+      detectedOperatorLabel?: string;
+      updatedAt: number;
+    }
+  | {
+      mode: 'SERIES_LIST';
+      categoryId: number;
+      categoryName: string;
+      brand: string;
+      seriesList: string[];
+      detectedDestination?: string;
+      detectedOperatorLabel?: string;
+      updatedAt: number;
+    }
+  | {
+      mode: 'DURATION_LIST';
+      categoryId: number;
+      categoryName: string;
+      brand: string;
+      series?: string;
+      hasSeriesStep: boolean;
+      durationBuckets: DurationBucket[];
+      detectedDestination?: string;
+      detectedOperatorLabel?: string;
       updatedAt: number;
     }
   | {
@@ -17,13 +42,25 @@ export type BotConversationState =
       skus: string[];
       page: number;
       categoryId?: number;
+      categoryName?: string;
       brand?: string;
+      series?: string;
+      durationBucket?: DurationBucket | 'ALL';
+      search?: string;
+      hasSeriesStep?: boolean;
+      hasDurationStep?: boolean;
       detectedDestination?: string;
+      detectedOperatorLabel?: string;
       updatedAt: number;
     }
   | {
       mode: 'AWAITING_SEARCH_QUERY';
       categoryId?: number;
+      brand?: string;
+      series?: string;
+      durationBucket?: DurationBucket | 'ALL';
+      detectedDestination?: string;
+      detectedOperatorLabel?: string;
       updatedAt: number;
     }
   | {

@@ -3,7 +3,6 @@ import { getDb } from '../../database/connection';
 import { config, getSafeConfigSummary, getDigiflazzEnvDiagnostic } from '../../config/env';
 import { requireDashboardAuth, requirePermission } from '../middleware/auth';
 import { adminRateLimiter } from '../middleware/rate-limit';
-import { maskDestination } from '../../domain/masking';
 import {
   getOverviewMetrics,
   listTransactions,
@@ -677,73 +676,6 @@ adminRouter.post('/settings/digiflazz-diagnostic', requirePermission('settings:r
     },
   });
 });
-
-adminRouter.post(
-  '/settings/digiflazz-pasca-pricelist',
-  requirePermission('settings:read'),
-  async (req: Request, res: Response) => {
-    const result = await digiflazzService.fetchPostpaidPriceList();
-    recordAuditLog({
-      actorId: req.admin!.username,
-      actorRole: req.admin!.role,
-      action: 'DIGIFLAZZ_PASCA_PRICELIST_PROBE',
-      targetType: 'DIGIFLAZZ',
-      details: { ok: result.ok, count: result.items.length },
-    });
-    res.status(result.ok ? 200 : 400).json({
-      ok: result.ok,
-      data: {
-        checkedAt: new Date().toISOString(),
-        total: result.items.length,
-        items: result.items,
-      },
-      error: result.errorMessage,
-    });
-  }
-);
-
-adminRouter.post(
-  '/settings/digiflazz-pasca-inquiry',
-  requirePermission('settings:read'),
-  async (req: Request, res: Response) => {
-    const sku = typeof req.body?.sku === 'string' ? req.body.sku.trim() : '';
-    const customerNo = typeof req.body?.customerNo === 'string' ? req.body.customerNo.trim() : '';
-    const testing = Boolean(req.body?.testing);
-
-    if (!sku || !customerNo) {
-      res.status(400).json({ ok: false, error: 'Kode SKU Pascabayar dan Nomor Tujuan / Kode Bayar wajib diisi.' });
-      return;
-    }
-
-    const result = await digiflazzService.inquirePostpaid({
-      sku,
-      customerNo,
-      testing,
-    });
-
-    recordAuditLog({
-      actorId: req.admin!.username,
-      actorRole: req.admin!.role,
-      action: 'DIGIFLAZZ_PASCA_INQUIRY_TEST',
-      targetType: 'DIGIFLAZZ',
-      details: {
-        sku,
-        customerNoMasked: maskDestination(customerNo),
-        ok: result.ok,
-        rc: result.rc || null,
-        rawStatus: result.rawStatus || null,
-      },
-    });
-
-    res.json({
-      ok: true,
-      data: {
-        checkedAt: new Date().toISOString(),
-        result,
-      },
-    });
-  }
-);
 
 adminRouter.put('/settings/maintenance', requirePermission('maintenance:toggle'), (req: Request, res: Response) => {
   const enabled = Boolean(req.body.enabled);

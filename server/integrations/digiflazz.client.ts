@@ -29,42 +29,9 @@ export interface DigiflazzTxResponse {
   errorMessage?: string;
 }
 
-export interface DigiflazzPostpaidPriceItem {
-  buyer_sku_code: string;
-  product_name: string;
-  category?: string;
-  brand?: string;
-  seller_name?: string;
-  admin?: number;
-  commission?: number;
-  buyer_product_status?: boolean;
-  seller_product_status?: boolean;
-  desc?: string;
-}
-
-export interface DigiflazzPostpaidInquiryResponse {
-  ok: boolean;
-  refId: string;
-  httpStatus: number;
-  rc?: string;
-  rawStatus?: string;
-  message?: string;
-  customerName?: string;
-  customerNo?: string;
-  buyerSkuCode?: string;
-  price?: number;
-  admin?: number;
-  sellingPrice?: number;
-  sn?: string;
-  desc?: unknown;
-  rawBody?: unknown;
-  errorMessage?: string;
-}
-
 export interface DigiflazzPort {
   isConfigured(): boolean;
   fetchPriceList(): Promise<{ ok: boolean; items: DigiflazzPriceItem[]; errorMessage?: string }>;
-  fetchPostpaidPriceList?(): Promise<{ ok: boolean; items: DigiflazzPostpaidPriceItem[]; errorMessage?: string }>;
   createTransaction(params: {
     sku: string;
     destination: string;
@@ -75,12 +42,6 @@ export interface DigiflazzPort {
     destination: string;
     refId: string;
   }): Promise<DigiflazzTxResponse>;
-  inquirePostpaidBill?(params: {
-    sku: string;
-    customerNo: string;
-    refId?: string;
-    testing?: boolean;
-  }): Promise<DigiflazzPostpaidInquiryResponse>;
   checkBalance(): Promise<{ ok: boolean; balance?: number; errorMessage?: string }>;
 }
 
@@ -373,142 +334,6 @@ export class DigiflazzClient implements DigiflazzPort {
       };
     } catch (err) {
       return { ok: false, errorMessage: err instanceof Error ? err.message : 'Cek saldo gagal' };
-    }
-  }
-
-  async fetchPostpaidPriceList(): Promise<{
-    ok: boolean;
-    items: DigiflazzPostpaidPriceItem[];
-    errorMessage?: string;
-  }> {
-    if (!this.isConfigured()) {
-      return {
-        ok: false,
-        items: [],
-        errorMessage: 'Kredensial Digiflazz (DIGIFLAZZ_USERNAME / DIGIFLAZZ_API_KEY) belum dikonfigurasi',
-      };
-    }
-
-    try {
-      const res = await this.postJsonRaw<{
-        message?: string;
-        data?: DigiflazzPostpaidPriceItem[] | { message?: string; rc?: string };
-      }>('/price-list', {
-        cmd: 'pasca',
-        username: config.digiflazz.username,
-        sign: this.sign('pricelist'),
-      });
-
-      if (!res.httpOk || !res.body || !Array.isArray(res.body.data)) {
-        const dataObj =
-          res.body?.data && !Array.isArray(res.body.data) ? res.body.data : undefined;
-        const msg = formatDigiflazzErrorMessage({
-          httpStatus: res.httpStatus,
-          rc: dataObj?.rc,
-          message: dataObj?.message || res.body?.message || res.rawText || 'Format respons price-list pascabayar Digiflazz tidak valid',
-        });
-        return { ok: false, items: [], errorMessage: msg };
-      }
-
-      return { ok: true, items: res.body.data };
-    } catch (err) {
-      return {
-        ok: false,
-        items: [],
-        errorMessage: err instanceof Error ? err.message : 'Gagal mengambil price list pascabayar Digiflazz',
-      };
-    }
-  }
-
-  async inquirePostpaidBill(params: {
-    sku: string;
-    customerNo: string;
-    refId?: string;
-    testing?: boolean;
-  }): Promise<DigiflazzPostpaidInquiryResponse> {
-    const refId =
-      (params.refId || '').trim() ||
-      `INQ-${Date.now()}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
-
-    if (!this.isConfigured()) {
-      return {
-        ok: false,
-        refId,
-        httpStatus: 0,
-        errorMessage: 'Kredensial Digiflazz belum dikonfigurasi',
-      };
-    }
-
-    try {
-      const payload: Record<string, unknown> = {
-        commands: 'inq-pasca',
-        username: config.digiflazz.username,
-        buyer_sku_code: params.sku.trim(),
-        customer_no: params.customerNo.trim(),
-        ref_id: refId,
-        sign: this.sign(refId),
-      };
-      if (params.testing) {
-        payload.testing = true;
-      }
-
-      const res = await this.postJsonRaw<{
-        message?: string;
-        rc?: string;
-        status?: string;
-        data?: {
-          ref_id?: string;
-          customer_no?: string;
-          customer_name?: string;
-          buyer_sku_code?: string;
-          admin?: number;
-          message?: string;
-          status?: string;
-          rc?: string;
-          sn?: string;
-          price?: number;
-          selling_price?: number;
-          desc?: unknown;
-        };
-      }>('/transaction', payload);
-
-      const d = res.body?.data && typeof res.body.data === 'object' ? res.body.data : undefined;
-      const rc = d?.rc ?? res.body?.rc;
-      const rawStatus = d?.status ?? res.body?.status;
-      const rawMessage = d?.message ?? res.body?.message ?? (!res.body ? res.rawText : undefined);
-      const mapped = mapDigiflazzStatus(rawStatus);
-      const ok = res.httpOk && (mapped === 'SUCCESS' || rc === '00');
-      const formattedErr = formatDigiflazzErrorMessage({
-        httpStatus: res.httpStatus,
-        rc,
-        message: rawMessage,
-      });
-
-      return {
-        ok,
-        refId: d?.ref_id || refId,
-        httpStatus: res.httpStatus,
-        rc,
-        rawStatus,
-        message: rawMessage,
-        customerName: d?.customer_name,
-        customerNo: d?.customer_no || params.customerNo.trim(),
-        buyerSkuCode: d?.buyer_sku_code || params.sku.trim(),
-        price: typeof d?.price === 'number' ? d.price : undefined,
-        admin: typeof d?.admin === 'number' ? d.admin : undefined,
-        sellingPrice: typeof d?.selling_price === 'number' ? d.selling_price : undefined,
-        sn: d?.sn ? String(d.sn) : undefined,
-        desc: d?.desc,
-        rawBody: res.body ?? res.rawText ?? null,
-        errorMessage: ok ? undefined : formattedErr,
-      };
-    } catch (err) {
-      return {
-        ok: false,
-        refId,
-        httpStatus: 0,
-        errorMessage: err instanceof Error ? err.message : 'Gagal menjalankan inq-pasca Digiflazz',
-      };
     }
   }
 }

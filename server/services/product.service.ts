@@ -1,5 +1,13 @@
 import { getDb, withTransaction } from '../database/connection';
 import { resolveEffectiveMargin, type MarginRule, type MarginType } from '../domain/pricing';
+import {
+  filterProductsBySeriesAndDuration,
+  summarizeDurations,
+  summarizeSeries,
+  type DurationBucket,
+  type DurationSummary,
+  type SeriesSummary,
+} from '../domain/catalog-filter';
 import { getSetting } from './settings.service';
 import { recordAuditLog } from './audit.service';
 
@@ -96,6 +104,59 @@ export function listActiveBrandsInCategory(categoryId: number): CategoryBrandSum
          brand ASC`
     )
     .all(categoryId) as CategoryBrandSummary[];
+}
+
+export function listActiveProductsForBrand(categoryId: number, brand?: string): ProductRow[] {
+  const db = getDb();
+  const where: string[] = ['p.category_id = ?', "p.status = 'ACTIVE'", 'p.is_available = 1'];
+  const args: unknown[] = [categoryId];
+
+  if (brand && brand.trim()) {
+    const cleanBrand = brand.trim();
+    if (cleanBrand.toUpperCase() === 'LAINNYA') {
+      where.push("(p.brand IS NULL OR TRIM(p.brand) = '')");
+    } else {
+      where.push('UPPER(TRIM(p.brand)) = UPPER(TRIM(?))');
+      args.push(cleanBrand);
+    }
+  }
+
+  return db
+    .prepare(
+      `SELECT p.*, c.name as category_name
+       FROM products p
+       LEFT JOIN categories c ON c.id = p.category_id
+       WHERE ${where.join(' AND ')}
+       ORDER BY p.selling_price ASC, p.name ASC`
+    )
+    .all(...args) as ProductRow[];
+}
+
+export interface BrandCatalogAnalysis {
+  totalInBrand: number;
+  filteredCount: number;
+  seriesSummaries: SeriesSummary[];
+  durationSummaries: DurationSummary[];
+}
+
+export function analyzeBrandCatalog(
+  categoryId: number,
+  brand?: string,
+  series?: string
+): BrandCatalogAnalysis {
+  const allInBrand = listActiveProductsForBrand(categoryId, brand);
+  const seriesSummaries = summarizeSeries(allInBrand);
+  const scoped =
+    series && series.trim() && series.trim().toUpperCase() !== 'ALL'
+      ? filterProductsBySeriesAndDuration(allInBrand, { series })
+      : allInBrand;
+  const durationSummaries = summarizeDurations(scoped);
+  return {
+    totalInBrand: allInBrand.length,
+    filteredCount: scoped.length,
+    seriesSummaries,
+    durationSummaries,
+  };
 }
 
 export function createCategory(
@@ -220,6 +281,8 @@ export function listProducts(params: {
   limit?: number;
   categoryId?: number;
   brand?: string;
+  series?: string;
+  durationBucket?: DurationBucket | 'ALL';
   search?: string;
   onlyActive?: boolean;
   sortBy?: 'NAME_ASC' | 'PRICE_ASC';
@@ -249,9 +312,9 @@ export function listProducts(params: {
     }
   }
   if (params.search) {
-    where.push('(p.sku LIKE ? OR p.name LIKE ? OR p.brand LIKE ?)');
+    where.push('(p.sku LIKE ? OR p.name LIKE ? OR p.brand LIKE ? OR p.type LIKE ?)');
     const q = `%${params.search}%`;
-    args.push(q, q, q);
+    args.push(q, q, q, q);
   }
 
   const orderBySql =
@@ -260,6 +323,37 @@ export function listProducts(params: {
       : 'ORDER BY p.name ASC';
 
   const whereSql = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
+  const hasDomainFilter =
+    Boolean(params.series && params.series.trim() && params.series.trim().toUpperCase() !== 'ALL') ||
+    Boolean(params.durationBucket && params.durationBucket !== 'ALL');
+
+  if (hasDomainFilter) {
+    const allRows = db
+      .prepare(
+        `SELECT p.*, c.name as category_name
+         FROM products p
+         LEFT JOIN categories c ON c.id = p.category_id
+         ${whereSql}
+         ${orderBySql}`
+      )
+      .all(...args) as ProductRow[];
+    const filtered = filterProductsBySeriesAndDuration(allRows, {
+      series: params.series,
+      durationBucket: params.durationBucket,
+    });
+    const total = filtered.length;
+    const items = filtered.slice(offset, offset + limit);
+    return {
+      items,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.max(1, Math.ceil(total / limit)),
+      },
+    };
+  }
+
   const total = (
     db.prepare(`SELECT COUNT(*) as cnt FROM products p ${whereSql}`).get(...args) as { cnt: number }
   ).cnt;
