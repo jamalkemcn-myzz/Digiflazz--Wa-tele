@@ -3214,7 +3214,9 @@ test('Digiflazz auto-sync description: populates desc on sync, shows after desti
   );
   assert.equal(prodAuto1.supplier_description, prodAuto1.description);
 
-  // 2. Telegram: tap product -> enter phone number -> description appears right after entering number
+  const { toTelegramHtml } = await import('../bots/telegram.command-handler');
+
+  // 2. Telegram: tap product -> description appears right on the phone number input form with special highlight/bold styling
   const tgSelect = await runBotDemoInteraction({
     platform: 'TELEGRAM',
     senderRole: 'CUSTOMER',
@@ -3224,6 +3226,12 @@ test('Digiflazz auto-sync description: populates desc on sync, shows after desti
     actor,
   });
   assert.match(tgSelect.replies[0].text, /nomor tujuan/i);
+  assert.ok(tgSelect.replies[0].text.includes('📌 *PERHATIAN — KETERANGAN PRODUK:*'));
+  assert.ok(tgSelect.replies[0].text.includes('┃ KHUSUS XL AXIS CUANKU'));
+  const tgSelectHtml = toTelegramHtml(tgSelect.replies[0].text);
+  assert.ok(tgSelectHtml.includes('<b>PERHATIAN — KETERANGAN PRODUK:</b>'));
+  assert.ok(tgSelectHtml.includes('<blockquote><b><i>KHUSUS XL AXIS CUANKU'));
+  assert.ok(tgSelectHtml.includes('- Berlaku nasional</i></b></blockquote>'));
 
   const tgAfterNum = await runBotDemoInteraction({
     platform: 'TELEGRAM',
@@ -3237,7 +3245,7 @@ test('Digiflazz auto-sync description: populates desc on sync, shows after desti
   assert.ok(tgAfterNum.replies[0].text.includes('Keterangan:\nKHUSUS XL AXIS CUANKU'));
   assert.ok(tgAfterNum.replies[0].text.includes('- Masa aktif 28 hari'));
 
-  // 3. WhatsApp: !pilih SKU -> enter phone number -> description appears right after entering number
+  // 3. WhatsApp: !pilih SKU -> description appears right on the phone number input form with bold+italic & special frame
   const waSelect = await runBotDemoInteraction({
     platform: 'WHATSAPP',
     senderRole: 'CUSTOMER',
@@ -3247,6 +3255,9 @@ test('Digiflazz auto-sync description: populates desc on sync, shows after desti
     actor,
   });
   assert.match(waSelect.replies[0].text, /nomor tujuan/i);
+  assert.ok(waSelect.replies[0].text.includes('📌 *PERHATIAN — KETERANGAN PRODUK:*'));
+  assert.ok(waSelect.replies[0].text.includes('┃ *_KHUSUS XL AXIS CUANKU_*'));
+  assert.ok(waSelect.replies[0].text.includes('┃ *_- Masa aktif 28 hari_*'));
 
   const waAfterNum = await runBotDemoInteraction({
     platform: 'WHATSAPP',

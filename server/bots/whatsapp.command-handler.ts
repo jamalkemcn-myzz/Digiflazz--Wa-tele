@@ -220,6 +220,30 @@ function formatWaProductButtonLabel(name: string, sellingPrice: number, num: num
   return `${num}. ${shortName} · Rp${sellingPrice.toLocaleString('id-ID')}`;
 }
 
+function formatWhatsappProductHighlightBlock(desc: string): string {
+  const lines = desc
+    .trim()
+    .split(/\r?\n/)
+    .map((line) => {
+      const trimmed = line.trimEnd();
+      if (!trimmed) return '┃';
+      if (!/[*_]|https?:\/\//i.test(trimmed)) {
+        return `┃ *_${trimmed}_*`;
+      }
+      const safeBold = trimmed.replace(/\*/g, '');
+      if (!/https?:\/\//i.test(safeBold) && safeBold) {
+        return `┃ *${safeBold}*`;
+      }
+      return `┃ ${trimmed}`;
+    });
+  return (
+    `📌 *PERHATIAN — KETERANGAN PRODUK:*\n` +
+    `┏━━━━━━━━━━━━━━━━━━━━━━\n` +
+    `${lines.join('\n')}\n` +
+    `┗━━━━━━━━━━━━━━━━━━━━━━`
+  );
+}
+
 async function sendMainMenu(
   sock: WhatsappReplyTransport,
   jid: string,
@@ -953,11 +977,15 @@ async function promptProductDestination(
     dryRun
   );
 
+  const rawDesc = product.description?.trim() || null;
+  const descBlock = rawDesc ? `${formatWhatsappProductHighlightBlock(rawDesc)}\n\n` : '';
+
   await sock.sendMessage(jid, {
     text:
       `Pilihan tepat! Anda memilih:\n` +
       `*${product.name}*\n` +
       `Harga: *Rp${product.selling_price.toLocaleString('id-ID')}*\n\n` +
+      descBlock +
       `Silakan ketik awalan *!* atau *.* diikuti *nomor tujuan / ID pelanggan* Anda sekarang (contoh: *!081234567890*, atau tambahkan kode kupon setelah spasi).`,
     quickReplies: [
       [

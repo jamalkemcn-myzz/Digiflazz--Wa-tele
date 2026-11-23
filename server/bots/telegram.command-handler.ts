@@ -237,7 +237,35 @@ export async function clearTrackedTelegramMessages(bot: Telegraf, chatId: string
 
 export function toTelegramHtml(raw: string): string {
   const escaped = raw.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  return escaped.replace(/\*([^\n*]+)\*/g, '<b>$1</b>');
+  const withCallouts = escaped.replace(
+    /┏━+\n([\s\S]*?)\n┗━+/g,
+    (_match, inner: string) => {
+      const body = inner
+        .split('\n')
+        .map((line) => line.replace(/^┃ ?/, ''))
+        .join('\n');
+      return `<blockquote><b><i>${body}</i></b></blockquote>`;
+    }
+  );
+  return withCallouts.replace(/(<blockquote[\s\S]*?<\/blockquote>)|\*([^\n*]+)\*/g, (_m, block, bold) =>
+    block ? block : `<b>${bold}</b>`
+  );
+}
+
+function formatTelegramProductHighlightBlock(desc: string): string {
+  const lines = desc
+    .trim()
+    .split(/\r?\n/)
+    .map((line) => {
+      const trimmed = line.trimEnd();
+      return trimmed ? `┃ ${trimmed}` : '┃';
+    });
+  return (
+    `📌 *PERHATIAN — KETERANGAN PRODUK:*\n` +
+    `┏━━━━━━━━━━━━━━━━━━━━━━\n` +
+    `${lines.join('\n')}\n` +
+    `┗━━━━━━━━━━━━━━━━━━━━━━`
+  );
 }
 
 function createTelegrafTransport(bot: Telegraf, ctx: Context): TelegramReplyTransport {
@@ -983,10 +1011,14 @@ export async function promptTelegramProductDestination(
     dryRun
   );
 
+  const rawDesc = product.description?.trim() || null;
+  const descBlock = rawDesc ? `${formatTelegramProductHighlightBlock(rawDesc)}\n\n` : '';
+
   await transport.reply(
     `Siap Kak! Anda memilih:\n` +
       `${product.name}\n` +
       `Harga: Rp${product.selling_price.toLocaleString('id-ID')}\n\n` +
+      descBlock +
       `Silakan kirimkan nomor tujuan / ID pelanggan Anda sekarang (contoh: 081234567890, atau tambahkan kode kupon setelah spasi).`,
     [
       [
