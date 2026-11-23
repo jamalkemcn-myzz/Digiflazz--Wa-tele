@@ -747,7 +747,7 @@ export function CatalogPage({ initialTab = 'products', permissions }: { initialT
                 <input
                   id="prod-description"
                   type="text"
-                  maxLength={500}
+                  maxLength={1000}
                   value={newProd.description}
                   onChange={(e) => setNewProd({ ...newProd, description: e.target.value })}
                   placeholder="Contoh: Proses cepat 1-5 menit. Kosongkan jika tidak perlu."

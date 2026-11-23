@@ -412,20 +412,19 @@ function buildWhatsappBrandButtons(
 function buildWhatsappSeriesButtons(
   categoryId: number,
   brand: string,
-  seriesSummaries: Array<{ series: string; productCount: number }>,
-  totalInBrand: number
+  seriesSummaries: Array<{ series: string; productCount: number }>
 ): WhatsappQuickButton[][] {
   const shown = seriesSummaries.slice(0, 14);
   const buttonRows: WhatsappQuickButton[][] = [];
   for (let i = 0; i < shown.length; i += 2) {
     buttonRows.push(
       shown.slice(i, i + 2).map((s, offset) => ({
-        text: `📦 ${i + offset + 1}. ${s.series} (${s.productCount})`,
+        text: `📦 ${i + offset + 1}. ${s.series}`,
         replyText: `!seri ${i + offset}`,
       }))
     );
   }
-  buttonRows.push([{ text: `📋 Semua Produk ${brand} (${totalInBrand})`, replyText: '!seri ALL' }]);
+  buttonRows.push([{ text: `📋 Semua Produk ${brand}`, replyText: '!seri ALL' }]);
   buttonRows.push([
     { text: '🔍 Cari Produk', replyText: '!cari_scope' },
     { text: '🔄 Ganti Operator / Brand', replyText: `!produk_kat ${categoryId} 1` },
@@ -588,7 +587,7 @@ async function enterWhatsappBrandCatalog(
     const lines = shown
       .map(
         (s, idx) =>
-          `${idx + 1}. *${s.series}* (${s.productCount} paket, mulai Rp${s.minPrice.toLocaleString('id-ID')})`
+          `${idx + 1}. *${s.series}* (mulai Rp${s.minPrice.toLocaleString('id-ID')})`
       )
       .join('\n');
 
@@ -600,8 +599,7 @@ async function enterWhatsappBrandCatalog(
       quickReplies: buildWhatsappSeriesButtons(
         params.categoryId,
         params.brand,
-        shown,
-        analysis.totalInBrand
+        shown
       ),
     });
     return;
@@ -1017,6 +1015,12 @@ async function promptWhatsappOrderConfirmation(
     params.dryRun
   );
 
+  const productDescLine = productDesc
+    ? productDesc.includes('\n')
+      ? `Keterangan:\n${productDesc}\n`
+      : `Keterangan: ${productDesc}\n`
+    : '';
+
   await sock.sendMessage(jid, {
     text:
       `*Konfirmasi Pesanan Anda*\n\n` +
@@ -1025,7 +1029,7 @@ async function promptWhatsappOrderConfirmation(
       `Harga: Rp${sellingPrice.toLocaleString('id-ID')}\n` +
       (p.coupon_code_snapshot ? `Kupon: ${p.coupon_code_snapshot} (-Rp${p.discount_snapshot.toLocaleString('id-ID')})\n` : '') +
       `Estimasi Total (+ Kode Unik): *Rp${p.payment_amount.toLocaleString('id-ID')}*\n` +
-      (productDesc ? `Keterangan: ${productDesc}\n` : '') +
+      productDescLine +
       (globalDesc ? `Catatan: ${globalDesc}\n` : '') +
       `\nBalas *!ya* untuk melanjutkan atau *!batal* untuk membatalkan:`,
     quickReplies: [

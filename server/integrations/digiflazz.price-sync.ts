@@ -17,6 +17,13 @@ function slugify(name: string): string {
     .replace(/^-+|-+$/g, '') || 'lainnya';
 }
 
+function normalizeSupplierDescription(raw?: string | null): string | null {
+  if (typeof raw !== 'string') return null;
+  const clean = raw.replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+  if (!clean) return null;
+  return clean.length > 1000 ? `${clean.slice(0, 997).trimEnd()}...` : clean;
+}
+
 export async function runDigiflazzPriceSync(
   client: DigiflazzPort = defaultDigiflazzClient,
   triggerSource: 'CRON' | 'MANUAL' = 'CRON'
@@ -103,14 +110,16 @@ export async function runDigiflazzPriceSync(
         `INSERT INTO categories (name, slug, margin_type, margin_value, status, created_at, updated_at)
          VALUES (?, ?, NULL, NULL, 'ACTIVE', ?, ?)`
       );
-      const findProduct = txDb.prepare('SELECT id, margin_type, margin_value, max_margin FROM products WHERE sku = ?');
+      const findProduct = txDb.prepare(
+        'SELECT id, description, supplier_description, margin_type, margin_value, max_margin FROM products WHERE sku = ?'
+      );
       const insertProduct = txDb.prepare(
-        `INSERT INTO products (sku, name, category_id, brand, type, supplier_price, selling_price, margin_type, margin_value, status, is_available, last_price_sync_at, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?)`
+        `INSERT INTO products (sku, name, description, supplier_description, category_id, brand, type, supplier_price, selling_price, margin_type, margin_value, status, is_available, last_price_sync_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?)`
       );
       const updateProduct = txDb.prepare(
         `UPDATE products
-         SET name = ?, category_id = ?, brand = ?, type = ?, supplier_price = ?, selling_price = ?, is_available = ?, last_price_sync_at = ?, updated_at = ?
+         SET name = ?, description = ?, supplier_description = ?, category_id = ?, brand = ?, type = ?, supplier_price = ?, selling_price = ?, is_available = ?, last_price_sync_at = ?, updated_at = ?
          WHERE id = ?`
       );
 
@@ -150,8 +159,17 @@ export async function runDigiflazzPriceSync(
           }
 
           const existing = findProduct.get(sku) as
-            | { id: number; margin_type: MarginType | null; margin_value: number | null; max_margin: number | null }
+            | {
+                id: number;
+                description: string | null;
+                supplier_description: string | null;
+                margin_type: MarginType | null;
+                margin_value: number | null;
+                max_margin: number | null;
+              }
             | undefined;
+
+          const digiDesc = normalizeSupplierDescription(item.desc);
 
           const productMargin: MarginRule | null =
             existing?.margin_type && existing.margin_value !== null
@@ -173,6 +191,8 @@ export async function runDigiflazzPriceSync(
             insertProduct.run(
               sku,
               item.product_name.trim(),
+              digiDesc,
+              digiDesc,
               catRow.id,
               item.brand || null,
               item.type || null,
@@ -185,9 +205,18 @@ export async function runDigiflazzPriceSync(
               now
             );
           } else {
+            // Auto-fill/update description from Digiflazz when empty or still synced from supplier; keep manual admin overrides intact
+            const existingDescTrimmed = (existing.description || '').trim();
+            const existingSupplierTrimmed = (existing.supplier_description || '').trim();
+            const isManualOverride =
+              Boolean(existingDescTrimmed) && existingDescTrimmed !== existingSupplierTrimmed;
+            const nextDescription = isManualOverride ? existing.description : digiDesc;
+
             // Never overwrite product-specific or category margin config during sync!
             updateProduct.run(
               item.product_name.trim(),
+              nextDescription,
+              digiDesc,
               catRow.id,
               item.brand || null,
               item.type || null,

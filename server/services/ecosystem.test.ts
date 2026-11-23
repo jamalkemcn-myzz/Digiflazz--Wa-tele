@@ -22,7 +22,7 @@ import { refreshConfig } from '../config/env';
 refreshConfig(process.env);
 import { getDb, closeDb } from '../database/connection';
 import { runMigrations, verifyDatabaseIntegrity } from '../database/migrate';
-import { upsertProduct, listCategories, listProducts, getGlobalMarginRule, deleteProductSafely } from './product.service';
+import { upsertProduct, listCategories, listProducts, getGlobalMarginRule, deleteProductSafely, updateProductDescription, getProductBySkuOrId } from './product.service';
 import { setGlobalMargin, setCategoryMargin, listMarginHistory } from './margin.service';
 import { createCoupon } from './coupon.service';
 import {
@@ -2775,16 +2775,21 @@ test('Hierarchical Brand -> Series -> Duration Filtering (Tri Happy/Combo/GetMor
     senderId: '991122',
     actor,
   });
-  // Should land on SERIES_LIST showing Combo, GetMore, Happy
+  // Should land on SERIES_LIST showing Combo, GetMore, Happy WITHOUT item counts
   assert.match(tgAutoTri.replies[0].text, /Pilih seri \/ jenis paket/i);
   assert.ok(tgAutoTri.replies[0].text.includes('089612345678'));
+  const tgSeriesSection = tgAutoTri.replies[0].text.split('Pilih seri / jenis paket')[1] || '';
+  assert.equal(/\d+\s+paket|\(\d+\)/i.test(tgSeriesSection), false);
   const tgSeriesBtns = (tgAutoTri.replies[0].buttons || []).flat();
   tgSeriesBtns.forEach((b) => {
     if (b.callbackData) {
       assert.ok(Buffer.byteLength(b.callbackData, 'utf8') <= 64, `Callback too long: ${b.callbackData}`);
     }
+    if (b.callbackData?.startsWith('SELSER_') || b.callbackData === 'SELALLSER') {
+      assert.equal(/\(\d+\)/.test(b.text), false, `Series button should not show count: ${b.text}`);
+    }
   });
-  const happyBtn = tgSeriesBtns.find((b) => b.text.includes('Happy'));
+  const happyBtn = tgSeriesBtns.find((b) => b.text === '📦 Happy');
   assert.ok(happyBtn?.callbackData?.startsWith('SELSER_'));
 
   // Tap Happy -> should show Duration Picker (Harian, Pekanan, Bulanan)
@@ -2873,8 +2878,15 @@ test('Hierarchical Brand -> Series -> Duration Filtering (Tri Happy/Combo/GetMor
     actor,
   });
   assert.match(waTriSeries.replies[0].text, /Pilih seri \/ jenis paket/i);
+  const waSeriesSection = waTriSeries.replies[0].text.split('Pilih seri / jenis paket')[1] || '';
+  assert.equal(/\d+\s+paket|\(\d+\)/i.test(waSeriesSection), false);
   const waSeriesButtons = (waTriSeries.replies[0].buttons || []).flat();
-  const waHappyBtn = waSeriesButtons.find((b) => b.text.includes('Happy'));
+  waSeriesButtons.forEach((b) => {
+    if (b.replyText?.startsWith('!seri')) {
+      assert.equal(/\(\d+\)/.test(b.text), false, `WA series button should not show count: ${b.text}`);
+    }
+  });
+  const waHappyBtn = waSeriesButtons.find((b) => b.text.includes('Happy') && !b.text.includes('('));
   assert.ok(waHappyBtn?.replyText?.startsWith('!seri '));
 
   // Click Happy quick button -> Duration List
@@ -3139,6 +3151,130 @@ test('Manual Digiflazz Retry (Tembak Ulang): strict FAILED-only guard, -R1/-R2 r
     await new Promise<void>((resolve) => apiServer.close(() => resolve()));
     await new Promise<void>((resolve) => mockDigiServer.close(() => resolve()));
   }
+});
+
+test('Digiflazz auto-sync description: populates desc on sync, shows after destination input, preserves admin overrides', async () => {
+  const actor = { id: 'owner-desc-test', role: 'OWNER' as const };
+  let currentDesc =
+    'KHUSUS XL AXIS CUANKU\r\n- Pastikan nomor aktif\n\n\n- Masa aktif 28 hari\n- Berlaku nasional';
+  let currentOverrideDesc = 'Deskripsi awal seller';
+
+  const mockDigiPort: DigiflazzPort = {
+    isConfigured() {
+      return true;
+    },
+    async fetchPriceList() {
+      return {
+        ok: true,
+        items: [
+          {
+            buyer_sku_code: 'DIGI_DESC_AUTO',
+            product_name: 'XL Xtra Combo 15GB 28 Hari',
+            category: 'Data',
+            brand: 'XL',
+            type: 'Umum',
+            price: 38000,
+            buyer_product_status: true,
+            seller_product_status: true,
+            desc: currentDesc,
+          },
+          {
+            buyer_sku_code: 'DIGI_DESC_MANUAL',
+            product_name: 'XL Paket Manual Override 5GB',
+            category: 'Data',
+            brand: 'XL',
+            type: 'Umum',
+            price: 22000,
+            buyer_product_status: true,
+            seller_product_status: true,
+            desc: currentOverrideDesc,
+          },
+        ],
+      };
+    },
+    async checkBalance() {
+      return { ok: true, balance: 1000000 };
+    },
+    async createTransaction() {
+      throw new Error('not used');
+    },
+    async inquireTransaction() {
+      throw new Error('not used');
+    },
+  };
+
+  // 1. First sync auto-populates description & supplier_description
+  const sync1 = await runDigiflazzPriceSync(mockDigiPort, 'MANUAL');
+  assert.equal(sync1.ok, true);
+  const prodAuto1 = getProductBySkuOrId('DIGI_DESC_AUTO');
+  assert.ok(prodAuto1);
+  assert.equal(
+    prodAuto1.description,
+    'KHUSUS XL AXIS CUANKU\n- Pastikan nomor aktif\n\n- Masa aktif 28 hari\n- Berlaku nasional'
+  );
+  assert.equal(prodAuto1.supplier_description, prodAuto1.description);
+
+  // 2. Telegram: tap product -> enter phone number -> description appears right after entering number
+  const tgSelect = await runBotDemoInteraction({
+    platform: 'TELEGRAM',
+    senderRole: 'CUSTOMER',
+    inputType: 'CALLBACK',
+    callbackData: 'BUY_SKU_DIGI_DESC_AUTO',
+    senderId: '774411',
+    actor,
+  });
+  assert.match(tgSelect.replies[0].text, /nomor tujuan/i);
+
+  const tgAfterNum = await runBotDemoInteraction({
+    platform: 'TELEGRAM',
+    senderRole: 'CUSTOMER',
+    inputType: 'TEXT',
+    text: '087812345678',
+    senderId: '774411',
+    actor,
+  });
+  assert.match(tgAfterNum.replies[0].text, /Konfirmasi Pesanan Anda/i);
+  assert.ok(tgAfterNum.replies[0].text.includes('Keterangan:\nKHUSUS XL AXIS CUANKU'));
+  assert.ok(tgAfterNum.replies[0].text.includes('- Masa aktif 28 hari'));
+
+  // 3. WhatsApp: !pilih SKU -> enter phone number -> description appears right after entering number
+  const waSelect = await runBotDemoInteraction({
+    platform: 'WHATSAPP',
+    senderRole: 'CUSTOMER',
+    inputType: 'TEXT',
+    text: '!pilih DIGI_DESC_AUTO',
+    senderId: '6287812345678',
+    actor,
+  });
+  assert.match(waSelect.replies[0].text, /nomor tujuan/i);
+
+  const waAfterNum = await runBotDemoInteraction({
+    platform: 'WHATSAPP',
+    senderRole: 'CUSTOMER',
+    inputType: 'TEXT',
+    text: '!087812345678',
+    senderId: '6287812345678',
+    actor,
+  });
+  assert.match(waAfterNum.replies[0].text, /Konfirmasi Pesanan Anda/i);
+  assert.ok(waAfterNum.replies[0].text.includes('Keterangan:\nKHUSUS XL AXIS CUANKU'));
+  assert.ok(waAfterNum.replies[0].text.includes('- Berlaku nasional'));
+
+  // 4. Admin edits DIGI_DESC_MANUAL manually; next Digiflazz sync updates DIGI_DESC_AUTO but preserves DIGI_DESC_MANUAL
+  updateProductDescription('DIGI_DESC_MANUAL', 'Catatan khusus admin toko', actor);
+  currentDesc = 'KHUSUS XL UPDATE V2 - Kuota Utama 15GB';
+  currentOverrideDesc = 'Deskripsi seller baru harus diabaikan oleh override admin';
+
+  const sync2 = await runDigiflazzPriceSync(mockDigiPort, 'MANUAL');
+  assert.equal(sync2.ok, true);
+
+  const prodAuto2 = getProductBySkuOrId('DIGI_DESC_AUTO');
+  assert.equal(prodAuto2?.description, 'KHUSUS XL UPDATE V2 - Kuota Utama 15GB');
+  assert.equal(prodAuto2?.supplier_description, 'KHUSUS XL UPDATE V2 - Kuota Utama 15GB');
+
+  const prodManual2 = getProductBySkuOrId('DIGI_DESC_MANUAL');
+  assert.equal(prodManual2?.description, 'Catatan khusus admin toko');
+  assert.equal(prodManual2?.supplier_description, 'Deskripsi seller baru harus diabaikan oleh override admin');
 });
 
 test.after(() => {

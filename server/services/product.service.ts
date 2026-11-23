@@ -28,6 +28,7 @@ export interface ProductRow {
   sku: string;
   name: string;
   description: string | null;
+  supplier_description?: string | null;
   category_id: number | null;
   category_name?: string | null;
   brand: string | null;
@@ -427,8 +428,8 @@ export function upsertProduct(
   const normalizedDescription = hasDescriptionField
     ? (input.description || '').trim() || null
     : undefined;
-  if (normalizedDescription && normalizedDescription.length > 500) {
-    throw new Error('Deskripsi produk maksimal 500 karakter');
+  if (normalizedDescription && normalizedDescription.length > 1000) {
+    throw new Error('Deskripsi produk maksimal 1000 karakter');
   }
 
   const db = getDb();
@@ -540,8 +541,8 @@ export function updateProductDescription(
   if (!existing) throw new Error(`Produk "${skuOrId}" tidak ditemukan`);
   const clean = (description || '').trim();
   const nextDesc = clean === '-' || !clean ? null : clean;
-  if (nextDesc && nextDesc.length > 500) {
-    throw new Error('Deskripsi produk maksimal 500 karakter');
+  if (nextDesc && nextDesc.length > 1000) {
+    throw new Error('Deskripsi produk maksimal 1000 karakter');
   }
   const now = new Date().toISOString();
   const updated = withTransaction((txDb) => {

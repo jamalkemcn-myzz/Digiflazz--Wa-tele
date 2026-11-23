@@ -13,6 +13,7 @@ export interface DigiflazzPriceItem {
   seller_product_status: boolean;
   unlimited_stock?: boolean;
   stock?: number;
+  desc?: string | null;
 }
 
 export type DigiflazzMappedStatus = 'SUCCESS' | 'PENDING' | 'FAILED' | 'UNKNOWN';

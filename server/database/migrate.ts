@@ -466,6 +466,16 @@ const MIGRATIONS: Migration[] = [
       ).run(now);
     },
   },
+  {
+    id: '005',
+    name: 'add_supplier_description',
+    up: (db) => {
+      const prodCols = (db.prepare('PRAGMA table_info(products)').all() as Array<{ name: string }>).map((c) => c.name);
+      if (!prodCols.includes('supplier_description')) {
+        db.exec('ALTER TABLE products ADD COLUMN supplier_description TEXT');
+      }
+    },
+  },
 ];
 
 export function runMigrations(customDb?: Database.Database): void {

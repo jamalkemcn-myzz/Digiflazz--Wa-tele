@@ -463,20 +463,19 @@ function buildBrandPickerButtons(
 function buildSeriesPickerButtons(
   categoryId: number,
   brand: string,
-  seriesSummaries: Array<{ series: string; productCount: number }>,
-  totalInBrand: number
+  seriesSummaries: Array<{ series: string; productCount: number }>
 ): TelegramInlineButton[][] {
   const shown = seriesSummaries.slice(0, 16);
   const buttons: TelegramInlineButton[][] = [];
   for (let i = 0; i < shown.length; i += 2) {
     buttons.push(
       shown.slice(i, i + 2).map((s, offset) => ({
-        text: `📦 ${s.series} (${s.productCount})`,
+        text: `📦 ${s.series}`,
         callbackData: `SELSER_${i + offset}`,
       }))
     );
   }
-  buttons.push([{ text: `📋 Semua Produk ${brand} (${totalInBrand})`, callbackData: 'SELALLSER' }]);
+  buttons.push([{ text: `📋 Semua Produk ${brand}`, callbackData: 'SELALLSER' }]);
   buttons.push([
     { text: '🔍 Cari Produk', callbackData: 'CARI_SCOPE' },
     { text: '🔄 Ganti Operator / Brand', callbackData: `CAT_${categoryId}_1` },
@@ -628,13 +627,13 @@ export async function enterTelegramBrandCatalog(
       ? `Nomor *${params.detectedDestination}* terdeteksi *${params.detectedOperatorLabel || params.brand}*\n`
       : '';
     const lines = shown.map(
-      (s) => `• *${s.series}* — ${s.productCount} paket (mulai Rp${s.minPrice.toLocaleString('id-ID')})`
+      (s) => `• *${s.series}* (mulai Rp${s.minPrice.toLocaleString('id-ID')})`
     );
 
     await transport.reply(
       `${destHint}*${params.brand}* (${catName})\n\n` +
         `Pilih seri / jenis paket yang ingin dicari:\n${lines.join('\n')}`,
-      buildSeriesPickerButtons(params.categoryId, params.brand, shown, analysis.totalInBrand)
+      buildSeriesPickerButtons(params.categoryId, params.brand, shown)
     );
     return;
   }
@@ -1051,6 +1050,12 @@ export async function promptTelegramOrderConfirmation(
     params.dryRun
   );
 
+  const productDescLine = productDesc
+    ? productDesc.includes('\n')
+      ? `Keterangan:\n${productDesc}\n`
+      : `Keterangan: ${productDesc}\n`
+    : '';
+
   await transport.reply(
     `Konfirmasi Pesanan Anda\n\n` +
       `Produk: ${p.product_name_snapshot}\n` +
@@ -1058,7 +1063,7 @@ export async function promptTelegramOrderConfirmation(
       `Harga: Rp${sellingPrice.toLocaleString('id-ID')}\n` +
       (p.coupon_code_snapshot ? `Kupon: ${p.coupon_code_snapshot} (-Rp${p.discount_snapshot.toLocaleString('id-ID')})\n` : '') +
       `Estimasi Total (+ Kode Unik): Rp${p.payment_amount.toLocaleString('id-ID')}\n` +
-      (productDesc ? `Keterangan: ${productDesc}\n` : '') +
+      productDescLine +
       (globalDesc ? `Catatan: ${globalDesc}\n` : '') +
       `\nApakah Anda yakin ingin membuat invoice QRIS sekarang?`,
     [
