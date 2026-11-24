@@ -98,10 +98,10 @@ export function formatVoucherPromptMessage(
   platform: 'WHATSAPP' | 'TELEGRAM',
   activeVoucher?: string | null
 ): string {
-  const exampleCmd = platform === 'WHATSAPP' ? '!voucher KODEPROMO' : '/voucher KODEPROMO';
+  const exampleCmd = platform === 'WHATSAPP' ? 'voucher KODEPROMO' : '/voucher KODEPROMO';
   const inputHint =
     platform === 'WHATSAPP'
-      ? `Balas dengan awalan *!* atau *.* diikuti kode voucher (contoh: *!KODEPROMO* atau *${exampleCmd}*).`
+      ? `Balas dengan *kode voucher* Anda sekarang (contoh: *KODEPROMO* atau *${exampleCmd}*).`
       : `Kirimkan *kode voucher* Anda sekarang (contoh: KODEPROMO atau ${exampleCmd}).`;
 
   return (

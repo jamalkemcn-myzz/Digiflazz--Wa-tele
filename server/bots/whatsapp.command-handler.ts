@@ -269,14 +269,14 @@ async function sendMainMenu(
         userId: summary.userId,
         isAdmin,
       })}\n\n` +
-      `*Menu Utama (Prefix ! / .):*\n` +
-      `• *!kategori* — Kategori Produk\n` +
-      `• *!produk* — Daftar Produk\n` +
-      `• *!profil* — Profil & Saldo\n` +
-      `• *!voucher* — Redeem Voucher\n` +
-      `• *!riwayat* — Riwayat Transaksi\n` +
-      `• *!kontak* — Hubungi Admin\n\n` +
-      `_Gunakan awalan *!* atau *.* untuk setiap perintah (misal: !menu, !profil)._`,
+      `*Menu Utama:*\n` +
+      `• *kategori* — Kategori Produk\n` +
+      `• *produk* — Daftar Produk\n` +
+      `• *profil* — Profil & Saldo\n` +
+      `• *voucher* — Redeem Voucher\n` +
+      `• *riwayat* — Riwayat Transaksi\n` +
+      `• *kontak* — Hubungi Admin\n\n` +
+      `_Ketik langsung perintah di atas atau tap tombol menu (awalan ! / . bersifat opsional)._`,
     quickReplies: MAIN_MENU_BUTTONS,
   });
 }
@@ -406,7 +406,7 @@ async function sendCategoryList(sock: WhatsappReplyTransport, jid: string, dryRu
     text:
       `*Kategori Produk Aktif*\n` +
       `${lines}\n\n` +
-      `Pilih tombol kategori atau balas dengan *!angka* kategori (misal: *!1*) ya Kak.`,
+      `Pilih tombol kategori atau balas dengan *angka* kategori (misal: *1*) ya Kak.`,
     quickReplies: buttonRows,
   });
 }
@@ -543,7 +543,7 @@ async function enterWhatsappSeriesCatalog(
       text:
         `${destHint}${scopeLabel} (${catName})\n\n` +
         `Pilih durasi masa aktif paket agar lebih mudah dicari:\n${lines}\n\n` +
-        `Balas *!angka* (misal: *!1*) untuk memilih durasi, atau ketik *!kata_kunci* untuk mencari:`,
+        `Balas *angka* (misal: *1*) untuk memilih durasi, atau ketik *kata kunci* untuk mencari:`,
       quickReplies: buildWhatsappDurationButtons(
         params.categoryId,
         analysis.durationSummaries,
@@ -619,7 +619,7 @@ async function enterWhatsappBrandCatalog(
       text:
         `${destHint}*${params.brand}* (${catName})\n\n` +
         `Pilih seri / jenis paket yang ingin dicari:\n${lines}\n\n` +
-        `Balas *!angka* (misal: *!1*) untuk memilih seri, atau ketik *!kata_kunci* untuk mencari:`,
+        `Balas *angka* (misal: *1*) untuk memilih seri, atau ketik *kata kunci* untuk mencari:`,
       quickReplies: buildWhatsappSeriesButtons(
         params.categoryId,
         params.brand,
@@ -700,8 +700,8 @@ async function sendCategoryBrandOrProducts(
 
   const isTelecom = isTelecomCategoryName(cat?.name);
   const promptHint = isTelecom
-    ? `Kirim *!nomor_hp* untuk deteksi operator otomatis (contoh: *!081812345678*), atau balas *!angka* untuk memilih operator:`
-    : `Balas *!angka* (misal: *!1*) untuk melihat daftar produk brand tersebut:`;
+    ? `Kirim *nomor HP* untuk deteksi operator otomatis (contoh: *081812345678*), atau balas *angka* untuk memilih operator:`
+    : `Balas *angka* (misal: *1*) untuk melihat daftar produk brand tersebut:`;
 
   await sock.sendMessage(jid, {
     text:
@@ -744,7 +744,7 @@ async function promptWhatsappSearch(
   const scopeDesc = scopeParts.length > 0 ? ` di *${scopeParts.join(' · ')}*` : '';
   await sock.sendMessage(jid, {
     text:
-      `Silakan ketik awalan *!* atau *.* diikuti kata kunci produk${scopeDesc} yang dicari (contoh: *!happy 12*, *!30 hari*, *!xl 10*, *!pln 50*).`,
+      `Silakan ketik kata kunci produk${scopeDesc} yang dicari (contoh: *happy 12*, *30 hari*, *xl 10*, *pln 50*).`,
     quickReplies: [
       [
         { text: '📂 Kategori Produk', replyText: '!kategori' },
@@ -930,17 +930,17 @@ async function sendProductPage(
     headerText =
       `*Nomor ${params.detectedDestination} Terdeteksi: ${params.brand || params.detectedOperatorLabel}*${filterSuffix} (Hal ${params.page}/${res.pagination.totalPages})\n` +
       `${lines.join('\n')}\n\n` +
-      `Tap produk di bawah atau balas *!angka* (misal: *!1*) untuk langsung konfirmasi pesanan ya Kak!`;
+      `Tap produk di bawah atau balas *angka* (misal: *1*) untuk langsung konfirmasi pesanan ya Kak!`;
   } else if (params.brand) {
     headerText =
       `*Daftar ${params.brand}*${filterSuffix} (Hal ${params.page}/${res.pagination.totalPages})\n` +
       `${lines.join('\n')}\n\n` +
-      `Tap tombol produk di bawah atau balas *!angka* (misal: *!1*) untuk memesan ya Kak!`;
+      `Tap tombol produk di bawah atau balas *angka* (misal: *1*) untuk memesan ya Kak!`;
   } else {
     headerText =
       `*Daftar Produk${filterSuffix} (Hal ${params.page}/${res.pagination.totalPages})*\n` +
       `${lines.join('\n')}\n\n` +
-      `Tap tombol produk di bawah atau balas *!angka* (misal: *!1*) untuk memesan ya Kak!`;
+      `Tap tombol produk di bawah atau balas *angka* (misal: *1*) untuk memesan ya Kak!`;
   }
 
   await sock.sendMessage(jid, {
@@ -986,7 +986,7 @@ async function promptProductDestination(
       `*${product.name}*\n` +
       `Harga: *Rp${product.selling_price.toLocaleString('id-ID')}*\n\n` +
       descBlock +
-      `Silakan ketik awalan *!* atau *.* diikuti *nomor tujuan / ID pelanggan* Anda sekarang (contoh: *!081234567890*, atau tambahkan kode kupon setelah spasi).`,
+      `Silakan kirimkan *nomor tujuan / ID pelanggan* Anda sekarang (contoh: *081234567890*, atau tambahkan kode kupon setelah spasi).`,
     quickReplies: [
       [
         { text: '🛒 Pilih Produk Lain', replyText: '!produk' },
@@ -1059,7 +1059,7 @@ async function promptWhatsappOrderConfirmation(
       `Estimasi Total (+ Kode Unik): *Rp${p.payment_amount.toLocaleString('id-ID')}*\n` +
       productDescLine +
       (globalDesc ? `Catatan: ${globalDesc}\n` : '') +
-      `\nBalas *!ya* untuk melanjutkan atau *!batal* untuk membatalkan:`,
+      `\nBalas *ya* untuk melanjutkan atau *batal* untuk membatalkan:`,
     quickReplies: [
       [
         { text: '✅ Ya, Buat QRIS', replyText: '!ya' },
@@ -1281,11 +1281,6 @@ export async function handleWhatsappCommand(
   const trimmed = text.trim();
   if (!trimmed) return;
 
-  // Rule: mandatory prefix (! or .). Messages without prefix are silently ignored.
-  if (!trimmed.startsWith('!') && !trimmed.startsWith('.')) {
-    return;
-  }
-
   const dryRun = Boolean(options?.dryRun);
   const now = options?.now ?? Date.now();
   // Rule: 3-second per-user cooldown. Ignore repeat messages within 3s.
@@ -1293,7 +1288,9 @@ export async function handleWhatsappCommand(
     return;
   }
 
-  const withoutPrefix = trimmed.slice(1).trim();
+  // Optional prefix (!, ., or /) is still supported, while plain text without prefix works directly
+  const hasPrefix = trimmed.startsWith('!') || trimmed.startsWith('.') || trimmed.startsWith('/');
+  const withoutPrefix = hasPrefix ? trimmed.slice(1).trim() : trimmed;
   if (!withoutPrefix) return;
 
   const parts = withoutPrefix.split(/\s+/);
@@ -1334,10 +1331,10 @@ export async function handleWhatsappCommand(
         text:
           `*Panel Admin WhatsApp (${admin.role})*\n` +
           `Halo Admin, pilih menu pengelolaan cepat di bawah ini:\n\n` +
-          `• !transaksi [halaman] — Ringkasan & riwayat transaksi\n` +
-          `• !cari <TRX_ID> — Detail transaksi\n` +
-          `• !statusbot — Status layanan & scheduler\n` +
-          `• !maintenance on|off — Ubah maintenance mode`,
+          `• transaksi [halaman] — Ringkasan & riwayat transaksi\n` +
+          `• cari <TRX_ID> — Detail transaksi\n` +
+          `• statusbot — Status layanan & scheduler\n` +
+          `• maintenance on|off — Ubah maintenance mode`,
         quickReplies: adminMenuButtons,
       });
       return;
@@ -1506,11 +1503,11 @@ export async function handleWhatsappCommand(
     await sock.sendMessage(jid, {
       text:
         `*Panduan Belanja Praktis*\n` +
-        `1. Tap tombol *Daftar Produk* atau *Kategori Produk* (lalu pilih operator / kirim *!nomor_hp* untuk deteksi otomatis).\n` +
-        `2. Pilih produk yang Anda inginkan, kirim *!nomor_tujuan*, lalu konfirmasi (*!ya*/* !batal*).\n` +
+        `1. Tap tombol *Daftar Produk* atau *Kategori Produk* (lalu pilih operator / kirim *nomor HP* untuk deteksi otomatis).\n` +
+        `2. Pilih produk yang Anda inginkan, kirim *nomor tujuan*, lalu konfirmasi (*ya* / *batal*).\n` +
         `3. Scan QRIS atau buka Link Pembayaran sesuai nominal tepat sebelum batas waktu.\n` +
-        `4. Ketik *!batal* untuk membatalkan pesanan PENDING (minimal 30 detik setelah dibuat).\n\n` +
-        `Bisa juga ketik langsung: \`!order <SKU> <TUJUAN> [KUPON]\` bila sudah hafal kode SKU.`,
+        `4. Ketik *batal* untuk membatalkan pesanan PENDING (minimal 30 detik setelah dibuat).\n\n` +
+        `Bisa juga ketik langsung: \`order <SKU> <TUJUAN> [KUPON]\` bila sudah hafal kode SKU.`,
       quickReplies: MAIN_MENU_BUTTONS,
     });
     return;
@@ -1827,7 +1824,7 @@ export async function handleWhatsappCommand(
       await sock.sendMessage(jid, {
         text:
           `Supaya lebih praktis, Kakak bisa tap tombol *Daftar Produk* lalu pilih produk tanpa mengetik format manual.\n` +
-          `Atau ketik: *!order <SKU> <TUJUAN> [KODE_KUPON]*`,
+          `Atau ketik: *order <SKU> <TUJUAN> [KODE_KUPON]*`,
         quickReplies: NAV_BACK_BUTTONS,
       });
       return;

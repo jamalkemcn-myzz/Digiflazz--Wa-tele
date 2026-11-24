@@ -618,7 +618,7 @@ test('Bot Demo Simulator: simulates WhatsApp & Telegram replies, inline callback
   assert.match(waMenu.replies[0].text, /Selamat datang di/i);
   assert.ok(waMenu.replies[0].buttons && waMenu.replies[0].buttons.length === 3);
 
-  // Input without prefix must be silently ignored on WhatsApp
+  // Unprefixed greeting ("halo apakabar") opens Main Menu on WhatsApp without requiring ! or . prefix
   const waNoPrefix = await runBotDemoInteraction({
     platform: 'WHATSAPP',
     senderRole: 'CUSTOMER',
@@ -626,14 +626,15 @@ test('Bot Demo Simulator: simulates WhatsApp & Telegram replies, inline callback
     text: 'halo apakabar',
     actor: { id: 'testowner', role: 'OWNER' },
   });
-  assert.equal(waNoPrefix.replies.length, 0);
+  assert.equal(waNoPrefix.replies.length, 1);
+  assert.match(waNoPrefix.replies[0].text, /Selamat datang di/i);
 
-  // Unknown prefixed command returns warm message + clickable menu buttons
+  // Unknown command (without prefix) returns warm message + clickable menu buttons
   const waUnknown = await runBotDemoInteraction({
     platform: 'WHATSAPP',
     senderRole: 'CUSTOMER',
     inputType: 'TEXT',
-    text: '!tidakada',
+    text: 'tidakada',
     actor: { id: 'testowner', role: 'OWNER' },
   });
   assert.ok(waUnknown.replies[0].buttons && waUnknown.replies[0].buttons.length >= 2);
@@ -1634,7 +1635,7 @@ test('PulsaSync Bot Revision: SHOP_NAME env, /start greeting & buttons, /profil 
   assert.match(profMsg, /Tier:\s*(Bronze|Silver|Gold|Platinum)/);
   assert.match(profMsg, /Total Belanja:\s*Rp\s*[\d.]+/);
 
-  // WhatsApp ignores messages without ! or . prefix completely
+  // WhatsApp responds directly WITHOUT requiring ! or . prefix, while still supporting optional prefix and 3s cooldown
   const waSent: Array<{ text: string; buttons?: Array<Array<{ text: string; replyText: string }>> }> = [];
   const waTransport = {
     async sendMessage(_jid: string, content: { text?: string; caption?: string; quickReplies?: Array<Array<{ text: string; replyText: string }>> }) {
@@ -1646,13 +1647,8 @@ test('PulsaSync Bot Revision: SHOP_NAME env, /start greeting & buttons, /profil 
     },
   };
 
+  // Unprefixed 'start' works immediately and renders exact greeting, SHOP_NAME, and 6 buttons
   await handleWhatsappCommand(waTransport, '628777000111', 'start', 'Andi WA', { now: 10_000 });
-  await handleWhatsappCommand(waTransport, '628777000111', 'profil', 'Andi WA', { now: 15_000 });
-  await handleWhatsappCommand(waTransport, '628777000111', 'halo kak', 'Andi WA', { now: 20_000 });
-  assert.equal(waSent.length, 0);
-
-  // WhatsApp responds to .start and renders exact greeting, SHOP_NAME, 6 buttons (no Deposit), and prefixed .profil
-  await handleWhatsappCommand(waTransport, '628777000111', '.start', 'Andi WA', { now: 25_000 });
   assert.equal(waSent.length, 1);
   assert.ok(waSent[0].text.includes('Halo Kak Andi WA!'));
   assert.ok(waSent[0].text.includes('Selamat datang di Toko PulsaSync Jaya — Layanan Pelanggan.'));
@@ -1668,20 +1664,45 @@ test('PulsaSync Bot Revision: SHOP_NAME env, /start greeting & buttons, /profil 
   ]);
   assert.equal(waBtns.some((t) => /deposit/i.test(t)), false);
 
-  // Within 3s cooldown (25_000 -> 27_000 = 2s), second prefixed command MUST be ignored silently
-  await handleWhatsappCommand(waTransport, '628777000111', '!profil', 'Andi WA', { now: 27_000 });
-  assert.equal(waSent.length, 1);
-
-  // Different user at 27_000 is NOT blocked by first user's cooldown
-  await handleWhatsappCommand(waTransport, '628777000222', '!kontak', 'Budi WA', { now: 27_000 });
+  // Unprefixed 'profil' and 'halo kak' also work directly after cooldown
+  await handleWhatsappCommand(waTransport, '628777000111', 'profil', 'Andi WA', { now: 15_000 });
   assert.equal(waSent.length, 2);
-  assert.match(waSent[1].text, /Hubungi Admin — Toko PulsaSync Jaya/);
+  assert.match(waSent[1].text, /Profil Pengguna/);
+  assert.match(waSent[1].text, /Tier:\s*(Bronze|Silver|Gold|Platinum)/);
 
-  // After 3s elapsed (25_000 -> 28_000 = 3s), first user responds to !profil again
-  await handleWhatsappCommand(waTransport, '628777000111', '!profil', 'Andi WA', { now: 28_000 });
+  await handleWhatsappCommand(waTransport, '628777000111', 'halo kak', 'Andi WA', { now: 20_000 });
   assert.equal(waSent.length, 3);
-  assert.match(waSent[2].text, /Profil Pengguna/);
-  assert.match(waSent[2].text, /Tier:\s*(Bronze|Silver|Gold|Platinum)/);
+  assert.ok(waSent[2].text.includes('Selamat datang di Toko PulsaSync Jaya — Layanan Pelanggan.'));
+
+  // Optional prefix (.start) also still works
+  await handleWhatsappCommand(waTransport, '628777000111', '.start', 'Andi WA', { now: 25_000 });
+  assert.equal(waSent.length, 4);
+
+  // Within 3s cooldown (25_000 -> 27_000 = 2s), second command MUST be ignored silently
+  await handleWhatsappCommand(waTransport, '628777000111', 'profil', 'Andi WA', { now: 27_000 });
+  assert.equal(waSent.length, 4);
+
+  // Different user at 27_000 is NOT blocked by first user's cooldown (works without prefix too)
+  await handleWhatsappCommand(waTransport, '628777000222', 'kontak', 'Budi WA', { now: 27_000 });
+  assert.equal(waSent.length, 5);
+  assert.match(waSent[4].text, /Hubungi Admin — Toko PulsaSync Jaya/);
+
+  // After 3s elapsed (25_000 -> 28_000 = 3s), first user responds to !profil (or profil) again
+  await handleWhatsappCommand(waTransport, '628777000111', '!profil', 'Andi WA', { now: 28_000 });
+  assert.equal(waSent.length, 6);
+  assert.match(waSent[5].text, /Profil Pengguna/);
+  assert.match(waSent[5].text, /Tier:\s*(Bronze|Silver|Gold|Platinum)/);
+
+  // Verify prefix-free interactive flow: pilih TSEL10 -> 081234567890 -> batal
+  await handleWhatsappCommand(waTransport, '628777000333', 'pilih TSEL10', 'Citra WA', { now: 30_000 });
+  assert.equal(waSent.length, 7);
+  assert.match(waSent[6].text, /nomor tujuan/i);
+  await handleWhatsappCommand(waTransport, '628777000333', '081234567890', 'Citra WA', { now: 34_000 });
+  assert.equal(waSent.length, 8);
+  assert.match(waSent[7].text, /Konfirmasi Pesanan Anda/i);
+  await handleWhatsappCommand(waTransport, '628777000333', 'batal', 'Citra WA', { now: 38_000 });
+  assert.equal(waSent.length, 9);
+  assert.match(waSent[8].text, /dibatalkan sebelum QRIS dibuat/i);
 });
 
 test('Production config boots cleanly without SESSION_SECRET and derives strong deterministic/ephemeral secret', async () => {
