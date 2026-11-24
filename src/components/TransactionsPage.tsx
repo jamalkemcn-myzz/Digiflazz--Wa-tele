@@ -78,9 +78,12 @@ export function TransactionsPage({ permissions }: { permissions: string[] }) {
     setFeedback(null);
     setConfirmRetryTxId(null);
     try {
-      await api.reconcileTransaction(txId);
+      const res = await api.reconcileTransaction(txId);
+      const updated = res.data;
       await openDetail(txId);
-      setFeedback(`Rekonsiliasi / inquiry untuk ${txId} telah dijalankan.`);
+      setFeedback(
+        `Rekonsiliasi untuk ${txId} selesai → Status: ${updated?.transaction_status || '-'} (Pembayaran: ${updated?.payment_status || '-'}).`
+      );
       await load(pagination.page);
     } catch (err) {
       setFeedback(err instanceof Error ? err.message : 'Rekonsiliasi gagal');

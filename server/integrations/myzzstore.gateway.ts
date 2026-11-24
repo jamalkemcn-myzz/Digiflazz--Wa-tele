@@ -312,17 +312,26 @@ export class MyZZStoreGateway implements PaymentGatewayPort {
         },
       };
     } catch (err) {
-      const isTimeout = err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError');
+      const errObj = err as { name?: string; message?: string; cause?: { code?: string; message?: string } };
+      const causeCode = typeof errObj?.cause?.code === 'string' ? errObj.cause.code : '';
+      const isTimeout =
+        errObj?.name === 'TimeoutError' ||
+        errObj?.name === 'AbortError' ||
+        causeCode === 'UND_ERR_CONNECT_TIMEOUT' ||
+        causeCode === 'ETIMEDOUT';
+      const safeDetail = causeCode || (isTimeout ? 'timeout' : errObj?.message || 'network_error');
       logger.error('MyZZStore createPayment failed', {
         service: 'myzzstore',
         transactionId: input.transactionId,
-        details: { isTimeout, message: err instanceof Error ? err.message : 'unknown' },
+        details: { isTimeout, causeCode: causeCode || undefined, message: errObj?.message || 'unknown' },
       });
       return {
         ok: false,
         mappedStatus: 'UNKNOWN',
         errorCode: isTimeout ? 'GATEWAY_TIMEOUT' : 'GATEWAY_HTTP_ERROR',
-        errorMessage: isTimeout ? 'Request ke MyZZStore timeout' : 'Gagal menghubungi MyZZStore',
+        errorMessage: isTimeout
+          ? `Request ke MyZZStore timeout (${safeDetail})`
+          : `Gagal menghubungi MyZZStore (${safeDetail})`,
       };
     }
   }

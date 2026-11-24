@@ -3,7 +3,12 @@ import { logger } from '../logging/logger';
 import { defaultPaymentGateway, type PaymentGatewayPort } from '../integrations/myzzstore.gateway';
 import { digiflazzService, type DigiflazzService } from '../integrations/digiflazz.service';
 import { pollPendingPayments, reconcileUnknownAndMissedCallbacks } from './payment.reconciliation.service';
-import { processSingleSupplierJob, type TransactionRow } from './transaction.service';
+import {
+  processSingleSupplierJob,
+  resolveGatewayReference,
+  transitionTransactionStatus,
+  type TransactionRow,
+} from './transaction.service';
 
 export async function pollPendingSupplierJobs(
   workerId = 'scheduler',
@@ -124,17 +129,62 @@ export async function reconcileSingleTransactionManual(
     | undefined;
   if (!tx) throw new Error('Transaksi tidak ditemukan');
 
-  if (tx.payment_status !== 'PAID' && gateway.isConfigured()) {
-    const { checkTransactionPaymentStatus } = await import('./payment.service');
-    const verified = await checkTransactionPaymentStatus(tx, gateway);
-    if (verified && verified.check.mappedStatus === 'PAID') {
-      const { handleVerifiedPaymentPaid } = await import('./transaction.service');
-      handleVerifiedPaymentPaid(
-        tx.transaction_id,
-        'MANUAL_RECONCILE',
-        verified.check.paidAt,
-        verified.effectiveGatewayRef
-      );
+  if (tx.payment_status !== 'PAID') {
+    const gatewayRef = resolveGatewayReference(tx);
+    if (!gatewayRef) {
+      if (
+        tx.supplier_status === 'NONE' &&
+        !tx.qris_payload_json &&
+        ['CREATED', 'UNKNOWN'].includes(tx.transaction_status)
+      ) {
+        transitionTransactionStatus(
+          tx.transaction_id,
+          'FAILED',
+          'MANUAL_RECONCILE',
+          'Rekonsiliasi manual: pembuatan invoice QRIS gagal sebelum menerima Gateway Ref sehingga tidak ada invoice aktif / pembayaran yang diproses',
+          { paymentStatus: 'FAILED', completedAt: new Date().toISOString() }
+        );
+      }
+    } else if (gateway.isConfigured()) {
+      const { checkTransactionPaymentStatus, finalizeExpiredInvoice } = await import('./payment.service');
+      const verified = await checkTransactionPaymentStatus(tx, gateway);
+      if (verified) {
+        const { check, effectiveGatewayRef } = verified;
+        if (check.mappedStatus === 'PAID') {
+          const { handleVerifiedPaymentPaid } = await import('./transaction.service');
+          handleVerifiedPaymentPaid(
+            tx.transaction_id,
+            'MANUAL_RECONCILE',
+            check.paidAt,
+            effectiveGatewayRef
+          );
+        } else if (check.mappedStatus === 'EXPIRED') {
+          await finalizeExpiredInvoice(tx, 'MANUAL_RECONCILE', gateway);
+        } else if (check.mappedStatus === 'FAILED' || check.mappedStatus === 'CANCELLED') {
+          if (['CREATED', 'PENDING_PAYMENT', 'PAYMENT_PROCESSING', 'UNKNOWN'].includes(tx.transaction_status)) {
+            transitionTransactionStatus(
+              tx.transaction_id,
+              'FAILED',
+              'MANUAL_RECONCILE',
+              `Rekonsiliasi manual menemukan gateway berstatus ${check.mappedStatus}`,
+              { paymentStatus: check.mappedStatus, completedAt: new Date().toISOString() }
+            );
+          }
+        } else if (check.mappedStatus === 'PENDING') {
+          const isPastExpiry = tx.expired_at ? Date.now() >= new Date(tx.expired_at).getTime() : false;
+          if (isPastExpiry) {
+            await finalizeExpiredInvoice(tx, 'MANUAL_RECONCILE', gateway);
+          } else if (tx.transaction_status === 'UNKNOWN') {
+            transitionTransactionStatus(
+              tx.transaction_id,
+              'PENDING_PAYMENT',
+              'MANUAL_RECONCILE',
+              'Rekonsiliasi manual menemukan invoice masih PENDING di gateway',
+              { paymentStatus: 'PENDING' }
+            );
+          }
+        }
+      }
     }
   }
 

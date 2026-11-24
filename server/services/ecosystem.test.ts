@@ -3629,6 +3629,71 @@ test('Balance payment method (BALANCE), platform-based User ID (Telegram ID / WA
   assert.ok(waBrandReplies[3].text.includes('*Riwayat Transaksi (6285169758268)*'));
 });
 
+test('UNKNOWN invoice without Gateway Ref (e.g. createPayment network failure) resolves cleanly on manual and auto reconciliation', async () => {
+  const db = getDb();
+  const { reconcileSingleTransactionManual } = await import('./reconciliation.service');
+
+  const failingGw = new TestPaymentGateway();
+  failingGw.nextCreateBehavior = 'TIMEOUT';
+
+  const order1 = await createOrder(
+    {
+      platform: 'TELEGRAM',
+      platformUserId: '77112233',
+      platformUsername: 'unknown_user',
+      productSkuOrId: 'BAL_ISAT_10',
+      destination: '085700001111',
+      paymentMethod: 'QRIS',
+    },
+    failingGw
+  );
+  assert.equal(order1.ok, false);
+  assert.ok(order1.transaction);
+  assert.equal(order1.transaction.transaction_status, 'UNKNOWN');
+  assert.equal(order1.transaction.payment_status, 'UNKNOWN');
+  assert.equal(order1.transaction.gateway_reference, null);
+
+  // Manual reconcile immediately resolves UNKNOWN without Gateway Ref -> FAILED
+  const resolvedManual = (await reconcileSingleTransactionManual(order1.transaction.transaction_id, failingGw)) as {
+    transaction_status: string;
+    payment_status: string;
+  };
+  assert.equal(resolvedManual.transaction_status, 'FAILED');
+  assert.equal(resolvedManual.payment_status, 'FAILED');
+
+  // Auto reconcile skips within expiry window, then finalizes UNKNOWN without Gateway Ref -> FAILED once expired
+  const order2 = await createOrder(
+    {
+      platform: 'TELEGRAM',
+      platformUserId: '77112234',
+      platformUsername: 'unknown_user_2',
+      productSkuOrId: 'BAL_ISAT_10',
+      destination: '085700002222',
+      paymentMethod: 'QRIS',
+    },
+    failingGw
+  );
+  assert.equal(order2.transaction?.transaction_status, 'UNKNOWN');
+
+  await reconcileUnknownAndMissedCallbacks(failingGw);
+  const stillUnknown = db
+    .prepare('SELECT transaction_status FROM transactions WHERE transaction_id = ?')
+    .get(order2.transaction!.transaction_id) as { transaction_status: string };
+  assert.equal(stillUnknown.transaction_status, 'UNKNOWN');
+
+  // Backdate expired_at past now -> auto reconciliation finalizes UNKNOWN without Gateway Ref to FAILED
+  db.prepare('UPDATE transactions SET expired_at = ? WHERE transaction_id = ?').run(
+    new Date(Date.now() - 60_000).toISOString(),
+    order2.transaction!.transaction_id
+  );
+  await reconcileUnknownAndMissedCallbacks(failingGw);
+  const resolvedAuto = db
+    .prepare('SELECT transaction_status, payment_status FROM transactions WHERE transaction_id = ?')
+    .get(order2.transaction!.transaction_id) as { transaction_status: string; payment_status: string };
+  assert.equal(resolvedAuto.transaction_status, 'FAILED');
+  assert.equal(resolvedAuto.payment_status, 'FAILED');
+});
+
 test.after(() => {
   closeDb();
   fs.rmSync(tempDir, { recursive: true, force: true });
