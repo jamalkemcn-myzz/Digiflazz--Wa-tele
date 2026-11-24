@@ -1652,6 +1652,9 @@ test('PulsaSync Bot Revision: SHOP_NAME env, /start greeting & buttons, /profil 
   assert.equal(waSent.length, 1);
   assert.ok(waSent[0].text.includes('Halo Kak Andi WA!'));
   assert.ok(waSent[0].text.includes('Selamat datang di Toko PulsaSync Jaya — Layanan Pelanggan.'));
+  assert.equal(/tombol praktis di bawah/i.test(waSent[0].text), false);
+  assert.ok(waSent[0].text.includes('*1.* 📂 Kategori Produk'));
+  assert.ok(waSent[0].text.includes('*6.* 👨‍💼 Hubungi Admin'));
   assert.equal(/Total Pengguna Bot/i.test(waSent[0].text), false);
   const waBtns = (waSent[0].buttons || []).flat().map((b) => b.text);
   assert.deepEqual(waBtns, [
@@ -1703,6 +1706,12 @@ test('PulsaSync Bot Revision: SHOP_NAME env, /start greeting & buttons, /profil 
   await handleWhatsappCommand(waTransport, '628777000333', 'batal', 'Citra WA', { now: 38_000 });
   assert.equal(waSent.length, 9);
   assert.match(waSent[8].text, /dibatalkan sebelum QRIS dibuat/i);
+
+  // Unknown input "P" on real WhatsApp renders full numbered menu options directly in text
+  await handleWhatsappCommand(waTransport, '628777000444', 'P', 'Dina WA', { now: 40_000 });
+  assert.equal(waSent.length, 10);
+  assert.ok(waSent[9].text.includes('*1.* 📂 Kategori Produk'));
+  assert.ok(waSent[9].text.includes('*6.* 👨‍💼 Hubungi Admin'));
 });
 
 test('Production config boots cleanly without SESSION_SECRET and derives strong deterministic/ephemeral secret', async () => {

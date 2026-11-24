@@ -36,12 +36,17 @@ export function formatStartMessage(params: {
   userId: string;
   isAdmin: boolean;
   totalUsers?: number;
+  supportsButtons?: boolean;
 }): string {
   const name = resolveDisplayName(params.displayName, params.username);
+  const subtitle =
+    params.supportsButtons === false
+      ? 'Silakan pilih menu dengan membalas angka atau ketik perintah di bawah ini:'
+      : 'Silakan pilih menu lewat tombol praktis di bawah tanpa perlu mengetik perintah manual:';
   return (
     `Halo Kak ${name}!\n` +
     `Selamat datang di ${params.shopName} — Layanan Pelanggan.\n` +
-    `Silakan pilih menu lewat tombol praktis di bawah tanpa perlu mengetik perintah manual:\n\n` +
+    `${subtitle}\n\n` +
     `• ID User: ${params.userId}\n` +
     `• Status: ${params.isAdmin ? 'Admin' : 'Member'}`
   );
