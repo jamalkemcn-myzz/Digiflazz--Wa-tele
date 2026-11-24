@@ -2,7 +2,7 @@ import { getEffectivePermissions, type AdminRole } from '../domain/rbac';
 import QRCode from 'qrcode';
 import { config } from '../config/env';
 import { logger } from '../logging/logger';
-import { maskDestination } from '../domain/masking';
+import { extractWhatsappPhoneFromJid, maskDestination } from '../domain/masking';
 import {
   listCategories,
   getCategoryById,
@@ -39,9 +39,12 @@ import {
   cancelCustomerTransaction,
   getCustomerTransactions,
   getTransactionDetail,
+  processSingleSupplierJob,
   saveQrMessageReference,
+  type PaymentMethod,
 } from '../services/transaction.service';
 import { fetchQrisImageBuffer } from '../integrations/qris-image';
+import { digiflazzService } from '../integrations/digiflazz.service';
 import {
   resolveAdminByPlatform,
   checkAdminPermission,
@@ -419,14 +422,14 @@ async function sendCategoryList(sock: WhatsappReplyTransport, jid: string, dryRu
 
 function buildWhatsappBrandButtons(
   categoryId: number,
-  brands: Array<{ brand: string; productCount: number }>
+  brands: Array<{ brand: string; productCount?: number }>
 ): WhatsappQuickButton[][] {
   const shown = brands.slice(0, 14);
   const buttonRows: WhatsappQuickButton[][] = [];
   for (let i = 0; i < shown.length; i += 2) {
     buttonRows.push(
       shown.slice(i, i + 2).map((b, offset) => ({
-        text: `📶 ${i + offset + 1}. ${b.brand} (${b.productCount})`,
+        text: `📶 ${i + offset + 1}. ${b.brand}`,
         replyText: `!produk_brand ${categoryId} 1 ${b.brand}`,
       }))
     );
@@ -701,7 +704,7 @@ async function sendCategoryBrandOrProducts(
   );
 
   const lines = shown
-    .map((b, idx) => `${idx + 1}. *${b.brand}* (${b.productCount} produk, mulai Rp${b.minPrice.toLocaleString('id-ID')})`)
+    .map((b, idx) => `${idx + 1}. *${b.brand}* (mulai Rp${b.minPrice.toLocaleString('id-ID')})`)
     .join('\n');
 
   const isTelecom = isTelecomCategoryName(cat?.name);
@@ -1046,6 +1049,9 @@ async function promptWhatsappOrderConfirmation(
 
   const p = preview.transaction;
   const sellingPrice = p.supplier_price_snapshot + p.margin_snapshot;
+  const exactTotal = Math.max(0, sellingPrice - p.discount_snapshot);
+  const customerBalance = preview.customerBalance ?? 0;
+  const canPayWithBalance = customerBalance >= exactTotal;
   const productRow = getProductBySkuOrId(p.product_sku_snapshot);
   const productDesc = productRow?.description?.trim() || null;
   const globalDesc = getConfirmationDescription();
@@ -1060,6 +1066,9 @@ async function promptWhatsappOrderConfirmation(
       sellingPrice,
       discountAmount: p.discount_snapshot,
       estimatedTotal: p.payment_amount,
+      exactTotal,
+      customerBalance,
+      canPayWithBalance,
       destination: params.destination.trim(),
       couponCode: p.coupon_code_snapshot,
       updatedAt: Date.now(),
@@ -1073,6 +1082,33 @@ async function promptWhatsappOrderConfirmation(
       : `Keterangan: ${productDesc}\n`
     : '';
 
+  const totalText = canPayWithBalance
+    ? `Total Bayar via Saldo: *Rp${exactTotal.toLocaleString('id-ID')}* (tanpa kode unik)\n` +
+      `Estimasi Total (+ Kode Unik QRIS): *Rp${p.payment_amount.toLocaleString('id-ID')}*\n`
+    : `Estimasi Total (+ Kode Unik): *Rp${p.payment_amount.toLocaleString('id-ID')}*\n`;
+
+  const actionText = canPayWithBalance
+    ? `\nPilih metode pembayaran:\n` +
+      `*1.* Ketik *saldo* (Rp${exactTotal.toLocaleString('id-ID')})\n` +
+      `*2.* Ketik *qris* / *ya* (Rp${p.payment_amount.toLocaleString('id-ID')})\n` +
+      `Atau ketik *batal* untuk membatalkan:`
+    : `\nBalas *ya* untuk melanjutkan atau *batal* untuk membatalkan:`;
+
+  const actionButtons: WhatsappQuickButton[][] = canPayWithBalance
+    ? [
+        [
+          { text: '💳 Bayar via Saldo', replyText: '!saldo' },
+          { text: '✅ Bayar via QRIS', replyText: '!qris' },
+        ],
+        [{ text: '❌ Batal', replyText: '!batal' }],
+      ]
+    : [
+        [
+          { text: '✅ Ya, Buat QRIS', replyText: '!ya' },
+          { text: '❌ Batal', replyText: '!batal' },
+        ],
+      ];
+
   await sock.sendMessage(jid, {
     text:
       `*Konfirmasi Pesanan Anda*\n\n` +
@@ -1080,23 +1116,26 @@ async function promptWhatsappOrderConfirmation(
       `Tujuan: *${params.destination.trim()}*\n` +
       `Harga: Rp${sellingPrice.toLocaleString('id-ID')}\n` +
       (p.coupon_code_snapshot ? `Kupon: ${p.coupon_code_snapshot} (-Rp${p.discount_snapshot.toLocaleString('id-ID')})\n` : '') +
-      `Estimasi Total (+ Kode Unik): *Rp${p.payment_amount.toLocaleString('id-ID')}*\n` +
+      `Saldo Anda: Rp${customerBalance.toLocaleString('id-ID')}\n` +
+      totalText +
       productDescLine +
       (globalDesc ? `Catatan: ${globalDesc}\n` : '') +
-      `\nBalas *ya* untuk melanjutkan atau *batal* untuk membatalkan:`,
-    quickReplies: [
-      [
-        { text: '✅ Ya, Buat QRIS', replyText: '!ya' },
-        { text: '❌ Batal', replyText: '!batal' },
-      ],
-    ],
+      actionText,
+    quickReplies: actionButtons,
   });
 }
 
 async function executeWhatsappOrder(
   sock: WhatsappReplyTransport,
   jid: string,
-  params: { sku: string; destination: string; couponCode?: string | null; pushName?: string; dryRun?: boolean }
+  params: {
+    sku: string;
+    destination: string;
+    couponCode?: string | null;
+    paymentMethod?: PaymentMethod;
+    pushName?: string;
+    dryRun?: boolean;
+  }
 ) {
   clearBotSession('WHATSAPP', jid, params.dryRun);
   const resolvedCoupon =
@@ -1104,6 +1143,7 @@ async function executeWhatsappOrder(
   if (resolvedCoupon) {
     clearPendingVoucher('WHATSAPP', jid, params.dryRun);
   }
+  const paymentMethod: PaymentMethod = params.paymentMethod === 'BALANCE' ? 'BALANCE' : 'QRIS';
   const result = params.dryRun
     ? previewOrderDryRun({
         platform: 'WHATSAPP',
@@ -1111,6 +1151,7 @@ async function executeWhatsappOrder(
         productSkuOrId: params.sku,
         destination: params.destination,
         couponCode: resolvedCoupon,
+        paymentMethod,
       })
     : await createOrder({
         platform: 'WHATSAPP',
@@ -1119,6 +1160,7 @@ async function executeWhatsappOrder(
         productSkuOrId: params.sku,
         destination: params.destination,
         couponCode: resolvedCoupon,
+        paymentMethod,
       });
 
   if (!result.ok || !result.transaction) {
@@ -1148,6 +1190,45 @@ async function executeWhatsappOrder(
   }
 
   const tx = result.transaction;
+  if (tx.payment_method === 'BALANCE') {
+    const balanceAfter =
+      result.balanceAfter ?? Math.max(0, (result.customerBalance ?? 0) - tx.payment_amount);
+    const balanceMsg =
+      `Terima kasih Kak! Pembayaran via Saldo berhasil diproses:\n\n` +
+      `*PEMBAYARAN SALDO BERHASIL*\n` +
+      `ID Transaksi: ${tx.transaction_id}\n` +
+      `Produk: ${tx.product_name_snapshot}\n` +
+      `Tujuan: ${maskDestination(tx.destination)}\n` +
+      (tx.discount_snapshot > 0 ? `Diskon Kupon: -Rp${tx.discount_snapshot.toLocaleString('id-ID')}\n` : '') +
+      `*Total Dibayar: Rp${tx.payment_amount.toLocaleString('id-ID')}*\n` +
+      `Sisa Saldo: Rp${balanceAfter.toLocaleString('id-ID')}\n` +
+      `Status: *${tx.transaction_status}*\n\n` +
+      `Pesanan sedang diproses ke sistem pengisian otomatis ya Kak.` +
+      (params.dryRun ? `\n\n_[Mode Demo: pratinjau pembayaran saldo, saldo & transaksi tidak berubah]_` : '');
+
+    await sock.sendMessage(jid, {
+      text: balanceMsg,
+      quickReplies: [
+        [
+          { text: '🔍 Cek Status Pesanan', replyText: `!status ${tx.transaction_id}` },
+          { text: '🛒 Beli Lagi', replyText: '!kategori' },
+        ],
+        [{ text: '🏠 Menu Utama', replyText: '!menu' }],
+      ],
+    });
+
+    if (!params.dryRun && config.nodeEnv !== 'test' && digiflazzService.isConfigured()) {
+      void processSingleSupplierJob(tx.transaction_id, 'wa-balance-instant', digiflazzService).catch((err) => {
+        logger.error('Immediate supplier fulfillment trigger failed after WA balance payment', {
+          service: 'whatsapp',
+          transactionId: tx.transaction_id,
+          details: { error: err instanceof Error ? err.message : 'unknown' },
+        });
+      });
+    }
+    return;
+  }
+
   const originalPaymentUrl =
     result.qris?.qrUrl && !result.qris.qrUrl.startsWith('data:') ? result.qris.qrUrl : undefined;
   const caption =
@@ -1182,7 +1263,7 @@ async function executeWhatsappOrder(
       if (!params.dryRun && sent?.key) {
         saveQrMessageReference(tx.transaction_id, {
           platform: 'WHATSAPP',
-          chatId: jid,
+          chatId: (sent.key as { remoteJid?: string })?.remoteJid || jid,
           messageId: sent.key as unknown as Record<string, unknown>,
         });
       }
@@ -1196,7 +1277,7 @@ async function executeWhatsappOrder(
       if (!params.dryRun && sent?.key) {
         saveQrMessageReference(tx.transaction_id, {
           platform: 'WHATSAPP',
-          chatId: jid,
+          chatId: (sent.key as { remoteJid?: string })?.remoteJid || jid,
           messageId: sent.key as unknown as Record<string, unknown>,
         });
       }
@@ -1290,7 +1371,7 @@ async function sendWhatsappHistory(
   );
   await sock.sendMessage(jid, {
     text:
-      `*Riwayat Transaksi (${customer.customer_code})*\n` +
+      `*Riwayat Transaksi (${extractWhatsappPhoneFromJid(jid)})*\n` +
       `Kredit Refund Internal: Rp${refundTotal.toLocaleString('id-ID')}\n\n` +
       (lines.length > 0 ? lines.join('\n') : 'Belum ada riwayat transaksi ya Kak.'),
     quickReplies: NAV_BACK_BUTTONS,
@@ -2023,7 +2104,18 @@ export async function handleWhatsappCommand(
   // Interactive conversation state fallback (prefixed confirmations, destination entry, voucher code, & numeric selection)
   const session = getBotSession('WHATSAPP', jid, dryRun);
   if (session?.mode === 'AWAITING_ORDER_CONFIRMATION') {
-    if (['ya', 'iya', 'ok', 'oke', 'lanjut', 'konfirmasi', 'y'].includes(cmd)) {
+    const confirmNumericChoice = /^\d+$/.test(withoutPrefix) ? Number(withoutPrefix) : null;
+    const isBalanceChoice =
+      cmd === 'saldo' ||
+      cmd === 'balance' ||
+      (cmd === 'bayar' && args[0]?.toLowerCase() === 'saldo') ||
+      (confirmNumericChoice === 1 && Boolean(session.canPayWithBalance));
+    const isQrisChoice =
+      ['ya', 'iya', 'ok', 'oke', 'lanjut', 'konfirmasi', 'y', 'qris'].includes(cmd) ||
+      (cmd === 'bayar' && args[0]?.toLowerCase() === 'qris') ||
+      (confirmNumericChoice === 2 && Boolean(session.canPayWithBalance));
+
+    if (isBalanceChoice || isQrisChoice) {
       if (!acquireOrderExecutionLock('WHATSAPP', jid, dryRun)) {
         return;
       }
@@ -2032,6 +2124,7 @@ export async function handleWhatsappCommand(
           sku: session.sku,
           destination: session.destination,
           couponCode: session.couponCode || null,
+          paymentMethod: isBalanceChoice ? 'BALANCE' : 'QRIS',
           pushName,
           dryRun,
         });
@@ -2048,16 +2141,29 @@ export async function handleWhatsappCommand(
       });
       return;
     }
-    await sock.sendMessage(jid, {
-      text: dryRun
+    const fallbackPromptText = session.canPayWithBalance
+      ? `Pesanan *${session.productName}* (${session.destination}) menunggu konfirmasi Anda.\n` +
+        `Balas *saldo* (atau *1*) untuk bayar via Saldo, *qris* / *ya* (atau *2*) untuk QRIS, atau *batal* untuk membatalkan:`
+      : dryRun
         ? `Pesanan *${session.productName}* (${session.destination}) menunggu konfirmasi Anda.\nTap tombol *Ya, Buat QRIS* atau *Batal* di bawah ini:`
-        : `Pesanan *${session.productName}* (${session.destination}) menunggu konfirmasi Anda.\nBalas *ya* untuk membuat QRIS atau *batal* untuk membatalkan:`,
-      quickReplies: [
-        [
-          { text: '✅ Ya, Buat QRIS', replyText: '!ya' },
-          { text: '❌ Batal', replyText: '!batal' },
-        ],
-      ],
+        : `Pesanan *${session.productName}* (${session.destination}) menunggu konfirmasi Anda.\nBalas *ya* untuk membuat QRIS atau *batal* untuk membatalkan:`;
+    const fallbackButtons: WhatsappQuickButton[][] = session.canPayWithBalance
+      ? [
+          [
+            { text: '💳 Bayar via Saldo', replyText: '!saldo' },
+            { text: '✅ Bayar via QRIS', replyText: '!qris' },
+          ],
+          [{ text: '❌ Batal', replyText: '!batal' }],
+        ]
+      : [
+          [
+            { text: '✅ Ya, Buat QRIS', replyText: '!ya' },
+            { text: '❌ Batal', replyText: '!batal' },
+          ],
+        ];
+    await sock.sendMessage(jid, {
+      text: fallbackPromptText,
+      quickReplies: fallbackButtons,
     });
     return;
   }

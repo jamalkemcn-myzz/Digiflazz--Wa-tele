@@ -77,6 +77,9 @@ export type BotConversationState =
       sellingPrice: number;
       discountAmount: number;
       estimatedTotal: number;
+      exactTotal?: number;
+      customerBalance?: number;
+      canPayWithBalance?: boolean;
       destination: string;
       couponCode?: string | null;
       updatedAt: number;

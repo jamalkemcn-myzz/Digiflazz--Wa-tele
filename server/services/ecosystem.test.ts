@@ -1609,7 +1609,7 @@ test('PulsaSync Bot Revision: SHOP_NAME env, /start greeting & buttons, /profil 
   assert.ok(
     startMsg.includes('Silakan pilih menu lewat tombol praktis di bawah tanpa perlu mengetik perintah manual:')
   );
-  assert.match(startMsg, /ID User:/);
+  assert.ok(startMsg.includes('ID User: 910001'));
   assert.match(startMsg, /Status:\s*Member/);
   assert.equal(/Total Pengguna Bot/i.test(startMsg), false);
 
@@ -1626,7 +1626,7 @@ test('PulsaSync Bot Revision: SHOP_NAME env, /start greeting & buttons, /profil 
   const profMsg = tgProfileReplies[0];
   assert.match(profMsg, /Profil Pengguna/);
   assert.match(profMsg, /Akun/);
-  assert.match(profMsg, /ID:\s*CUS-/);
+  assert.match(profMsg, /ID:\s*910001/);
   assert.match(profMsg, /Username:\s*@nadia_tg/);
   assert.match(profMsg, /Bergabung:/);
   assert.match(profMsg, /Keuangan/);
@@ -1653,6 +1653,7 @@ test('PulsaSync Bot Revision: SHOP_NAME env, /start greeting & buttons, /profil 
   assert.ok(waSent[0].text.includes('Halo Kak Andi WA!'));
   assert.ok(waSent[0].text.includes('Selamat datang di Toko PulsaSync Jaya — Layanan Pelanggan.'));
   assert.equal(/tombol praktis di bawah/i.test(waSent[0].text), false);
+  assert.ok(waSent[0].text.includes('ID User: 628777000111'));
   assert.ok(waSent[0].text.includes('*1.* 📂 Kategori Produk'));
   assert.ok(waSent[0].text.includes('*6.* 👨‍💼 Hubungi Admin'));
   assert.equal(/Total Pengguna Bot/i.test(waSent[0].text), false);
@@ -1671,6 +1672,7 @@ test('PulsaSync Bot Revision: SHOP_NAME env, /start greeting & buttons, /profil 
   await handleWhatsappCommand(waTransport, '628777000111', 'profil', 'Andi WA', { now: 15_000 });
   assert.equal(waSent.length, 2);
   assert.match(waSent[1].text, /Profil Pengguna/);
+  assert.match(waSent[1].text, /ID:\s*628777000111/);
   assert.match(waSent[1].text, /Tier:\s*(Bronze|Silver|Gold|Platinum)/);
 
   await handleWhatsappCommand(waTransport, '628777000111', 'halo kak', 'Andi WA', { now: 20_000 });
@@ -3316,6 +3318,315 @@ test('Digiflazz auto-sync description: populates desc on sync, shows after desti
   const prodManual2 = getProductBySkuOrId('DIGI_DESC_MANUAL');
   assert.equal(prodManual2?.description, 'Catatan khusus admin toko');
   assert.equal(prodManual2?.supplier_description, 'Deskripsi seller baru harus diabaikan oleh override admin');
+});
+
+test('Balance payment method (BALANCE), platform-based User ID (Telegram ID / WA phone & LID), and brand picker without product counts', async () => {
+  const actor = { id: 'owner-bal-test', role: 'OWNER' as const };
+  const db = getDb();
+
+  // Seed a clean Data category with multiple brands so BRAND_LIST renders
+  const nowIso = new Date().toISOString();
+  db.prepare(
+    `INSERT OR IGNORE INTO categories (name, slug, status, created_at, updated_at) VALUES (?, ?, 'ACTIVE', ?, ?)`
+  ).run('Paket Balance Test', 'paket-balance-test', nowIso, nowIso);
+  const testCat = listCategories(true).find((c) => c.name === 'Paket Balance Test');
+  assert.ok(testCat);
+
+  upsertProduct({
+    sku: 'BAL_ISAT_10',
+    name: 'Indosat Freedom 10GB',
+    categoryId: testCat.id,
+    brand: 'INDOSAT',
+    supplierPrice: 18000,
+    marginType: 'FIXED',
+    marginValue: 2000,
+    status: 'ACTIVE',
+  }, actor);
+  upsertProduct({
+    sku: 'BAL_ISAT_20',
+    name: 'Indosat Freedom 20GB',
+    categoryId: testCat.id,
+    brand: 'INDOSAT',
+    supplierPrice: 30000,
+    marginType: 'FIXED',
+    marginValue: 2000,
+    status: 'ACTIVE',
+  }, actor);
+  upsertProduct({
+    sku: 'BAL_TSEL_10',
+    name: 'Telkomsel Combo 10GB',
+    categoryId: testCat.id,
+    brand: 'TELKOMSEL',
+    supplierPrice: 23000,
+    marginType: 'FIXED',
+    marginValue: 2000,
+    status: 'ACTIVE',
+  }, actor);
+
+  const { dispatchTelegramCommand } = await import('../bots/telegram.command-handler');
+  const { dispatchTelegramCallback } = await import('../bots/telegram.callback-handler');
+  const { handleWhatsappCommand, clearWhatsappCooldown } = await import('../bots/whatsapp.command-handler');
+  const { handleWhatsappMessagesUpsert } = await import('../bots/whatsapp.message-handler');
+  const { retryFailedSupplierTransaction } = await import('./transaction.service');
+  clearWhatsappCooldown();
+
+  // 1. Operator/Brand picker hides product count on Telegram AND WhatsApp
+  const tgCatReplies: Array<{ text: string; buttons?: Array<Array<{ text: string; callbackData: string }>> }> = [];
+  await dispatchTelegramCallback(
+    {
+      async reply(text, buttons) {
+        tgCatReplies.push({
+          text,
+          buttons: buttons as Array<Array<{ text: string; callbackData: string }>> | undefined,
+        });
+      },
+      async answerCbQuery() {},
+    },
+    { userId: '88220011', username: 'bal_user', displayName: 'Bal User', data: `CAT_${testCat.id}` }
+  );
+  const tgBrandBtnTexts = (tgCatReplies[0].buttons || []).flat().map((b) => b.text);
+  assert.ok(tgBrandBtnTexts.some((t) => t.includes('INDOSAT')));
+  assert.ok(tgBrandBtnTexts.some((t) => t.includes('TELKOMSEL')));
+  assert.equal(tgBrandBtnTexts.some((t) => /\(\d+\)/.test(t)), false);
+
+  const waBrandReplies: Array<{ text: string; buttons?: Array<Array<{ text: string; replyText: string }>> }> = [];
+  const waMockSock = {
+    async sendMessage(_jid: string, content: { text?: string; caption?: string; quickReplies?: Array<Array<{ text: string; replyText: string }>> }) {
+      waBrandReplies.push({
+        text: content.text || content.caption || '',
+        buttons: content.quickReplies,
+      });
+      return { key: { id: 'wa-msg-1', remoteJid: _jid } };
+    },
+  };
+  await handleWhatsappCommand(waMockSock, '6285169758268@s.whatsapp.net', `produk_kat ${testCat.id} 1`, 'Musa WA', { now: 100_000 });
+  const waBrandText = waBrandReplies[0].text;
+  const waBrandBtnTexts = (waBrandReplies[0].buttons || []).flat().map((b) => b.text);
+  assert.ok(waBrandText.includes('*INDOSAT*'));
+  assert.equal(/\(\d+\s*produk/i.test(waBrandText), false);
+  assert.equal(waBrandBtnTexts.some((t) => /\(\d+\)/.test(t)), false);
+
+  // 2. WhatsApp @lid resolution uses remoteJidAlt for ID User (phone number) and replies to raw remoteJid
+  const lidReplies: Array<{ to: string; text: string }> = [];
+  await handleWhatsappMessagesUpsert(
+    {
+      async sendMessage(to: string, content: { text?: string; image?: unknown; caption?: string }) {
+        lidReplies.push({ to, text: content.text || content.caption || '' });
+        return { key: { id: 'wa-lid-1', remoteJid: to } };
+      },
+    } as never,
+    {
+      type: 'notify',
+      messages: [
+        {
+          key: {
+            id: 'wa-incoming-lid-1',
+            remoteJid: '229847182931@lid',
+            remoteJidAlt: '6285169758268@s.whatsapp.net',
+            fromMe: false,
+          },
+          pushName: 'Musa',
+          message: { conversation: 'menu' },
+        },
+      ],
+    }
+  );
+  assert.equal(lidReplies.length, 1);
+  assert.equal(lidReplies[0].to, '229847182931@lid');
+  assert.ok(lidReplies[0].text.includes('ID User: 6285169758268'));
+  assert.equal(lidReplies[0].text.includes('CUS-'), false);
+
+  // 3. Insufficient balance rejection (atomic check, ledger untouched)
+  const tgCust = resolveOrCreateCustomer({
+    platform: 'TELEGRAM',
+    platformUserId: '88220011',
+    platformUsername: 'bal_user',
+  });
+  assert.equal(getCustomerRefundCreditTotal(tgCust.customer.id), 0);
+
+  const insufficientRes = await createOrder({
+    platform: 'TELEGRAM',
+    platformUserId: '88220011',
+    platformUsername: 'bal_user',
+    productSkuOrId: 'BAL_ISAT_10',
+    destination: '085712340001',
+    paymentMethod: 'BALANCE',
+  });
+  assert.equal(insufficientRes.ok, false);
+  assert.equal(insufficientRes.code, 'INSUFFICIENT_BALANCE');
+  assert.equal(getCustomerRefundCreditTotal(tgCust.customer.id), 0);
+
+  // 4. Top-up internal balance & pay via Telegram callback CONFIRM_ORDER_BALANCE
+  applyManualRefundOrAdjustment(
+    {
+      customerId: tgCust.customer.id,
+      entryType: 'MANUAL_ADJUSTMENT_CREDIT',
+      amount: 50000,
+      reason: 'Test saldo awal',
+    },
+    actor
+  );
+  assert.equal(getCustomerRefundCreditTotal(tgCust.customer.id), 50000);
+
+  const tgPromptReplies: Array<{ text: string; buttons?: Array<Array<{ text: string; callbackData: string }>> }> = [];
+  await dispatchTelegramCallback(
+    {
+      async reply(text, buttons) {
+        tgPromptReplies.push({
+          text,
+          buttons: buttons as Array<Array<{ text: string; callbackData: string }>> | undefined,
+        });
+      },
+      async answerCbQuery() {},
+    },
+    { userId: '88220011', username: 'bal_user', displayName: 'Bal User', data: 'BUY_SKU_BAL_ISAT_10' }
+  );
+  await dispatchTelegramCommand(
+    {
+      async reply(text, buttons) {
+        tgPromptReplies.push({
+          text,
+          buttons: buttons as Array<Array<{ text: string; callbackData: string }>> | undefined,
+        });
+      },
+    },
+    { userId: '88220011', username: 'bal_user', displayName: 'Bal User', text: '085712340002' }
+  );
+  const confirmMsg = tgPromptReplies[1];
+  assert.ok(confirmMsg.text.includes('Saldo Anda: Rp50.000'));
+  assert.ok(confirmMsg.text.includes('Total Bayar via Saldo: Rp20.000'));
+  const confirmBtns = (confirmMsg.buttons || []).flat().map((b) => b.callbackData);
+  assert.ok(confirmBtns.includes('CONFIRM_ORDER_BALANCE'));
+  assert.ok(confirmBtns.includes('CONFIRM_ORDER'));
+
+  const tgPaidReplies: string[] = [];
+  await dispatchTelegramCallback(
+    {
+      async reply(text) {
+        tgPaidReplies.push(text);
+      },
+      async answerCbQuery() {},
+    },
+    { userId: '88220011', username: 'bal_user', displayName: 'Bal User', data: 'CONFIRM_ORDER_BALANCE' }
+  );
+  assert.ok(tgPaidReplies[0].includes('Pembayaran via Saldo Berhasil!'));
+  assert.ok(tgPaidReplies[0].includes('Total Dibayar (Saldo): Rp20.000'));
+  assert.ok(tgPaidReplies[0].includes('Sisa Saldo: Rp30.000'));
+  assert.equal(getCustomerRefundCreditTotal(tgCust.customer.id), 30000);
+
+  const tgTxMatch = tgPaidReplies[0].match(/TRX-[A-Z0-9-]+/);
+  assert.ok(tgTxMatch);
+  const tgTxId = tgTxMatch[0];
+  const tgTxRow = db.prepare('SELECT * FROM transactions WHERE transaction_id = ?').get(tgTxId) as {
+    payment_method: string;
+    payment_status: string;
+    transaction_status: string;
+    unique_code: number;
+    payment_amount: number;
+    expired_at: string | null;
+  };
+  assert.equal(tgTxRow.payment_method, 'BALANCE');
+  assert.equal(tgTxRow.payment_status, 'PAID');
+  assert.equal(tgTxRow.transaction_status, 'PAID_PROCESSING');
+  assert.equal(tgTxRow.unique_code, 0);
+  assert.equal(tgTxRow.payment_amount, 20000);
+  assert.equal(tgTxRow.expired_at, null);
+
+  // 5. Simulate Digiflazz definitive failure on this BALANCE order -> auto refund restores Rp20.000 back to Rp50.000
+  let supplierOutcome: 'FAILED' | 'SUCCESS' = 'FAILED';
+  const mockDigiBal = new DigiflazzService({
+    isConfigured: () => true,
+    fetchPriceList: async () => ({ ok: true, items: [] }),
+    checkBalance: async () => ({ ok: true, balance: 1000000 }),
+    createTransaction: async ({ refId }): Promise<DigiflazzTxResponse> => {
+      if (supplierOutcome === 'FAILED') {
+        return {
+          ok: false,
+          mappedStatus: 'FAILED',
+          rawStatus: 'Gagal',
+          rc: '07',
+          message: 'Nomor gangguan',
+          refId,
+        };
+      }
+      return {
+        ok: true,
+        mappedStatus: 'SUCCESS',
+        rawStatus: 'Sukses',
+        rc: '00',
+        sn: 'SN-BAL-RETRY-01',
+        message: 'Sukses',
+        refId,
+      };
+    },
+    inquireTransaction: async ({ refId }): Promise<DigiflazzTxResponse> => ({
+      ok: false,
+      mappedStatus: 'FAILED',
+      rawStatus: 'Gagal',
+      rc: '07',
+      message: 'Nomor gangguan',
+      refId,
+    }),
+  });
+
+  await processSingleSupplierJob(tgTxId, 'bal-test-worker', mockDigiBal);
+  const afterFailTx = db.prepare('SELECT transaction_status, supplier_status FROM transactions WHERE transaction_id = ?').get(tgTxId) as {
+    transaction_status: string;
+    supplier_status: string;
+  };
+  assert.equal(afterFailTx.supplier_status, 'FAILED');
+  assert.equal(afterFailTx.transaction_status, 'REFUNDED');
+  assert.equal(getCustomerRefundCreditTotal(tgCust.customer.id), 50000);
+
+  // Retry succeeds -> must reverse ONLY the REFUND_CREDIT (not ORDER_PAYMENT_DEBIT), leaving balance at Rp30.000
+  supplierOutcome = 'SUCCESS';
+  const retryRes = await retryFailedSupplierTransaction(tgTxId, actor, mockDigiBal);
+  assert.equal(retryRes.mappedStatus, 'SUCCESS');
+  assert.equal(retryRes.refundReversedAmount, 20000);
+  assert.equal(getCustomerRefundCreditTotal(tgCust.customer.id), 30000);
+
+  // Check Telegram /riwayat displays Telegram user ID (88220011) instead of CUS-
+  const tgHistoryReplies: string[] = [];
+  await dispatchTelegramCommand(
+    {
+      async reply(text) {
+        tgHistoryReplies.push(text);
+      },
+    },
+    { userId: '88220011', username: 'bal_user', displayName: 'Bal User', text: '/riwayat' }
+  );
+  assert.ok(tgHistoryReplies[0].includes('(88220011)'));
+  assert.equal(tgHistoryReplies[0].includes('CUS-'), false);
+
+  // 6. WhatsApp interactive !saldo payment flow + history displays phone number
+  const waCust = resolveOrCreateCustomer({
+    platform: 'WHATSAPP',
+    platformUserId: '6285169758268@s.whatsapp.net',
+    platformUsername: 'Musa',
+  });
+  applyManualRefundOrAdjustment(
+    {
+      customerId: waCust.customer.id,
+      entryType: 'MANUAL_ADJUSTMENT_CREDIT',
+      amount: 40000,
+      reason: 'Saldo WA test',
+    },
+    actor
+  );
+
+  clearWhatsappCooldown();
+  waBrandReplies.length = 0;
+  await handleWhatsappCommand(waMockSock, '6285169758268@s.whatsapp.net', 'pilih BAL_ISAT_10', 'Musa', { now: 110_000 });
+  await handleWhatsappCommand(waMockSock, '6285169758268@s.whatsapp.net', '085799998888', 'Musa', { now: 115_000 });
+  assert.ok(waBrandReplies[1].text.includes('Total Bayar via Saldo: *Rp20.000*'));
+  assert.ok(waBrandReplies[1].text.includes('saldo'));
+  await handleWhatsappCommand(waMockSock, '6285169758268@s.whatsapp.net', 'saldo', 'Musa', { now: 120_000 });
+  assert.ok(waBrandReplies[2].text.includes('*PEMBAYARAN SALDO BERHASIL*'));
+  assert.ok(waBrandReplies[2].text.includes('Sisa Saldo: Rp20.000'));
+  assert.equal(getCustomerRefundCreditTotal(waCust.customer.id), 20000);
+
+  await handleWhatsappCommand(waMockSock, '6285169758268@s.whatsapp.net', 'riwayat', 'Musa', { now: 125_000 });
+  assert.ok(waBrandReplies[3].text.includes('*Riwayat Transaksi (6285169758268)*'));
 });
 
 test.after(() => {

@@ -2,7 +2,14 @@ import crypto from 'node:crypto';
 import { getDb, withTransaction } from '../database/connection';
 import { config } from '../config/env';
 import { logger } from '../logging/logger';
-import { resolveEffectiveMargin, selectAvailableUniqueCode, computeFinalPaymentAmount, type MarginRule, type MarginType } from '../domain/pricing';
+import {
+  resolveEffectiveMargin,
+  selectAvailableUniqueCode,
+  computeFinalPaymentAmount,
+  computeBalancePaymentAmount,
+  type MarginRule,
+  type MarginType,
+} from '../domain/pricing';
 import {
   ACTIVE_CUSTOMER_TRANSACTION_STATUSES,
   canTransitionTransaction,
@@ -12,7 +19,12 @@ import {
   type TransactionStatus,
 } from '../domain/state-machine';
 import { maskDestination } from '../domain/masking';
-import { resolveOrCreateCustomer, findCustomerByPlatform, type CustomerPlatform } from './customer.service';
+import {
+  resolveOrCreateCustomer,
+  findCustomerByPlatform,
+  getCustomerRefundCreditTotal,
+  type CustomerPlatform,
+} from './customer.service';
 import { getGlobalMarginRule, getProductBySkuOrId } from './product.service';
 import { validateAndClaimCouponInTx, previewCouponReadOnly } from './coupon.service';
 import { isMaintenanceMode } from './settings.service';
@@ -59,6 +71,8 @@ export interface TransactionRow {
   completed_at: string | null;
 }
 
+export type PaymentMethod = 'QRIS' | 'BALANCE';
+
 export interface CreateOrderInput {
   platform: CustomerPlatform;
   platformUserId: string;
@@ -67,6 +81,7 @@ export interface CreateOrderInput {
   destination: string;
   couponCode?: string | null;
   idempotencyKey?: string | null;
+  paymentMethod?: PaymentMethod;
 }
 
 export interface CreateOrderResult {
@@ -77,11 +92,14 @@ export interface CreateOrderResult {
     | 'ACTIVE_INVOICE_EXISTS'
     | 'PRODUCT_UNAVAILABLE'
     | 'COUPON_INVALID'
+    | 'INSUFFICIENT_BALANCE'
     | 'GATEWAY_UNCONFIGURED'
     | 'GATEWAY_ERROR'
     | 'VALIDATION_ERROR';
   errorMessage?: string;
   cooldownRemainingSeconds?: number;
+  customerBalance?: number;
+  balanceAfter?: number;
   transaction?: TransactionRow;
   activeInvoice?: TransactionRow;
   qris?: {
@@ -227,7 +245,8 @@ export async function createOrder(
     };
   }
 
-  if (!gateway.isConfigured()) {
+  const paymentMethod: PaymentMethod = input.paymentMethod ?? 'QRIS';
+  if (paymentMethod === 'QRIS' && !gateway.isConfigured()) {
     return {
       ok: false,
       code: 'GATEWAY_UNCONFIGURED',
@@ -252,10 +271,13 @@ export async function createOrder(
       const parsedQris = existingByIdem.qris_payload_json
         ? (JSON.parse(existingByIdem.qris_payload_json) as { qrString?: string; qrUrl?: string })
         : undefined;
+      const currentBal = getCustomerRefundCreditTotal(customer.id);
       return {
         ok: true,
         transaction: existingByIdem,
         qris: parsedQris,
+        customerBalance: currentBal,
+        balanceAfter: currentBal,
       };
     }
   }
@@ -270,11 +292,11 @@ export async function createOrder(
     };
   }
 
-  let createdTx: TransactionRow;
+  let createdOutcome: { tx: TransactionRow; balanceBefore?: number; balanceAfter?: number };
   let earlyReject: CreateOrderResult | null = null;
 
   try {
-    createdTx = withTransaction((txDb) => {
+    createdOutcome = withTransaction((txDb) => {
       // 1. Check active invoice (Anti-Double-Order)
       const activeList = Array.from(ACTIVE_CUSTOMER_TRANSACTION_STATUSES);
       const placeholders = activeList.map(() => '?').join(',');
@@ -367,6 +389,112 @@ export async function createOrder(
         }
       }
 
+      const now = new Date();
+      const nowIso = now.toISOString();
+
+      if (paymentMethod === 'BALANCE') {
+        const uniqueCode = 0;
+        const paymentAmount = computeBalancePaymentAmount(marginCalc.sellingPrice, discountAmount);
+
+        const balRow = txDb
+          .prepare(
+            `SELECT COALESCE(SUM(
+               CASE
+                 WHEN entry_type IN ('REFUND_CREDIT', 'MANUAL_ADJUSTMENT_CREDIT') THEN amount
+                 WHEN entry_type IN ('MANUAL_ADJUSTMENT_DEBIT', 'ORDER_PAYMENT_DEBIT') THEN -amount
+                 ELSE 0
+               END
+             ), 0) as balance
+             FROM refund_ledger
+             WHERE customer_id = ?`
+          )
+          .get(customer.id) as { balance: number };
+        const balanceBefore = Number(balRow?.balance ?? 0);
+
+        if (balanceBefore < paymentAmount) {
+          earlyReject = {
+            ok: false,
+            code: 'INSUFFICIENT_BALANCE',
+            customerBalance: balanceBefore,
+            errorMessage: `Saldo Anda tidak mencukupi (Saldo: Rp${balanceBefore.toLocaleString('id-ID')}, Total: Rp${paymentAmount.toLocaleString('id-ID')}).`,
+          };
+          throw new Error('__EARLY_REJECT__');
+        }
+
+        txDb
+          .prepare(
+            `INSERT INTO transactions (
+              transaction_id, idempotency_key, customer_id, platform, product_id,
+              product_sku_snapshot, product_name_snapshot, supplier_price_snapshot, margin_snapshot,
+              coupon_code_snapshot, discount_snapshot, unique_code, payment_amount,
+              payment_method, payment_status, supplier_status, transaction_status,
+              destination, created_at, updated_at, expired_at, paid_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'BALANCE', 'PAID', 'NONE', 'PAID_PROCESSING', ?, ?, ?, NULL, ?)`
+          )
+          .run(
+            transactionId,
+            input.idempotencyKey ?? null,
+            customer.id,
+            input.platform,
+            product.id,
+            product.sku,
+            product.name,
+            product.supplier_price,
+            marginCalc.marginAmount,
+            couponCodeSnapshot,
+            discountAmount,
+            uniqueCode,
+            paymentAmount,
+            destination,
+            nowIso,
+            nowIso,
+            nowIso
+          );
+
+        if (paymentAmount > 0) {
+          const ledgerId = `LDG-${crypto.randomBytes(6).toString('hex').toUpperCase()}`;
+          txDb
+            .prepare(
+              `INSERT INTO refund_ledger (ledger_id, customer_id, transaction_id, entry_type, amount, description, actor_id, actor_source, created_at)
+               VALUES (?, ?, ?, 'ORDER_PAYMENT_DEBIT', ?, ?, ?, ?, ?)`
+            )
+            .run(
+              ledgerId,
+              customer.id,
+              transactionId,
+              paymentAmount,
+              `Pembayaran pesanan ${transactionId} (${product.name}) menggunakan saldo`,
+              customer.customer_code,
+              `${input.platform}_BALANCE_PAYMENT`,
+              nowIso
+            );
+        }
+
+        txDb
+          .prepare(
+            `INSERT INTO transaction_status_history (transaction_id, old_status, new_status, source, description, created_at)
+             VALUES (?, NULL, 'PAID_PROCESSING', ?, 'Order dibuat dan langsung dibayar lunas menggunakan saldo internal', ?)`
+          )
+          .run(transactionId, input.platform, nowIso);
+
+        txDb
+          .prepare(
+            `INSERT OR IGNORE INTO supplier_jobs (transaction_id, status, attempts, next_attempt_at, created_at, updated_at)
+             VALUES (?, 'PENDING', 0, ?, ?, ?)`
+          )
+          .run(transactionId, nowIso, nowIso, nowIso);
+
+        const txRow = txDb
+          .prepare('SELECT * FROM transactions WHERE transaction_id = ?')
+          .get(transactionId) as TransactionRow;
+
+        return {
+          tx: txRow,
+          balanceBefore,
+          balanceAfter: balanceBefore - paymentAmount,
+        };
+      }
+
       // 5. Select collision-free unique code 1..99
       const activeAmountRows = txDb
         .prepare(
@@ -385,9 +513,7 @@ export async function createOrder(
       );
       const paymentAmount = computeFinalPaymentAmount(marginCalc.sellingPrice, discountAmount, uniqueCode);
 
-      const now = new Date();
       const expiredAt = new Date(now.getTime() + config.transaction.invoiceExpiryMinutes * 60 * 1000).toISOString();
-      const nowIso = now.toISOString();
 
       txDb
         .prepare(
@@ -426,9 +552,10 @@ export async function createOrder(
         )
         .run(transactionId, input.platform, nowIso);
 
-      return txDb
+      const txRow = txDb
         .prepare('SELECT * FROM transactions WHERE transaction_id = ?')
         .get(transactionId) as TransactionRow;
+      return { tx: txRow };
     }, db);
   } catch (err) {
     if (earlyReject) return earlyReject;
@@ -441,6 +568,29 @@ export async function createOrder(
       };
     }
     throw err;
+  }
+
+  const createdTx = createdOutcome.tx;
+
+  if (paymentMethod === 'BALANCE') {
+    emitTransactionLogToGroups({
+      eventKey: 'paid',
+      transactionId: createdTx.transaction_id,
+      customerCode: customer.customer_code,
+      productName: createdTx.product_name_snapshot,
+      destination: createdTx.destination,
+      platform: createdTx.platform,
+      amount: createdTx.payment_amount,
+      status: 'PAID_PROCESSING',
+      note: 'Pembayaran lunas menggunakan saldo internal',
+    });
+
+    return {
+      ok: true,
+      transaction: createdTx,
+      customerBalance: createdOutcome.balanceBefore,
+      balanceAfter: createdOutcome.balanceAfter,
+    };
   }
 
   // 6. Request official QRIS invoice from MyZZStore outside DB transaction lock
@@ -1739,6 +1889,7 @@ export function previewOrderDryRun(input: {
   productSkuOrId: string | number;
   destination: string;
   couponCode?: string | null;
+  paymentMethod?: PaymentMethod;
 }): CreateOrderResult {
   if (isMaintenanceMode()) {
     return {
@@ -1818,6 +1969,63 @@ export function previewOrderDryRun(input: {
     }
   }
 
+  const customerBalance = existingCustomer ? getCustomerRefundCreditTotal(existingCustomer.customer.id) : 0;
+  const paymentMethod: PaymentMethod = input.paymentMethod ?? 'QRIS';
+  const now = new Date();
+  const previewTxId = `TRX-DEMO-${now.toISOString().slice(0, 10).replace(/-/g, '')}`;
+
+  if (paymentMethod === 'BALANCE') {
+    const paymentAmount = computeBalancePaymentAmount(marginCalc.sellingPrice, discountAmount);
+    if (customerBalance < paymentAmount) {
+      return {
+        ok: false,
+        code: 'INSUFFICIENT_BALANCE',
+        customerBalance,
+        errorMessage: `Saldo Anda tidak mencukupi (Saldo: Rp${customerBalance.toLocaleString('id-ID')}, Total: Rp${paymentAmount.toLocaleString('id-ID')}).`,
+      };
+    }
+
+    const previewBalanceTx: TransactionRow = {
+      id: 0,
+      transaction_id: previewTxId,
+      idempotency_key: null,
+      customer_id: existingCustomer?.customer.id ?? 0,
+      platform: input.platform,
+      product_id: product.id,
+      product_sku_snapshot: product.sku,
+      product_name_snapshot: product.name,
+      supplier_price_snapshot: product.supplier_price,
+      margin_snapshot: marginCalc.marginAmount,
+      coupon_code_snapshot: couponCodeSnapshot,
+      discount_snapshot: discountAmount,
+      unique_code: 0,
+      payment_amount: paymentAmount,
+      payment_method: 'BALANCE',
+      payment_status: 'PAID',
+      supplier_status: 'NONE',
+      transaction_status: 'PAID_PROCESSING',
+      gateway_reference: null,
+      qris_payload_json: null,
+      qr_message_ref_json: null,
+      supplier_reference: null,
+      supplier_sn: null,
+      supplier_message: null,
+      destination,
+      created_at: now.toISOString(),
+      updated_at: now.toISOString(),
+      expired_at: null,
+      paid_at: now.toISOString(),
+      completed_at: null,
+    };
+
+    return {
+      ok: true,
+      transaction: previewBalanceTx,
+      customerBalance,
+      balanceAfter: customerBalance - paymentAmount,
+    };
+  }
+
   const activeRows = db
     .prepare("SELECT payment_amount FROM transactions WHERE transaction_status IN ('CREATED', 'PENDING_PAYMENT', 'PAYMENT_PROCESSING')")
     .all() as Array<{ payment_amount: number }>;
@@ -1833,9 +2041,7 @@ export function previewOrderDryRun(input: {
     uniqueCode
   );
 
-  const now = new Date();
   const expiredAt = new Date(now.getTime() + config.transaction.invoiceExpiryMinutes * 60 * 1000).toISOString();
-  const previewTxId = `TRX-DEMO-${now.toISOString().slice(0, 10).replace(/-/g, '')}`;
   const qrString = `00020101021226590014ID.CO.DEMO.PPOB0215${previewTxId}540${paymentAmount}5802ID5912PPOB BOT DEMO6007JAKARTA6304DEMO`;
 
   const previewTransaction: TransactionRow = {
@@ -1874,6 +2080,7 @@ export function previewOrderDryRun(input: {
   return {
     ok: true,
     transaction: previewTransaction,
+    customerBalance,
     qris: { qrString },
   };
 }

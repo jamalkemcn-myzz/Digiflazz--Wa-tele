@@ -110,3 +110,11 @@ export function computeFinalPaymentAmount(
   if (total <= 0) throw new Error('Final payment amount must be greater than zero');
   return total;
 }
+
+export function computeBalancePaymentAmount(
+  sellingPrice: number,
+  discountAmount: number
+): number {
+  if (discountAmount < 0) throw new Error('Discount amount cannot be negative');
+  return Math.max(0, Math.round(sellingPrice) - Math.round(discountAmount));
+}

@@ -422,7 +422,7 @@ export function getCustomerRefundCreditTotal(customerId: number): number {
       `SELECT COALESCE(SUM(
          CASE
            WHEN entry_type IN ('REFUND_CREDIT', 'MANUAL_ADJUSTMENT_CREDIT') THEN amount
-           WHEN entry_type = 'MANUAL_ADJUSTMENT_DEBIT' THEN -amount
+           WHEN entry_type IN ('MANUAL_ADJUSTMENT_DEBIT', 'ORDER_PAYMENT_DEBIT') THEN -amount
            ELSE 0
          END
        ), 0) as balance
@@ -475,7 +475,7 @@ export function listCustomersDetailed(params: { page?: number; limit?: number; s
          (SELECT COALESCE(SUM(
             CASE
               WHEN rl.entry_type IN ('REFUND_CREDIT', 'MANUAL_ADJUSTMENT_CREDIT') THEN rl.amount
-              WHEN rl.entry_type = 'MANUAL_ADJUSTMENT_DEBIT' THEN -rl.amount
+              WHEN rl.entry_type IN ('MANUAL_ADJUSTMENT_DEBIT', 'ORDER_PAYMENT_DEBIT') THEN -rl.amount
               ELSE 0
             END
           ), 0) FROM refund_ledger rl WHERE rl.customer_id = c.id) as refund_balance
@@ -603,10 +603,14 @@ export function getCustomerProfileSummary(params: {
 
   const storedUsername = (resolved.identity.platform_username || '').trim();
   const resolvedUsername = cleanUsername || storedUsername || cleanDisplay || resolved.identity.platform_user_id;
+  const platformUserDisplayId =
+    params.platform === 'WHATSAPP'
+      ? extractWhatsappPhoneFromJid(resolved.identity.platform_user_id)
+      : resolved.identity.platform_user_id;
 
   return {
     customerId: resolved.customer.id,
-    userId: resolved.customer.customer_code,
+    userId: platformUserDisplayId || fallbackId || resolved.customer.customer_code,
     username: resolvedUsername,
     joinedAt: resolved.customer.created_at,
     balance,

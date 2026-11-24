@@ -7,6 +7,7 @@ import { logger } from '../logging/logger';
 interface Migration {
   id: string;
   name: string;
+  requiresForeignKeysOff?: boolean;
   up: (db: Database.Database) => void;
 }
 
@@ -476,6 +477,131 @@ const MIGRATIONS: Migration[] = [
       }
     },
   },
+  {
+    id: '006',
+    name: 'allow_balance_payment_constraints',
+    requiresForeignKeysOff: true,
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE transactions_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          transaction_id TEXT NOT NULL UNIQUE,
+          idempotency_key TEXT UNIQUE,
+          customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+          platform TEXT NOT NULL CHECK(platform IN ('WHATSAPP', 'TELEGRAM', 'DASHBOARD')),
+          product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+          product_sku_snapshot TEXT NOT NULL,
+          product_name_snapshot TEXT NOT NULL,
+          supplier_price_snapshot INTEGER NOT NULL,
+          margin_snapshot INTEGER NOT NULL,
+          coupon_code_snapshot TEXT,
+          discount_snapshot INTEGER NOT NULL DEFAULT 0,
+          unique_code INTEGER NOT NULL CHECK(unique_code BETWEEN 0 AND 99),
+          payment_amount INTEGER NOT NULL CHECK(payment_amount >= 0),
+          payment_method TEXT NOT NULL DEFAULT 'QRIS',
+          payment_status TEXT NOT NULL DEFAULT 'CREATED',
+          supplier_status TEXT NOT NULL DEFAULT 'NONE',
+          transaction_status TEXT NOT NULL DEFAULT 'CREATED',
+          gateway_reference TEXT UNIQUE,
+          qris_payload_json TEXT,
+          qr_message_ref_json TEXT,
+          supplier_reference TEXT UNIQUE,
+          supplier_sn TEXT,
+          supplier_message TEXT,
+          destination TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          expired_at TEXT,
+          paid_at TEXT,
+          completed_at TEXT
+        );
+
+        INSERT INTO transactions_new (
+          id, transaction_id, idempotency_key, customer_id, platform, product_id,
+          product_sku_snapshot, product_name_snapshot, supplier_price_snapshot, margin_snapshot,
+          coupon_code_snapshot, discount_snapshot, unique_code, payment_amount,
+          payment_method, payment_status, supplier_status, transaction_status,
+          gateway_reference, qris_payload_json, qr_message_ref_json,
+          supplier_reference, supplier_sn, supplier_message, destination,
+          created_at, updated_at, expired_at, paid_at, completed_at
+        )
+        SELECT
+          id, transaction_id, idempotency_key, customer_id, platform, product_id,
+          product_sku_snapshot, product_name_snapshot, supplier_price_snapshot, margin_snapshot,
+          coupon_code_snapshot, discount_snapshot, unique_code, payment_amount,
+          payment_method, payment_status, supplier_status, transaction_status,
+          gateway_reference, qris_payload_json, qr_message_ref_json,
+          supplier_reference, supplier_sn, supplier_message, destination,
+          created_at, updated_at, expired_at, paid_at, completed_at
+        FROM transactions;
+
+        DROP TABLE transactions;
+        ALTER TABLE transactions_new RENAME TO transactions;
+
+        CREATE INDEX IF NOT EXISTS idx_transactions_customer ON transactions(customer_id);
+        CREATE INDEX IF NOT EXISTS idx_transactions_status ON transactions(transaction_status);
+        CREATE INDEX IF NOT EXISTS idx_transactions_created ON transactions(created_at);
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_tx_per_customer
+          ON transactions(customer_id)
+          WHERE transaction_status IN (
+            'CREATED', 'PENDING_PAYMENT', 'PAYMENT_PROCESSING',
+            'PAID', 'PAID_PROCESSING', 'SUPPLIER_PENDING', 'SUPPLIER_PROCESSING'
+          );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_active_payment_amount
+          ON transactions(payment_amount)
+          WHERE transaction_status IN ('CREATED', 'PENDING_PAYMENT', 'PAYMENT_PROCESSING');
+
+        DROP TRIGGER IF EXISTS prevent_refund_ledger_update;
+        DROP TRIGGER IF EXISTS prevent_refund_ledger_delete;
+
+        CREATE TABLE refund_ledger_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ledger_id TEXT NOT NULL UNIQUE,
+          customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+          transaction_id TEXT REFERENCES transactions(transaction_id) ON DELETE RESTRICT,
+          entry_type TEXT NOT NULL CHECK(entry_type IN ('REFUND_CREDIT', 'MANUAL_ADJUSTMENT_CREDIT', 'MANUAL_ADJUSTMENT_DEBIT', 'ORDER_PAYMENT_DEBIT')),
+          amount INTEGER NOT NULL,
+          description TEXT NOT NULL,
+          actor_id TEXT NOT NULL,
+          actor_source TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+
+        INSERT INTO refund_ledger_new (
+          id, ledger_id, customer_id, transaction_id, entry_type,
+          amount, description, actor_id, actor_source, created_at
+        )
+        SELECT
+          id, ledger_id, customer_id, transaction_id, entry_type,
+          amount, description, actor_id, actor_source, created_at
+        FROM refund_ledger;
+
+        DROP TABLE refund_ledger;
+        ALTER TABLE refund_ledger_new RENAME TO refund_ledger;
+
+        CREATE INDEX IF NOT EXISTS idx_refund_ledger_customer ON refund_ledger(customer_id);
+
+        CREATE TRIGGER IF NOT EXISTS prevent_refund_ledger_update
+        BEFORE UPDATE ON refund_ledger
+        BEGIN
+          SELECT RAISE(ABORT, 'refund_ledger is immutable and cannot be updated');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS prevent_refund_ledger_delete
+        BEFORE DELETE ON refund_ledger
+        BEGIN
+          SELECT RAISE(ABORT, 'refund_ledger is immutable and cannot be deleted');
+        END;
+      `);
+
+      const fkViolations = db.pragma('foreign_key_check') as unknown[];
+      if (fkViolations.length > 0) {
+        throw new Error(`Migration 006 foreign_key_check failed: ${JSON.stringify(fkViolations)}`);
+      }
+    },
+  },
 ];
 
 export function runMigrations(customDb?: Database.Database): void {
@@ -494,12 +620,21 @@ export function runMigrations(customDb?: Database.Database): void {
   for (const migration of MIGRATIONS) {
     if (appliedIds.has(migration.id)) continue;
 
-    withTransaction((txDb) => {
-      migration.up(txDb);
-      txDb
-        .prepare('INSERT INTO schema_migrations (id, name, applied_at) VALUES (?, ?, ?)')
-        .run(migration.id, migration.name, new Date().toISOString());
-    }, db);
+    if (migration.requiresForeignKeysOff) {
+      db.pragma('foreign_keys = OFF');
+    }
+    try {
+      withTransaction((txDb) => {
+        migration.up(txDb);
+        txDb
+          .prepare('INSERT INTO schema_migrations (id, name, applied_at) VALUES (?, ?, ?)')
+          .run(migration.id, migration.name, new Date().toISOString());
+      }, db);
+    } finally {
+      if (migration.requiresForeignKeysOff) {
+        db.pragma('foreign_keys = ON');
+      }
+    }
 
     logger.info(`Applied database migration ${migration.id}_${migration.name}`, {
       service: 'migration',

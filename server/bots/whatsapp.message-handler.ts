@@ -71,7 +71,7 @@ export async function handleWhatsappMessagesUpsert(sock: WASocket, rawUpsert: un
   const upsert = rawUpsert as {
     type?: string;
     messages?: Array<{
-      key?: { id?: string; fromMe?: boolean; remoteJid?: string };
+      key?: { id?: string; fromMe?: boolean; remoteJid?: string; remoteJidAlt?: string };
       pushName?: string;
       message?: Record<string, any>;
     }>;
@@ -79,25 +79,31 @@ export async function handleWhatsappMessagesUpsert(sock: WASocket, rawUpsert: un
 
   if (upsert?.type !== 'notify' || !Array.isArray(upsert.messages)) return;
 
-  const baileyTransport: WhatsappReplyTransport = {
-    async sendMessage(jid, content) {
-      if ('image' in content) {
-        return sock.sendMessage(jid, { image: content.image, caption: content.caption });
-      }
-      return sock.sendMessage(jid, { text: content.text });
-    },
-  };
-
   for (const msg of upsert.messages) {
     const id = msg.key?.id;
-    const remoteJid = msg.key?.remoteJid;
-    if (!id || !remoteJid || msg.key?.fromMe) continue;
-    if (remoteJid === 'status@broadcast' || remoteJid.endsWith('@g.us')) continue;
+    const rawRemoteJid = msg.key?.remoteJid;
+    const remoteJidAlt = msg.key?.remoteJidAlt;
+    if (!id || !rawRemoteJid || msg.key?.fromMe) continue;
+    if (rawRemoteJid === 'status@broadcast' || rawRemoteJid.endsWith('@g.us')) continue;
     if (!rememberMessageId(id)) continue;
 
     const text = extractIncomingWhatsappText(msg.message);
     if (!text.trim()) continue;
 
-    await handleWhatsappCommand(baileyTransport, remoteJid, text, msg.pushName);
+    const customerJid =
+      rawRemoteJid.endsWith('@lid') && remoteJidAlt && !remoteJidAlt.endsWith('@lid')
+        ? remoteJidAlt
+        : rawRemoteJid;
+
+    const baileyTransport: WhatsappReplyTransport = {
+      async sendMessage(_jid, content) {
+        if ('image' in content) {
+          return sock.sendMessage(rawRemoteJid, { image: content.image, caption: content.caption });
+        }
+        return sock.sendMessage(rawRemoteJid, { text: content.text });
+      },
+    };
+
+    await handleWhatsappCommand(baileyTransport, customerJid, text, msg.pushName);
   }
 }

@@ -38,7 +38,10 @@ import {
   getCustomerTransactions,
   getTransactionDetail,
   saveQrMessageReference,
+  processSingleSupplierJob,
+  type PaymentMethod,
 } from '../services/transaction.service';
+import { digiflazzService } from '../integrations/digiflazz.service';
 import {
   resolveAdminByPlatform,
   checkAdminPermission,
@@ -468,14 +471,14 @@ export async function sendTelegramCategoryList(transport: TelegramReplyTransport
 
 function buildBrandPickerButtons(
   categoryId: number,
-  brands: Array<{ brand: string; productCount: number }>
+  brands: Array<{ brand: string; productCount?: number }>
 ): TelegramInlineButton[][] {
   const shown = brands.slice(0, 16);
   const buttons: TelegramInlineButton[][] = [];
   for (let i = 0; i < shown.length; i += 2) {
     buttons.push(
       shown.slice(i, i + 2).map((b, offset) => ({
-        text: `📶 ${b.brand} (${b.productCount})`,
+        text: `📶 ${b.brand}`,
         callbackData: buildBrandCallbackData(categoryId, b.brand, i + offset, 1),
       }))
     );
@@ -1061,6 +1064,9 @@ export async function promptTelegramOrderConfirmation(
 
   const p = preview.transaction;
   const sellingPrice = p.supplier_price_snapshot + p.margin_snapshot;
+  const exactTotal = Math.max(0, sellingPrice - p.discount_snapshot);
+  const customerBalance = preview.customerBalance ?? 0;
+  const canPayWithBalance = customerBalance >= exactTotal;
   const productRow = getProductBySkuOrId(p.product_sku_snapshot);
   const productDesc = productRow?.description?.trim() || null;
   const globalDesc = getConfirmationDescription();
@@ -1075,6 +1081,9 @@ export async function promptTelegramOrderConfirmation(
       sellingPrice,
       discountAmount: p.discount_snapshot,
       estimatedTotal: p.payment_amount,
+      exactTotal,
+      customerBalance,
+      canPayWithBalance,
       destination: params.destination.trim(),
       couponCode: p.coupon_code_snapshot,
       updatedAt: Date.now(),
@@ -1088,22 +1097,40 @@ export async function promptTelegramOrderConfirmation(
       : `Keterangan: ${productDesc}\n`
     : '';
 
+  const confirmButtons: TelegramInlineButton[][] = canPayWithBalance
+    ? [
+        [
+          { text: '💳 Bayar via Saldo', callbackData: 'CONFIRM_ORDER_BALANCE' },
+          { text: '✅ Bayar via QRIS', callbackData: 'CONFIRM_ORDER' },
+        ],
+        [{ text: '❌ Batal', callbackData: 'CANCEL_CONFIRM_ORDER' }],
+      ]
+    : [
+        [
+          { text: '✅ Ya, Buat QRIS', callbackData: 'CONFIRM_ORDER' },
+          { text: '❌ Batal', callbackData: 'CANCEL_CONFIRM_ORDER' },
+        ],
+      ];
+
+  const promptLine = canPayWithBalance
+    ? `Saldo Anda mencukupi. Pilih metode pembayaran di bawah (atau ketik *saldo* / *ya*):`
+    : `Apakah Anda yakin ingin membuat invoice QRIS sekarang?`;
+
   await transport.reply(
     `Konfirmasi Pesanan Anda\n\n` +
       `Produk: ${p.product_name_snapshot}\n` +
       `Tujuan: ${params.destination.trim()}\n` +
       `Harga: Rp${sellingPrice.toLocaleString('id-ID')}\n` +
       (p.coupon_code_snapshot ? `Kupon: ${p.coupon_code_snapshot} (-Rp${p.discount_snapshot.toLocaleString('id-ID')})\n` : '') +
-      `Estimasi Total (+ Kode Unik): Rp${p.payment_amount.toLocaleString('id-ID')}\n` +
+      (canPayWithBalance
+        ? `Total Bayar via Saldo: Rp${exactTotal.toLocaleString('id-ID')}\n`
+        : '') +
+      `Estimasi Total QRIS (+ Kode Unik): Rp${p.payment_amount.toLocaleString('id-ID')}\n` +
+      `Saldo Anda: Rp${customerBalance.toLocaleString('id-ID')}\n` +
       productDescLine +
       (globalDesc ? `Catatan: ${globalDesc}\n` : '') +
-      `\nApakah Anda yakin ingin membuat invoice QRIS sekarang?`,
-    [
-      [
-        { text: '✅ Ya, Buat QRIS', callbackData: 'CONFIRM_ORDER' },
-        { text: '❌ Batal', callbackData: 'CANCEL_CONFIRM_ORDER' },
-      ],
-    ]
+      `\n${promptLine}`,
+    confirmButtons
   );
 }
 
@@ -1115,9 +1142,11 @@ export async function executeTelegramOrder(
     sku: string;
     destination: string;
     couponCode?: string | null;
+    paymentMethod?: PaymentMethod;
     dryRun?: boolean;
   }
 ): Promise<void> {
+  const paymentMethod: PaymentMethod = params.paymentMethod ?? 'QRIS';
   clearBotSession('TELEGRAM', params.userId, params.dryRun);
   const resolvedCoupon =
     params.couponCode?.trim() || getPendingVoucher('TELEGRAM', params.userId, params.dryRun) || null;
@@ -1126,7 +1155,9 @@ export async function executeTelegramOrder(
   }
   const dismissStatus = transport.sendStatusMessage
     ? await transport.sendStatusMessage(
-        '⏳ *Sedang membuat QRIS pembayaran...*\nMohon tunggu sebentar ya Kak, gambar QRIS sedang disiapkan.'
+        paymentMethod === 'BALANCE'
+          ? '⏳ *Memproses pembayaran via saldo...*\nMohon tunggu sebentar ya Kak.'
+          : '⏳ *Sedang membuat QRIS pembayaran...*\nMohon tunggu sebentar ya Kak, gambar QRIS sedang disiapkan.'
       )
     : undefined;
 
@@ -1138,6 +1169,7 @@ export async function executeTelegramOrder(
           productSkuOrId: params.sku,
           destination: params.destination,
           couponCode: resolvedCoupon,
+          paymentMethod,
         })
       : await createOrder({
           platform: 'TELEGRAM',
@@ -1146,6 +1178,7 @@ export async function executeTelegramOrder(
           productSkuOrId: params.sku,
           destination: params.destination,
           couponCode: resolvedCoupon,
+          paymentMethod,
         });
 
     if (!result.ok || !result.transaction) {
@@ -1172,6 +1205,33 @@ export async function executeTelegramOrder(
     }
 
     const tx = result.transaction;
+
+    if (paymentMethod === 'BALANCE') {
+      if (!params.dryRun && config.nodeEnv !== 'test' && digiflazzService.isConfigured()) {
+        void processSingleSupplierJob(tx.transaction_id, 'tg-balance-instant', digiflazzService).catch(() => undefined);
+      }
+      const balanceAfter = result.balanceAfter ?? 0;
+      await transport.reply(
+        `✅ *Pembayaran via Saldo Berhasil!*\n\n` +
+          `ID Transaksi: ${tx.transaction_id}\n` +
+          `Produk: ${tx.product_name_snapshot}\n` +
+          `Tujuan: ${maskDestination(tx.destination)}\n` +
+          (tx.discount_snapshot > 0 ? `Diskon: -Rp${tx.discount_snapshot.toLocaleString('id-ID')}\n` : '') +
+          `Total Dibayar (Saldo): Rp${tx.payment_amount.toLocaleString('id-ID')}\n` +
+          `Sisa Saldo: Rp${balanceAfter.toLocaleString('id-ID')}\n` +
+          `Status: ${tx.transaction_status}\n\n` +
+          `Pesanan sedang diteruskan ke supplier untuk diproses otomatis ya Kak.` +
+          (params.dryRun
+            ? `\n\n[Mode Demo: pratinjau pembayaran saldo, saldo & transaksi tidak disimpan ke database]`
+            : ''),
+        [
+          [{ text: '🔍 Cek Status Pesanan', callbackData: `STATUS_${tx.transaction_id}` }],
+          [{ text: '🏠 Menu Utama', callbackData: 'MAIN_MENU' }],
+        ]
+      );
+      return;
+    }
+
     const originalPaymentUrl =
       result.qris?.qrUrl && !result.qris.qrUrl.startsWith('data:') ? result.qris.qrUrl : undefined;
     const caption =
@@ -1332,7 +1392,8 @@ export async function dispatchTelegramCommand(
     }
 
     if (session?.mode === 'AWAITING_ORDER_CONFIRMATION') {
-      if (['ya', 'iya', 'ok', 'oke', 'lanjut', 'konfirmasi', 'y'].includes(cmd)) {
+      const lowerRaw = trimmed.toLowerCase();
+      if (['saldo', 'balance'].includes(cmd) || lowerRaw === 'bayar saldo' || lowerRaw === 'pakai saldo') {
         if (!acquireOrderExecutionLock('TELEGRAM', input.userId, dryRun)) {
           return;
         }
@@ -1344,6 +1405,27 @@ export async function dispatchTelegramCommand(
             sku: session.sku,
             destination: session.destination,
             couponCode: session.couponCode || null,
+            paymentMethod: 'BALANCE',
+            dryRun,
+          });
+        } finally {
+          releaseOrderExecutionLock('TELEGRAM', input.userId, dryRun);
+        }
+        return;
+      }
+      if (['ya', 'iya', 'ok', 'oke', 'lanjut', 'konfirmasi', 'y', 'qris'].includes(cmd) || lowerRaw === 'bayar qris') {
+        if (!acquireOrderExecutionLock('TELEGRAM', input.userId, dryRun)) {
+          return;
+        }
+        try {
+          markOrderConfirmedRecently('TELEGRAM', input.userId, dryRun);
+          await executeTelegramOrder(transport, {
+            userId: input.userId,
+            username: input.username,
+            sku: session.sku,
+            destination: session.destination,
+            couponCode: session.couponCode || null,
+            paymentMethod: 'QRIS',
             dryRun,
           });
         } finally {
@@ -1356,14 +1438,23 @@ export async function dispatchTelegramCommand(
         await transport.reply('Pembuatan pesanan dibatalkan sebelum QRIS dibuat.', TG_NAV_BACK_BUTTONS);
         return;
       }
+      const fallbackButtons: TelegramInlineButton[][] = session.canPayWithBalance
+        ? [
+            [
+              { text: '💳 Bayar via Saldo', callbackData: 'CONFIRM_ORDER_BALANCE' },
+              { text: '✅ Bayar via QRIS', callbackData: 'CONFIRM_ORDER' },
+            ],
+            [{ text: '❌ Batal', callbackData: 'CANCEL_CONFIRM_ORDER' }],
+          ]
+        : [
+            [
+              { text: '✅ Ya, Buat QRIS', callbackData: 'CONFIRM_ORDER' },
+              { text: '❌ Batal', callbackData: 'CANCEL_CONFIRM_ORDER' },
+            ],
+          ];
       await transport.reply(
-        `Pesanan ${session.productName} (${session.destination}) menunggu konfirmasi Anda.\nTekan tombol Ya, Buat QRIS atau Batal di bawah ini:`,
-        [
-          [
-            { text: '✅ Ya, Buat QRIS', callbackData: 'CONFIRM_ORDER' },
-            { text: '❌ Batal', callbackData: 'CANCEL_CONFIRM_ORDER' },
-          ],
-        ]
+        `Pesanan ${session.productName} (${session.destination}) menunggu konfirmasi Anda.\nPilih metode pembayaran atau tekan Batal di bawah ini:`,
+        fallbackButtons
       );
       return;
     }
@@ -1736,8 +1827,8 @@ export async function dispatchTelegramCommand(
     );
 
     await transport.reply(
-      `Riwayat Transaksi (${customer.customer_code})\n` +
-        `Kredit Refund Internal: Rp${refundTotal.toLocaleString('id-ID')}\n\n` +
+      `Riwayat Transaksi (${input.userId})\n` +
+        `Saldo: Rp${refundTotal.toLocaleString('id-ID')}\n\n` +
         (lines.length > 0 ? lines.join('\n') : 'Belum ada riwayat transaksi ya Kak.'),
       TG_NAV_BACK_BUTTONS
     );

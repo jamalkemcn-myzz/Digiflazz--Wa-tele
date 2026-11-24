@@ -83,11 +83,17 @@ export async function dispatchTelegramCallback(
     return;
   }
 
-  if (data === 'CONFIRM_ORDER') {
+  if (data === 'CONFIRM_ORDER' || data === 'CONFIRM_ORDER_BALANCE') {
+    const paymentMethod = data === 'CONFIRM_ORDER_BALANCE' ? 'BALANCE' : 'QRIS';
     const userId = input.userId || 'guest';
     if (!acquireOrderExecutionLock('TELEGRAM', userId, dryRun)) {
       if (transport.answerCbQuery) {
-        await transport.answerCbQuery('Sedang membuat invoice QRIS, mohon tunggu...', false);
+        await transport.answerCbQuery(
+          paymentMethod === 'BALANCE'
+            ? 'Sedang memproses pembayaran saldo, mohon tunggu...'
+            : 'Sedang membuat invoice QRIS, mohon tunggu...',
+          false
+        );
       }
       return;
     }
@@ -97,7 +103,12 @@ export async function dispatchTelegramCallback(
       if (session?.mode !== 'AWAITING_ORDER_CONFIRMATION') {
         if (wasOrderConfirmedRecently('TELEGRAM', userId, dryRun, input.sourceMessageId)) {
           if (transport.answerCbQuery) {
-            await transport.answerCbQuery('Invoice QRIS baru saja diproses, silakan cek pesan terbaru.', false);
+            await transport.answerCbQuery(
+              paymentMethod === 'BALANCE'
+                ? 'Pembayaran saldo baru saja diproses, silakan cek pesan terbaru.'
+                : 'Invoice QRIS baru saja diproses, silakan cek pesan terbaru.',
+              false
+            );
           }
           return;
         }
@@ -117,7 +128,10 @@ export async function dispatchTelegramCallback(
         await transport.deleteSourceMessage();
       }
       if (transport.answerCbQuery) {
-        await transport.answerCbQuery('⏳ Membuat QRIS pembayaran...', false);
+        await transport.answerCbQuery(
+          paymentMethod === 'BALANCE' ? '⏳ Memproses pembayaran saldo...' : '⏳ Membuat QRIS pembayaran...',
+          false
+        );
       }
       await executeTelegramOrder(transport, {
         userId,
@@ -125,6 +139,7 @@ export async function dispatchTelegramCallback(
         sku: session.sku,
         destination: session.destination,
         couponCode: session.couponCode || null,
+        paymentMethod,
         dryRun,
       });
       return;
@@ -565,8 +580,8 @@ export async function dispatchTelegramCallback(
       (t) => `• ${t.transaction_id} — ${t.product_name_snapshot} (Rp${t.payment_amount.toLocaleString('id-ID')}) [${t.transaction_status}]`
     );
     await transport.reply(
-      `Riwayat Transaksi (${resolved.customer.customer_code})\n` +
-        `Kredit Refund Internal: Rp${refundTotal.toLocaleString('id-ID')}\n\n` +
+      `Riwayat Transaksi (${input.userId})\n` +
+        `Saldo: Rp${refundTotal.toLocaleString('id-ID')}\n\n` +
         lines.join('\n'),
       TG_NAV_BACK_BUTTONS
     );
@@ -790,7 +805,12 @@ export function registerTelegramCallbacks(bot: Telegraf): void {
 
     // Immediately acknowledge non-alert, non-confirmation callbacks so Telegram removes the spinner right away;
     // STATUS_* waits for DB lookup alert text, and CONFIRM_ORDER / CANCEL_CONFIRM_ORDER answer right after lock check.
-    if (!data.startsWith('STATUS_') && data !== 'CONFIRM_ORDER' && data !== 'CANCEL_CONFIRM_ORDER') {
+    if (
+      !data.startsWith('STATUS_') &&
+      data !== 'CONFIRM_ORDER' &&
+      data !== 'CONFIRM_ORDER_BALANCE' &&
+      data !== 'CANCEL_CONFIRM_ORDER'
+    ) {
       void answerOnce();
     }
 

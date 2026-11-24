@@ -393,9 +393,12 @@ export function TransactionsPage({ permissions }: { permissions: string[] }) {
                     </p>
                   </div>
                   <div>
-                    <p className="text-xs text-slate-400">Total Pembayaran</p>
+                    <p className="text-xs text-slate-400">Total & Metode Bayar</p>
                     <p className="font-mono font-bold tabular-nums text-slate-100">
-                      {formatRp(selectedDetail.transaction.payment_amount)}
+                      {formatRp(selectedDetail.transaction.payment_amount)}{' '}
+                      <span className="text-xs font-normal text-[#60a5fa]">
+                        ({selectedDetail.transaction.payment_method})
+                      </span>
                     </p>
                   </div>
                   <div>
