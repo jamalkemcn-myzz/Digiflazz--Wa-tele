@@ -3060,7 +3060,7 @@ test('Manual Digiflazz Retry (Tembak Ulang): strict FAILED-only guard, -R1/-R2 r
     });
     assert.equal(unpaidApiRes.status, 400);
 
-    // 2. Mark PAID, first Digiflazz fails -> REFUNDED + credit recorded in refund_ledger
+    // 2. Mark PAID, first Digiflazz fails -> auto-refund runs (REFUNDED) -> retry MUST be blocked!
     handleVerifiedPaymentPaid(unpaidTxId, 'TEST_CALLBACK', new Date().toISOString());
     const supplier = new DigiflazzService();
     digiMode = 'FAIL';
@@ -3079,58 +3079,91 @@ test('Manual Digiflazz Retry (Tembak Ulang): strict FAILED-only guard, -R1/-R2 r
     const refundBalBefore = getCustomerRefundCreditTotal(txAfterFail.customer_id);
     assert.ok(refundBalBefore >= txAfterFail.payment_amount);
 
-    // 3. Detail endpoint reports eligible=true with -R1 and hadAutoRefund=true
-    const detailRes1 = await fetch(`http://127.0.0.1:${apiPort}/api/admin/transactions/${unpaidTxId}`, {
+    const detailRefundedRes = await fetch(`http://127.0.0.1:${apiPort}/api/admin/transactions/${unpaidTxId}`, {
+      headers: { Authorization: authHeader },
+    });
+    assert.equal(detailRefundedRes.status, 200);
+    const detailRefundedJson = (await detailRefundedRes.json()) as {
+      ok: boolean;
+      data: { supplierRetryEligibility: { eligible: boolean; hadAutoRefund: boolean; reason: string } };
+    };
+    assert.equal(detailRefundedJson.data.supplierRetryEligibility.eligible, false);
+    assert.equal(detailRefundedJson.data.supplierRetryEligibility.hadAutoRefund, true);
+    assert.match(detailRefundedJson.data.supplierRetryEligibility.reason, /di-refund otomatis/i);
+
+    const retryRefundedHttp = await fetch(`http://127.0.0.1:${apiPort}/api/admin/transactions/${unpaidTxId}/retry-supplier`, {
+      method: 'POST',
+      headers: { Authorization: authHeader },
+    });
+    assert.equal(retryRefundedHttp.status, 400);
+
+    // 3. Unrefunded FAILED transaction within 1 hour -> eligible=true -> retry returns PENDING (-R1) -> poll resolves SUCCESS
+    const pendingRetryOrder = await createOrder(
+      {
+        platform: 'TELEGRAM',
+        platformUserId: 'retry-test-user-unrefunded-1',
+        productSkuOrId: 'TSEL10',
+        destination: '081255110033',
+      },
+      gw
+    );
+    const pendingRetryTxId = pendingRetryOrder.transaction!.transaction_id;
+    handleVerifiedPaymentPaid(pendingRetryTxId, 'TEST_CALLBACK', new Date().toISOString());
+    const failIso = new Date().toISOString();
+    db.prepare(
+      `UPDATE transactions
+       SET transaction_status = 'FAILED', supplier_status = 'FAILED', supplier_reference = ?, supplier_message = 'Gagal sementara', completed_at = ?, updated_at = ?
+       WHERE transaction_id = ?`
+    ).run(pendingRetryTxId, failIso, failIso, pendingRetryTxId);
+    db.prepare(
+      `UPDATE supplier_jobs SET status = 'FAILED_DEFINITIVE', attempts = 1, updated_at = ? WHERE transaction_id = ?`
+    ).run(failIso, pendingRetryTxId);
+    db.prepare(
+      `INSERT INTO transaction_status_history (transaction_id, old_status, new_status, source, description, created_at)
+       VALUES (?, 'PAID_PROCESSING', 'FAILED', 'DIGIFLAZZ', 'Supplier gagal definitif tanpa auto-refund', ?)`
+    ).run(pendingRetryTxId, failIso);
+
+    const detailRes1 = await fetch(`http://127.0.0.1:${apiPort}/api/admin/transactions/${pendingRetryTxId}`, {
       headers: { Authorization: authHeader },
     });
     assert.equal(detailRes1.status, 200);
     const detailJson1 = (await detailRes1.json()) as {
       ok: boolean;
-      data: { supplierRetryEligibility: { eligible: boolean; nextRefId: string; hadAutoRefund: boolean } };
+      data: { supplierRetryEligibility: { eligible: boolean; nextRefId: string; hadAutoRefund: boolean; retryDeadlineAt?: string } };
     };
     assert.equal(detailJson1.data.supplierRetryEligibility.eligible, true);
-    assert.equal(detailJson1.data.supplierRetryEligibility.nextRefId, `${unpaidTxId}-R1`);
-    assert.equal(detailJson1.data.supplierRetryEligibility.hadAutoRefund, true);
+    assert.equal(detailJson1.data.supplierRetryEligibility.nextRefId, `${pendingRetryTxId}-R1`);
+    assert.equal(detailJson1.data.supplierRetryEligibility.hadAutoRefund, false);
+    assert.ok(detailJson1.data.supplierRetryEligibility.retryDeadlineAt);
 
-    // 4. First manual retry via HTTP -> Digiflazz returns FAILED again -> stays REFUNDED without double refund, supplier_reference=-R1
-    const retryRes1 = await fetch(`http://127.0.0.1:${apiPort}/api/admin/transactions/${unpaidTxId}/retry-supplier`, {
+    // Retry -> Digiflazz returns PENDING with -R1 -> SUPPLIER_PENDING, further retry blocked while PENDING!
+    digiMode = 'PENDING';
+    const retryResPending = await fetch(`http://127.0.0.1:${apiPort}/api/admin/transactions/${pendingRetryTxId}/retry-supplier`, {
       method: 'POST',
       headers: { Authorization: authHeader },
     });
-    assert.equal(retryRes1.status, 200);
-    const retryJson1 = (await retryRes1.json()) as {
+    assert.equal(retryResPending.status, 200);
+    const retryPendingJson = (await retryResPending.json()) as {
       ok: boolean;
-      data: { retryRefId: string; mappedStatus: string; refundReversedAmount: number; transaction: { supplier_reference: string; transaction_status: string } };
+      data: { retryRefId: string; mappedStatus: string; transaction: { transaction_status: string; supplier_reference: string } };
     };
-    assert.equal(retryJson1.data.retryRefId, `${unpaidTxId}-R1`);
-    assert.equal(retryJson1.data.mappedStatus, 'FAILED');
-    assert.equal(retryJson1.data.refundReversedAmount, 0);
-    assert.equal(retryJson1.data.transaction.transaction_status, 'REFUNDED');
-    assert.equal(retryJson1.data.transaction.supplier_reference, `${unpaidTxId}-R1`);
-    assert.equal(receivedDigiCalls[receivedDigiCalls.length - 1].ref_id, `${unpaidTxId}-R1`);
-    assert.equal(getCustomerRefundCreditTotal(txAfterFail.customer_id), refundBalBefore);
+    assert.equal(retryPendingJson.data.retryRefId, `${pendingRetryTxId}-R1`);
+    assert.equal(retryPendingJson.data.mappedStatus, 'PENDING');
+    assert.equal(retryPendingJson.data.transaction.transaction_status, 'SUPPLIER_PENDING');
+    assert.equal(checkSupplierRetryEligibility(pendingRetryTxId).eligible, false);
 
-    // 5. Second retry -> Digiflazz returns PENDING with -R2 -> SUPPLIER_PENDING, further retry blocked while PENDING!
-    digiMode = 'PENDING';
-    const retryRes2 = await retryFailedSupplierTransaction(unpaidTxId, { id: 'testowner', role: 'OWNER' }, supplier);
-    assert.equal(retryRes2.retryRefId, `${unpaidTxId}-R2`);
-    assert.equal(retryRes2.mappedStatus, 'PENDING');
-    assert.equal(retryRes2.transaction.transaction_status, 'SUPPLIER_PENDING');
-    assert.equal(checkSupplierRetryEligibility(unpaidTxId).eligible, false);
-
-    // 6. Scheduled poll now inquires using -R2 (not old unpaidTxId) and resolves SUCCESS, reversing auto-refund!
+    // Scheduled poll now inquires using -R1 and resolves SUCCESS
     db.prepare('UPDATE supplier_jobs SET next_attempt_at = ? WHERE transaction_id = ?').run(
       new Date(Date.now() - 1000).toISOString(),
-      unpaidTxId
+      pendingRetryTxId
     );
     digiMode = 'SUCCESS';
-    const pollAfterRetry = await processSingleSupplierJob(unpaidTxId, 'worker-2', supplier);
+    const pollAfterRetry = await processSingleSupplierJob(pendingRetryTxId, 'worker-2', supplier);
     assert.equal(pollAfterRetry.status, 'SUCCESS');
-    assert.equal(receivedDigiCalls[receivedDigiCalls.length - 1].ref_id, `${unpaidTxId}-R2`);
-    assert.equal(getCustomerRefundCreditTotal(txAfterFail.customer_id), refundBalBefore - txAfterFail.payment_amount);
-    assert.equal(checkSupplierRetryEligibility(unpaidTxId).eligible, false);
+    assert.equal(receivedDigiCalls[receivedDigiCalls.length - 1].ref_id, `${pendingRetryTxId}-R1`);
+    assert.equal(checkSupplierRetryEligibility(pendingRetryTxId).eligible, false);
 
-    // 7. Also verify direct immediate SUCCESS on manual retry reverses refund and records audit log
+    // 4. Direct immediate SUCCESS on unrefunded FAILED manual retry within 1 hour + audit log
     const directOrder = await createOrder(
       {
         platform: 'TELEGRAM',
@@ -3142,13 +3175,19 @@ test('Manual Digiflazz Retry (Tembak Ulang): strict FAILED-only guard, -R1/-R2 r
     );
     const directTxId = directOrder.transaction!.transaction_id;
     handleVerifiedPaymentPaid(directTxId, 'TEST_CALLBACK', new Date().toISOString());
-    digiMode = 'FAIL';
-    await processSingleSupplierJob(directTxId, 'worker-3', supplier);
-    const cus2 = db.prepare('SELECT customer_id, payment_amount FROM transactions WHERE transaction_id = ?').get(directTxId) as {
-      customer_id: number;
-      payment_amount: number;
-    };
-    assert.equal(getCustomerRefundCreditTotal(cus2.customer_id), cus2.payment_amount);
+    const directFailIso = new Date().toISOString();
+    db.prepare(
+      `UPDATE transactions
+       SET transaction_status = 'FAILED', supplier_status = 'FAILED', supplier_reference = ?, supplier_message = 'Gagal supplier', completed_at = ?, updated_at = ?
+       WHERE transaction_id = ?`
+    ).run(directTxId, directFailIso, directFailIso, directTxId);
+    db.prepare(
+      `UPDATE supplier_jobs SET status = 'FAILED_DEFINITIVE', attempts = 1, updated_at = ? WHERE transaction_id = ?`
+    ).run(directFailIso, directTxId);
+    db.prepare(
+      `INSERT INTO transaction_status_history (transaction_id, old_status, new_status, source, description, created_at)
+       VALUES (?, 'PAID_PROCESSING', 'FAILED', 'DIGIFLAZZ', 'Supplier gagal definitif tanpa refund', ?)`
+    ).run(directTxId, directFailIso);
 
     digiMode = 'SUCCESS';
     const retrySuccessHttp = await fetch(`http://127.0.0.1:${apiPort}/api/admin/transactions/${directTxId}/retry-supplier`, {
@@ -3162,10 +3201,9 @@ test('Manual Digiflazz Retry (Tembak Ulang): strict FAILED-only guard, -R1/-R2 r
     };
     assert.equal(retrySuccessJson.data.retryRefId, `${directTxId}-R1`);
     assert.equal(retrySuccessJson.data.mappedStatus, 'SUCCESS');
-    assert.equal(retrySuccessJson.data.refundReversedAmount, cus2.payment_amount);
+    assert.equal(retrySuccessJson.data.refundReversedAmount, 0);
     assert.equal(retrySuccessJson.data.transaction.transaction_status, 'SUCCESS');
     assert.equal(retrySuccessJson.data.transaction.supplier_sn, 'SN-RETRY-778899');
-    assert.equal(getCustomerRefundCreditTotal(cus2.customer_id), 0);
 
     // Trying again after SUCCESS must return HTTP 400
     const retryAgainHttp = await fetch(`http://127.0.0.1:${apiPort}/api/admin/transactions/${directTxId}/retry-supplier`, {
@@ -3179,6 +3217,42 @@ test('Manual Digiflazz Retry (Tembak Ulang): strict FAILED-only guard, -R1/-R2 r
       .get(directTxId) as { action: string; details_safe: string } | undefined;
     assert.ok(auditRow);
     assert.ok(auditRow.details_safe.includes(`${directTxId}-R1`));
+
+    // 5. Unrefunded FAILED transaction older than 1 hour (> 60 minutes) -> retry MUST be blocked!
+    const expiredOrder = await createOrder(
+      {
+        platform: 'TELEGRAM',
+        platformUserId: 'retry-test-user-expired-1h',
+        productSkuOrId: 'TSEL10',
+        destination: '081255110099',
+      },
+      gw
+    );
+    const expiredTxId = expiredOrder.transaction!.transaction_id;
+    handleVerifiedPaymentPaid(expiredTxId, 'TEST_CALLBACK', new Date().toISOString());
+    const overOneHourIso = new Date(Date.now() - 65 * 60_000).toISOString();
+    db.prepare(
+      `UPDATE transactions
+       SET transaction_status = 'FAILED', supplier_status = 'FAILED', supplier_reference = ?, supplier_message = 'Gagal lama', completed_at = ?, updated_at = ?
+       WHERE transaction_id = ?`
+    ).run(expiredTxId, overOneHourIso, overOneHourIso, expiredTxId);
+    db.prepare(
+      `UPDATE supplier_jobs SET status = 'FAILED_DEFINITIVE', attempts = 1, updated_at = ? WHERE transaction_id = ?`
+    ).run(overOneHourIso, expiredTxId);
+    db.prepare(
+      `INSERT INTO transaction_status_history (transaction_id, old_status, new_status, source, description, created_at)
+       VALUES (?, 'PAID_PROCESSING', 'FAILED', 'DIGIFLAZZ', 'Gagal lebih dari 1 jam lalu', ?)`
+    ).run(expiredTxId, overOneHourIso);
+
+    const expiredCheck = checkSupplierRetryEligibility(expiredTxId, supplier);
+    assert.equal(expiredCheck.eligible, false);
+    assert.match(expiredCheck.reason, /maksimal 1 jam/i);
+
+    const expiredRetryHttp = await fetch(`http://127.0.0.1:${apiPort}/api/admin/transactions/${expiredTxId}/retry-supplier`, {
+      method: 'POST',
+      headers: { Authorization: authHeader },
+    });
+    assert.equal(expiredRetryHttp.status, 400);
   } finally {
     await new Promise<void>((resolve) => apiServer.close(() => resolve()));
     await new Promise<void>((resolve) => mockDigiServer.close(() => resolve()));
@@ -3367,7 +3441,7 @@ test('Balance payment method (BALANCE), platform-based User ID (Telegram ID / WA
   const { dispatchTelegramCallback } = await import('../bots/telegram.callback-handler');
   const { handleWhatsappCommand, clearWhatsappCooldown } = await import('../bots/whatsapp.command-handler');
   const { handleWhatsappMessagesUpsert } = await import('../bots/whatsapp.message-handler');
-  const { retryFailedSupplierTransaction } = await import('./transaction.service');
+  const { retryFailedSupplierTransaction, checkSupplierRetryEligibility } = await import('./transaction.service');
   clearWhatsappCooldown();
 
   // 1. Operator/Brand picker hides product count on Telegram AND WhatsApp
@@ -3578,12 +3652,14 @@ test('Balance payment method (BALANCE), platform-based User ID (Telegram ID / WA
   assert.equal(afterFailTx.transaction_status, 'REFUNDED');
   assert.equal(getCustomerRefundCreditTotal(tgCust.customer.id), 50000);
 
-  // Retry succeeds -> must reverse ONLY the REFUND_CREDIT (not ORDER_PAYMENT_DEBIT), leaving balance at Rp30.000
+  // Since auto-refund already restored Rp50.000 (REFUNDED), manual retry MUST be blocked!
+  assert.equal(checkSupplierRetryEligibility(tgTxId, mockDigiBal).eligible, false);
   supplierOutcome = 'SUCCESS';
-  const retryRes = await retryFailedSupplierTransaction(tgTxId, actor, mockDigiBal);
-  assert.equal(retryRes.mappedStatus, 'SUCCESS');
-  assert.equal(retryRes.refundReversedAmount, 20000);
-  assert.equal(getCustomerRefundCreditTotal(tgCust.customer.id), 30000);
+  await assert.rejects(
+    () => retryFailedSupplierTransaction(tgTxId, actor, mockDigiBal),
+    /sudah di-refund otomatis/i
+  );
+  assert.equal(getCustomerRefundCreditTotal(tgCust.customer.id), 50000);
 
   // Check Telegram /riwayat displays Telegram user ID (88220011) instead of CUS-
   const tgHistoryReplies: string[] = [];

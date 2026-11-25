@@ -116,12 +116,16 @@ export function TransactionsPage({ permissions }: { permissions: string[] }) {
   }
 
   function isRowRetryCandidate(tx: TransactionItem): boolean {
-    return (
-      permissions.includes('transactions:reconcile') &&
-      tx.payment_status === 'PAID' &&
-      tx.supplier_status === 'FAILED' &&
-      (tx.transaction_status === 'FAILED' || tx.transaction_status === 'REFUNDED')
-    );
+    if (
+      !permissions.includes('transactions:reconcile') ||
+      tx.payment_status !== 'PAID' ||
+      tx.supplier_status !== 'FAILED' ||
+      tx.transaction_status !== 'FAILED'
+    ) {
+      return false;
+    }
+    const failedAtMs = Date.parse(tx.completed_at || tx.updated_at || tx.created_at);
+    return Number.isFinite(failedAtMs) && Date.now() - failedAtMs <= 60 * 60 * 1000;
   }
 
   return (
@@ -474,9 +478,8 @@ export function TransactionsPage({ permissions }: { permissions: string[] }) {
                               <p className="text-amber-200/90">
                                 Pesanan <span className="font-mono font-semibold">{selectedDetail.transaction.product_sku_snapshot}</span> ke{' '}
                                 <span className="font-mono font-semibold">{selectedDetail.transaction.destination_masked}</span> akan dikirim ulang ke Digiflazz menggunakan ref_id baru.
-                                {selectedDetail.supplierRetryEligibility.hadAutoRefund &&
-                                selectedDetail.supplierRetryEligibility.refundAmount
-                                  ? ` Jika berhasil, kredit refund sebelumnya sebesar ${formatRp(selectedDetail.supplierRetryEligibility.refundAmount)} akan dibalik otomatis di buku besar.`
+                                {selectedDetail.supplierRetryEligibility.retryDeadlineAt
+                                  ? ` Batas tembak ulang berlaku hingga ${new Date(selectedDetail.supplierRetryEligibility.retryDeadlineAt).toLocaleString('id-ID')}.`
                                   : ''}
                               </p>
                             </div>

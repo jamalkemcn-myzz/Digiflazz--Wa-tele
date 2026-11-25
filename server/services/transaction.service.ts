@@ -802,6 +802,8 @@ export function computeNextRetryRefId(transactionId: string, currentSupplierRef?
   return `${transactionId}-R${nextSeq}`;
 }
 
+export const SUPPLIER_RETRY_WINDOW_MS = 60 * 60 * 1000;
+
 export interface SupplierRetryEligibility {
   found: boolean;
   eligible: boolean;
@@ -810,6 +812,54 @@ export interface SupplierRetryEligibility {
   digiflazzConfigured: boolean;
   hadAutoRefund?: boolean;
   refundAmount?: number;
+  retryDeadlineAt?: string;
+}
+
+function getActiveAutoRefundState(
+  txDb: ReturnType<typeof getDb>,
+  transactionId: string,
+  customerId: number
+): { hasRefund: boolean; amount: number } {
+  const existingRefund = txDb
+    .prepare('SELECT amount FROM refunds WHERE transaction_id = ? LIMIT 1')
+    .get(transactionId) as { amount: number } | undefined;
+
+  const ledgerRow = txDb
+    .prepare(
+      `SELECT COALESCE(SUM(
+         CASE
+           WHEN entry_type = 'REFUND_CREDIT' THEN amount
+           WHEN entry_type = 'MANUAL_ADJUSTMENT_DEBIT' THEN -amount
+           ELSE 0
+         END
+       ), 0) as net_refund
+       FROM refund_ledger
+       WHERE transaction_id = ? AND customer_id = ?`
+    )
+    .get(transactionId, customerId) as { net_refund: number } | undefined;
+
+  const netRefund = Math.max(0, Number(ledgerRow?.net_refund ?? 0));
+  if (existingRefund) {
+    return { hasRefund: true, amount: Number(existingRefund.amount ?? netRefund) };
+  }
+  return { hasRefund: netRefund > 0, amount: netRefund };
+}
+
+function resolveFirstSupplierFailureAt(
+  txDb: ReturnType<typeof getDb>,
+  tx: Pick<TransactionRow, 'transaction_id' | 'completed_at' | 'updated_at' | 'created_at'>
+): string {
+  const firstFailHistory = txDb
+    .prepare(
+      `SELECT created_at
+       FROM transaction_status_history
+       WHERE transaction_id = ? AND new_status = 'FAILED'
+       ORDER BY id ASC
+       LIMIT 1`
+    )
+    .get(tx.transaction_id) as { created_at: string } | undefined;
+
+  return firstFailHistory?.created_at || tx.completed_at || tx.updated_at || tx.created_at;
 }
 
 export class SupplierRetryError extends Error {
@@ -1014,12 +1064,39 @@ export function checkSupplierRetryEligibility(
     };
   }
 
-  if (tx.supplier_status !== 'FAILED' || !['FAILED', 'REFUNDED'].includes(tx.transaction_status)) {
+  const refundState = getActiveAutoRefundState(db, transactionId, tx.customer_id);
+  if (tx.transaction_status === 'REFUNDED' || refundState.hasRefund) {
+    return {
+      found: true,
+      eligible: false,
+      reason: 'Saldo sudah di-refund otomatis, sehingga transaksi tidak dapat ditembak ulang',
+      digiflazzConfigured,
+      hadAutoRefund: true,
+      refundAmount: refundState.amount || tx.payment_amount,
+    };
+  }
+
+  if (tx.supplier_status !== 'FAILED' || tx.transaction_status !== 'FAILED') {
     return {
       found: true,
       eligible: false,
       reason: `Tembak ulang hanya diizinkan jika Digiflazz benar-benar FAILED (saat ini: supplier=${tx.supplier_status}, status=${tx.transaction_status})`,
       digiflazzConfigured,
+    };
+  }
+
+  const failedAtIso = resolveFirstSupplierFailureAt(db, tx);
+  const failedAtMs = Date.parse(failedAtIso);
+  const deadlineMs = failedAtMs + SUPPLIER_RETRY_WINDOW_MS;
+  const retryDeadlineAt = Number.isFinite(deadlineMs) ? new Date(deadlineMs).toISOString() : undefined;
+
+  if (!Number.isFinite(failedAtMs) || Date.now() > deadlineMs) {
+    return {
+      found: true,
+      eligible: false,
+      reason: 'Batas waktu tembak ulang (maksimal 1 jam setelah transaksi gagal) telah lewat',
+      digiflazzConfigured,
+      retryDeadlineAt,
     };
   }
 
@@ -1034,6 +1111,7 @@ export function checkSupplierRetryEligibility(
         eligible: false,
         reason: `Job supplier masih berstatus ${job.status}`,
         digiflazzConfigured,
+        retryDeadlineAt,
       };
     }
     const staleCutoff = new Date(Date.now() - 120_000).toISOString();
@@ -1043,26 +1121,21 @@ export function checkSupplierRetryEligibility(
         eligible: false,
         reason: 'Transaksi sedang diproses oleh worker/admin lain',
         digiflazzConfigured,
+        retryDeadlineAt,
       };
     }
   }
-
-  const existingRefund = db
-    .prepare('SELECT amount FROM refunds WHERE transaction_id = ?')
-    .get(transactionId) as { amount: number } | undefined;
 
   const nextRefId = computeNextRetryRefId(tx.transaction_id, tx.supplier_reference);
 
   return {
     found: true,
     eligible: true,
-    reason: existingRefund
-      ? `Digiflazz gagal definitif. Siap ditembak ulang dengan ref_id baru ${nextRefId} (kredit refund Rp${existingRefund.amount.toLocaleString('id-ID')} otomatis dibalik jika sukses).`
-      : `Digiflazz gagal definitif. Siap ditembak ulang dengan ref_id baru ${nextRefId}.`,
+    reason: `Digiflazz gagal definitif dan saldo belum di-refund. Siap ditembak ulang dengan ref_id baru ${nextRefId} (batas waktu hingga ${new Date(deadlineMs).toLocaleTimeString('id-ID')}).`,
     nextRefId,
     digiflazzConfigured,
-    hadAutoRefund: Boolean(existingRefund),
-    refundAmount: existingRefund?.amount,
+    hadAutoRefund: false,
+    retryDeadlineAt,
   };
 }
 
@@ -1204,6 +1277,7 @@ export async function processSingleSupplierJob(
         supplierStatus: 'FAILED',
         supplierReference: resp.refId || activeRefId,
         supplierMessage: resp.message ?? 'Gagal definitif',
+        completedAt: finishNow,
       }
     );
 
@@ -1367,9 +1441,26 @@ export async function retryFailedSupplierTransaction(
       throw new SupplierRetryError('Tembak ulang dilarang: pembayaran transaksi belum LUNAS', 400);
     }
 
-    if (tx.supplier_status !== 'FAILED' || !['FAILED', 'REFUNDED'].includes(tx.transaction_status)) {
+    const refundState = getActiveAutoRefundState(txDb, transactionId, tx.customer_id);
+    if (tx.transaction_status === 'REFUNDED' || refundState.hasRefund) {
+      throw new SupplierRetryError(
+        'Tembak ulang dilarang: saldo transaksi sudah di-refund otomatis',
+        400
+      );
+    }
+
+    if (tx.supplier_status !== 'FAILED' || tx.transaction_status !== 'FAILED') {
       throw new SupplierRetryError(
         `Tembak ulang hanya diizinkan jika Digiflazz benar-benar FAILED (saat ini: supplier=${tx.supplier_status}, status=${tx.transaction_status})`,
+        400
+      );
+    }
+
+    const failedAtIso = resolveFirstSupplierFailureAt(txDb, tx);
+    const failedAtMs = Date.parse(failedAtIso);
+    if (!Number.isFinite(failedAtMs) || Date.now() - failedAtMs > SUPPLIER_RETRY_WINDOW_MS) {
+      throw new SupplierRetryError(
+        'Tembak ulang dilarang: batas waktu maksimal 1 jam setelah transaksi gagal telah terlewati',
         400
       );
     }
