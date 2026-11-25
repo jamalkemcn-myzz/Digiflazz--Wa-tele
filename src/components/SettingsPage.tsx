@@ -371,6 +371,17 @@ export function SettingsPage({ permissions }: { permissions: string[] }) {
                   : `Menunggu .env: ${cfg.readiness.digiflazz.missingFields.join(', ')}`}
               </p>
             </div>
+            <div>
+              <span className="text-slate-400">Webhook Digiflazz (Real-Time Update):</span>
+              <p className="font-mono mt-0.5 text-[#60a5fa] break-all">
+                {cfg.digiflazz?.webhookUrl || `${window.location.origin}/api/webhooks/digiflazz`}
+              </p>
+              <p className={`text-[11px] font-mono mt-0.5 ${cfg.digiflazz?.webhookConfigured ? 'text-emerald-400' : 'text-amber-400'}`}>
+                {cfg.digiflazz?.webhookConfigured
+                  ? 'DIGIFLAZZ_WEBHOOK_SECRET: TERPASANG (X-Hub-Signature aktif)'
+                  : 'DIGIFLAZZ_WEBHOOK_SECRET belum diisi di .env (wajib disamakan dengan Secret Key di Digiflazz)'}
+              </p>
+            </div>
             <div className="flex justify-between gap-2"><span className="text-slate-400">Auto Backup Cron</span><span className="font-mono text-slate-200 text-right">{cfg.backup.cron} ({cfg.backup.retentionDays} hari)</span></div>
           </div>
         </div>

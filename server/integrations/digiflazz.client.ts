@@ -340,3 +340,121 @@ export class DigiflazzClient implements DigiflazzPort {
 }
 
 export const defaultDigiflazzClient = new DigiflazzClient();
+
+export interface ParsedDigiflazzWebhook {
+  event: string;
+  isPing: boolean;
+  refId?: string;
+  customerNo?: string;
+  sku?: string;
+  mappedStatus: DigiflazzMappedStatus;
+  rawStatus?: string;
+  rc?: string;
+  sn?: string;
+  message?: string;
+  price?: number;
+}
+
+export function verifyDigiflazzWebhookSignature(
+  rawBody: string,
+  signatureHeader: string | string[] | undefined,
+  secret: string
+): boolean {
+  const cleanSecret = secret.trim();
+  if (!cleanSecret) return false;
+
+  const rawHeader = Array.isArray(signatureHeader) ? signatureHeader[0] : signatureHeader;
+  const candidateHex = (rawHeader || '')
+    .trim()
+    .replace(/^sha1=/i, '')
+    .toLowerCase();
+  if (!/^[a-f0-9]{40}$/.test(candidateHex)) {
+    return false;
+  }
+
+  const expectedHex = crypto
+    .createHmac('sha1', cleanSecret)
+    .update(rawBody, 'utf8')
+    .digest('hex')
+    .toLowerCase();
+
+  const a = Buffer.from(candidateHex, 'hex');
+  const b = Buffer.from(expectedHex, 'hex');
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+export function parseDigiflazzWebhookPayload(
+  headers: Record<string, string | string[] | undefined>,
+  parsedBody: unknown
+): ParsedDigiflazzWebhook {
+  const rawEventHeader = headers['x-digiflazz-event'] ?? headers['X-Digiflazz-Event'];
+  const event = (Array.isArray(rawEventHeader) ? rawEventHeader[0] : rawEventHeader || 'update')
+    .trim()
+    .toLowerCase();
+
+  const obj =
+    parsedBody && typeof parsedBody === 'object' && !Array.isArray(parsedBody)
+      ? (parsedBody as Record<string, unknown>)
+      : {};
+  const data =
+    obj.data && typeof obj.data === 'object' && !Array.isArray(obj.data)
+      ? (obj.data as Record<string, unknown>)
+      : obj;
+
+  const pickStr = (val: unknown, maxLen = 250): string | undefined => {
+    if (typeof val === 'string' && val.trim()) return val.trim().slice(0, maxLen);
+    if (typeof val === 'number' && Number.isFinite(val)) return String(val);
+    return undefined;
+  };
+
+  const refId = pickStr(data.ref_id, 100);
+  if (event === 'ping' || (!refId && ('hook_id' in obj || 'zen' in obj || 'hook' in obj))) {
+    return {
+      event: event || 'ping',
+      isPing: true,
+      mappedStatus: 'UNKNOWN',
+    };
+  }
+
+  const rawStatus = pickStr(data.status, 50);
+  const rc = pickStr(data.rc, 20);
+  const rawMessage = pickStr(data.message, 250);
+  const sn = pickStr(data.sn, 200);
+  const sku = pickStr(data.buyer_sku_code, 80);
+  const customerNo = pickStr(data.customer_no, 80);
+  const price =
+    typeof data.price === 'number' && Number.isFinite(data.price) ? data.price : undefined;
+
+  let mappedStatus = mapDigiflazzStatus(rawStatus);
+  if (rc === '99') {
+    mappedStatus = 'UNKNOWN';
+  } else if (rc === '03' && mappedStatus === 'UNKNOWN') {
+    mappedStatus = 'PENDING';
+  } else if (
+    mappedStatus === 'UNKNOWN' &&
+    rc &&
+    DEFINITIVE_DIGIFLAZZ_REJECTION_RCS.has(String(rc).trim())
+  ) {
+    mappedStatus = 'FAILED';
+  }
+
+  const formattedMsg =
+    mappedStatus === 'FAILED' || mappedStatus === 'UNKNOWN'
+      ? formatDigiflazzErrorMessage({ httpStatus: 200, rc, message: rawMessage })
+      : rawMessage || 'Sukses';
+
+  return {
+    event: event || 'update',
+    isPing: false,
+    refId,
+    customerNo,
+    sku,
+    mappedStatus,
+    rawStatus,
+    rc,
+    sn,
+    message: formattedMsg.slice(0, 250),
+    price,
+  };
+}

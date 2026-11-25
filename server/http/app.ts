@@ -15,6 +15,7 @@ import {
 } from './middleware/auth';
 import { authRateLimiter, webhookRateLimiter } from './middleware/rate-limit';
 import { handleMyZZStoreCallback } from './controllers/payment.callback.controller';
+import { handleDigiflazzWebhook } from './controllers/digiflazz.webhook.controller';
 import { adminRouter } from './routes/admin.routes';
 import { whatsappService } from '../bots/whatsapp.service';
 import { telegramService } from '../bots/telegram.service';
@@ -199,6 +200,9 @@ export function createExpressApp() {
 
   // Payment Gateway Callback Endpoint
   app.post('/api/webhooks/myzzstore', webhookRateLimiter, handleMyZZStoreCallback);
+
+  // Digiflazz Supplier Webhook Endpoint (verifies X-Hub-Signature HMAC-SHA1)
+  app.post('/api/webhooks/digiflazz', webhookRateLimiter, handleDigiflazzWebhook);
 
   // Telegram Bot Webhook Endpoint
   app.post(config.telegram.webhookPath, webhookRateLimiter, async (req: Request, res: Response) => {

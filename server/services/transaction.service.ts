@@ -37,6 +37,7 @@ import {
 import { processAutomaticRefund } from './refund.service';
 import { defaultPaymentGateway, type PaymentGatewayPort } from '../integrations/myzzstore.gateway';
 import { digiflazzService, type DigiflazzService } from '../integrations/digiflazz.service';
+import type { ParsedDigiflazzWebhook } from '../integrations/digiflazz.client';
 
 export interface TransactionRow {
   id: number;
@@ -1209,6 +1210,26 @@ export async function processSingleSupplierJob(
 
   const nextAttempts = job.attempts + 1;
   const finishNow = new Date().toISOString();
+
+  // Guard against race if a Digiflazz webhook or manual retry already finalized or advanced this transaction
+  const currentTxState = db
+    .prepare('SELECT transaction_status, supplier_reference FROM transactions WHERE transaction_id = ?')
+    .get(tx.transaction_id) as { transaction_status: TransactionStatus; supplier_reference: string | null } | undefined;
+
+  if (
+    !currentTxState ||
+    ['SUCCESS', 'FAILED', 'REFUNDED', 'CANCELLED', 'EXPIRED'].includes(currentTxState.transaction_status) ||
+    (currentTxState.supplier_reference &&
+      currentTxState.supplier_reference.trim() !== '' &&
+      currentTxState.supplier_reference.trim() !== activeRefId)
+  ) {
+    db.prepare('UPDATE supplier_jobs SET locked_by = NULL, locked_at = NULL, updated_at = ? WHERE id = ?').run(
+      finishNow,
+      job.id
+    );
+    return { handled: false };
+  }
+
   const cus = db.prepare('SELECT customer_code FROM customers WHERE id = ?').get(tx.customer_id) as {
     customer_code: string;
   };
@@ -2301,6 +2322,411 @@ export async function cancelCustomerTransaction(
   return {
     ok: true,
     transaction: cancelled,
+  };
+}
+
+export async function applyDigiflazzWebhookUpdate(
+  payload: ParsedDigiflazzWebhook
+): Promise<{
+  ok: boolean;
+  statusCode: number;
+  alreadyProcessed?: boolean;
+  ignored?: boolean;
+  reason?: string;
+  transactionId?: string;
+  transactionStatus?: string;
+  error?: string;
+}> {
+  const refId = payload.refId?.trim();
+  if (!refId) {
+    return { ok: false, statusCode: 400, error: 'ref_id wajib ada pada payload webhook Digiflazz' };
+  }
+
+  const db = getDb();
+  const matchedTx = db
+    .prepare(
+      `SELECT * FROM transactions
+       WHERE supplier_reference = ? OR transaction_id = ?
+       ORDER BY id DESC LIMIT 1`
+    )
+    .get(refId, refId) as TransactionRow | undefined;
+
+  if (!matchedTx) {
+    return { ok: false, statusCode: 404, error: 'Transaksi tidak ditemukan' };
+  }
+
+  if (
+    matchedTx.supplier_reference &&
+    matchedTx.supplier_reference.trim() !== '' &&
+    matchedTx.supplier_reference.trim() !== refId
+  ) {
+    return {
+      ok: true,
+      statusCode: 200,
+      ignored: true,
+      transactionId: matchedTx.transaction_id,
+      transactionStatus: matchedTx.transaction_status,
+      reason: 'Stale ref_id: transaksi sudah memakai supplier_reference terbaru',
+    };
+  }
+
+  if (
+    payload.sku &&
+    matchedTx.product_sku_snapshot &&
+    payload.sku.trim().toUpperCase() !== matchedTx.product_sku_snapshot.trim().toUpperCase()
+  ) {
+    return { ok: false, statusCode: 400, error: 'SKU webhook tidak cocok dengan transaksi' };
+  }
+
+  if (
+    payload.customerNo &&
+    matchedTx.destination &&
+    payload.customerNo.trim() !== matchedTx.destination.trim()
+  ) {
+    return { ok: false, statusCode: 400, error: 'Nomor tujuan webhook tidak cocok dengan transaksi' };
+  }
+
+  if (matchedTx.payment_status !== 'PAID') {
+    return { ok: false, statusCode: 409, error: 'Pembayaran transaksi belum LUNAS' };
+  }
+
+  const nowIso = new Date().toISOString();
+
+  type WebhookOutcome =
+    | { kind: 'ALREADY_FINALIZED'; tx: TransactionRow }
+    | { kind: 'STALE'; tx: TransactionRow }
+    | { kind: 'SUCCESS'; tx: TransactionRow; cusCode: string }
+    | { kind: 'FAILED'; tx: TransactionRow; existingRefund: boolean }
+    | { kind: 'PENDING'; tx: TransactionRow; transitioned: boolean; cusCode: string }
+    | { kind: 'UNKNOWN'; tx: TransactionRow };
+
+  const outcome = withTransaction((txDb): WebhookOutcome => {
+    const freshTx = txDb
+      .prepare('SELECT * FROM transactions WHERE transaction_id = ?')
+      .get(matchedTx.transaction_id) as TransactionRow | undefined;
+
+    if (!freshTx) {
+      throw new Error('Transaksi tidak ditemukan');
+    }
+
+    if (
+      freshTx.supplier_reference &&
+      freshTx.supplier_reference.trim() !== '' &&
+      freshTx.supplier_reference.trim() !== refId
+    ) {
+      return { kind: 'STALE', tx: freshTx };
+    }
+
+    if (
+      freshTx.transaction_status === 'SUCCESS' ||
+      freshTx.supplier_status === 'SUCCESS' ||
+      ['FAILED', 'REFUNDED', 'CANCELLED', 'EXPIRED'].includes(freshTx.transaction_status)
+    ) {
+      return { kind: 'ALREADY_FINALIZED', tx: freshTx };
+    }
+
+    const cus = txDb
+      .prepare('SELECT customer_code FROM customers WHERE id = ?')
+      .get(freshTx.customer_id) as { customer_code: string };
+
+    const msg = (payload.message || payload.rawStatus || 'Update webhook Digiflazz').slice(0, 250);
+
+    if (payload.mappedStatus === 'SUCCESS') {
+      if (!canTransitionTransaction(freshTx.transaction_status, 'SUCCESS')) {
+        return { kind: 'ALREADY_FINALIZED', tx: freshTx };
+      }
+
+      txDb
+        .prepare(
+          `UPDATE supplier_jobs
+           SET status = 'COMPLETED', last_attempt_at = ?, last_error = NULL, locked_by = NULL, locked_at = NULL, updated_at = ?
+           WHERE transaction_id = ?`
+        )
+        .run(nowIso, nowIso, freshTx.transaction_id);
+
+      reversePriorRefundLedgerIfPresent(
+        txDb,
+        freshTx,
+        'DIGIFLAZZ_WEBHOOK',
+        'SUPPLIER_WEBHOOK',
+        refId
+      );
+
+      txDb
+        .prepare(
+          `UPDATE transactions
+           SET transaction_status = 'SUCCESS',
+               supplier_status = 'SUCCESS',
+               supplier_reference = ?,
+               supplier_sn = COALESCE(?, supplier_sn),
+               supplier_message = ?,
+               completed_at = ?,
+               updated_at = ?
+           WHERE transaction_id = ?`
+        )
+        .run(refId, payload.sn ?? null, msg, nowIso, nowIso, freshTx.transaction_id);
+
+      txDb
+        .prepare(
+          `INSERT INTO transaction_status_history (transaction_id, old_status, new_status, source, description, created_at)
+           VALUES (?, ?, 'SUCCESS', 'DIGIFLAZZ_WEBHOOK', ?, ?)`
+        )
+        .run(
+          freshTx.transaction_id,
+          freshTx.transaction_status,
+          `Webhook Digiflazz (${payload.event}): transaksi SUKSES${payload.sn ? ` (SN: ${payload.sn})` : ''}`,
+          nowIso
+        );
+
+      const updatedTx = txDb
+        .prepare('SELECT * FROM transactions WHERE transaction_id = ?')
+        .get(freshTx.transaction_id) as TransactionRow;
+      return { kind: 'SUCCESS', tx: updatedTx, cusCode: cus.customer_code };
+    }
+
+    if (payload.mappedStatus === 'FAILED') {
+      if (!canTransitionTransaction(freshTx.transaction_status, 'FAILED')) {
+        return { kind: 'ALREADY_FINALIZED', tx: freshTx };
+      }
+
+      txDb
+        .prepare(
+          `UPDATE supplier_jobs
+           SET status = 'FAILED_DEFINITIVE', last_attempt_at = ?, last_error = ?, locked_by = NULL, locked_at = NULL, updated_at = ?
+           WHERE transaction_id = ?`
+        )
+        .run(nowIso, msg, nowIso, freshTx.transaction_id);
+
+      txDb
+        .prepare(
+          `UPDATE transactions
+           SET transaction_status = 'FAILED',
+               supplier_status = 'FAILED',
+               supplier_reference = ?,
+               supplier_message = ?,
+               completed_at = ?,
+               updated_at = ?
+           WHERE transaction_id = ?`
+        )
+        .run(refId, msg, nowIso, nowIso, freshTx.transaction_id);
+
+      txDb
+        .prepare(
+          `INSERT INTO transaction_status_history (transaction_id, old_status, new_status, source, description, created_at)
+           VALUES (?, ?, 'FAILED', 'DIGIFLAZZ_WEBHOOK', ?, ?)`
+        )
+        .run(
+          freshTx.transaction_id,
+          freshTx.transaction_status,
+          `Webhook Digiflazz (${payload.event}): supplier gagal definitif (${msg})`,
+          nowIso
+        );
+
+      const existingRef = txDb
+        .prepare('SELECT id FROM refunds WHERE transaction_id = ? LIMIT 1')
+        .get(freshTx.transaction_id) as { id: number } | undefined;
+
+      const updatedTx = txDb
+        .prepare('SELECT * FROM transactions WHERE transaction_id = ?')
+        .get(freshTx.transaction_id) as TransactionRow;
+      return { kind: 'FAILED', tx: updatedTx, existingRefund: Boolean(existingRef) };
+    }
+
+    if (payload.mappedStatus === 'PENDING') {
+      const nextAttemptAt = new Date(
+        Date.now() + config.scheduler.supplierPollIntervalSeconds * 1000
+      ).toISOString();
+
+      txDb
+        .prepare(
+          `UPDATE supplier_jobs
+           SET status = 'PENDING', last_attempt_at = ?, next_attempt_at = ?, locked_by = NULL, locked_at = NULL, updated_at = ?
+           WHERE transaction_id = ? AND status IN ('PENDING', 'UNKNOWN')`
+        )
+        .run(nowIso, nextAttemptAt, nowIso, freshTx.transaction_id);
+
+      let transitioned = false;
+      if (
+        freshTx.transaction_status !== 'SUPPLIER_PENDING' &&
+        canTransitionTransaction(freshTx.transaction_status, 'SUPPLIER_PENDING')
+      ) {
+        txDb
+          .prepare(
+            `UPDATE transactions
+             SET transaction_status = 'SUPPLIER_PENDING',
+                 supplier_status = 'PENDING',
+                 supplier_reference = ?,
+                 supplier_message = ?,
+                 updated_at = ?
+             WHERE transaction_id = ?`
+          )
+          .run(refId, msg, nowIso, freshTx.transaction_id);
+
+        txDb
+          .prepare(
+            `INSERT INTO transaction_status_history (transaction_id, old_status, new_status, source, description, created_at)
+             VALUES (?, ?, 'SUPPLIER_PENDING', 'DIGIFLAZZ_WEBHOOK', ?, ?)`
+          )
+          .run(
+            freshTx.transaction_id,
+            freshTx.transaction_status,
+            `Webhook Digiflazz (${payload.event}): status PENDING (${msg})`,
+            nowIso
+          );
+        transitioned = true;
+      } else {
+        txDb
+          .prepare(
+            `UPDATE transactions
+             SET supplier_reference = COALESCE(supplier_reference, ?),
+                 supplier_message = ?,
+                 updated_at = ?
+             WHERE transaction_id = ?`
+          )
+          .run(refId, msg, nowIso, freshTx.transaction_id);
+      }
+
+      const updatedTx = txDb
+        .prepare('SELECT * FROM transactions WHERE transaction_id = ?')
+        .get(freshTx.transaction_id) as TransactionRow;
+      return { kind: 'PENDING', tx: updatedTx, transitioned, cusCode: cus.customer_code };
+    }
+
+    // UNKNOWN
+    const nextAttemptAt = new Date(Date.now() + 30_000).toISOString();
+    txDb
+      .prepare(
+        `UPDATE supplier_jobs
+         SET status = 'UNKNOWN', last_attempt_at = ?, next_attempt_at = ?, last_error = ?, locked_by = NULL, locked_at = NULL, updated_at = ?
+         WHERE transaction_id = ? AND status IN ('PENDING', 'UNKNOWN')`
+      )
+      .run(nowIso, nextAttemptAt, msg, nowIso, freshTx.transaction_id);
+
+    if (
+      freshTx.transaction_status !== 'UNKNOWN' &&
+      canTransitionTransaction(freshTx.transaction_status, 'UNKNOWN')
+    ) {
+      txDb
+        .prepare(
+          `UPDATE transactions
+           SET transaction_status = 'UNKNOWN',
+               supplier_status = 'UNKNOWN',
+               supplier_reference = ?,
+               supplier_message = ?,
+               updated_at = ?
+           WHERE transaction_id = ?`
+        )
+        .run(refId, msg, nowIso, freshTx.transaction_id);
+
+      txDb
+        .prepare(
+          `INSERT INTO transaction_status_history (transaction_id, old_status, new_status, source, description, created_at)
+           VALUES (?, ?, 'UNKNOWN', 'DIGIFLAZZ_WEBHOOK', ?, ?)`
+        )
+        .run(
+          freshTx.transaction_id,
+          freshTx.transaction_status,
+          `Webhook Digiflazz (${payload.event}): status UNKNOWN (${msg})`,
+          nowIso
+        );
+    }
+
+    const updatedTx = txDb
+      .prepare('SELECT * FROM transactions WHERE transaction_id = ?')
+      .get(freshTx.transaction_id) as TransactionRow;
+    return { kind: 'UNKNOWN', tx: updatedTx };
+  }, db);
+
+  if (outcome.kind === 'STALE') {
+    return {
+      ok: true,
+      statusCode: 200,
+      ignored: true,
+      transactionId: outcome.tx.transaction_id,
+      transactionStatus: outcome.tx.transaction_status,
+      reason: 'Stale ref_id',
+    };
+  }
+
+  if (outcome.kind === 'ALREADY_FINALIZED') {
+    return {
+      ok: true,
+      statusCode: 200,
+      alreadyProcessed: true,
+      transactionId: outcome.tx.transaction_id,
+      transactionStatus: outcome.tx.transaction_status,
+    };
+  }
+
+  if (outcome.kind === 'SUCCESS') {
+    emitSupplierSuccessEffects(
+      outcome.tx,
+      outcome.cusCode,
+      { sn: outcome.tx.supplier_sn ?? null, refId: outcome.tx.supplier_reference ?? refId },
+      nowIso
+    );
+    return {
+      ok: true,
+      statusCode: 200,
+      transactionId: outcome.tx.transaction_id,
+      transactionStatus: 'SUCCESS',
+    };
+  }
+
+  if (outcome.kind === 'FAILED') {
+    if (outcome.existingRefund) {
+      transitionTransactionStatus(
+        outcome.tx.transaction_id,
+        'REFUNDED',
+        'DIGIFLAZZ_WEBHOOK',
+        'Webhook gagal setelah tembak ulang; kredit refund internal sebelumnya tetap berlaku',
+        { completedAt: nowIso }
+      );
+    } else {
+      processAutomaticRefund(
+        outcome.tx.transaction_id,
+        'DIGIFLAZZ_WEBHOOK_FAILURE',
+        payload.message || 'Transaksi gagal definitif di supplier (webhook)'
+      );
+    }
+    const finalTx = db
+      .prepare('SELECT transaction_status FROM transactions WHERE transaction_id = ?')
+      .get(outcome.tx.transaction_id) as { transaction_status: string } | undefined;
+    return {
+      ok: true,
+      statusCode: 200,
+      transactionId: outcome.tx.transaction_id,
+      transactionStatus: finalTx?.transaction_status || 'FAILED',
+    };
+  }
+
+  if (outcome.kind === 'PENDING') {
+    if (outcome.transitioned) {
+      emitTransactionLogToGroups({
+        eventKey: 'supplier-pending',
+        transactionId: outcome.tx.transaction_id,
+        customerCode: outcome.cusCode,
+        productName: outcome.tx.product_name_snapshot,
+        destination: outcome.tx.destination,
+        platform: outcome.tx.platform,
+        amount: outcome.tx.payment_amount,
+        status: 'SUPPLIER_PENDING',
+        note: `Webhook Digiflazz (${payload.event}): menunggu hasil supplier`,
+      });
+    }
+    return {
+      ok: true,
+      statusCode: 200,
+      transactionId: outcome.tx.transaction_id,
+      transactionStatus: outcome.tx.transaction_status,
+    };
+  }
+
+  return {
+    ok: true,
+    statusCode: 200,
+    transactionId: outcome.tx.transaction_id,
+    transactionStatus: outcome.tx.transaction_status,
   };
 }
 

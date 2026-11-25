@@ -3770,6 +3770,252 @@ test('UNKNOWN invoice without Gateway Ref (e.g. createPayment network failure) r
   assert.equal(resolvedAuto.payment_status, 'FAILED');
 });
 
+test('Digiflazz Webhook (/api/webhooks/digiflazz): X-Hub-Signature HMAC-SHA1 verification, ping, real-time SUCCESS/FAILED & idempotency', async () => {
+  const db = getDb();
+  const { config } = await import('../config/env');
+  const prevSecret = config.digiflazz.webhookSecret;
+  const { createExpressApp } = await import('../http/app');
+  const { createOrder, handleVerifiedPaymentPaid, processSingleSupplierJob } = await import('./transaction.service');
+  const { getCustomerRefundCreditTotal } = await import('./customer.service');
+  const { DigiflazzService } = await import('../integrations/digiflazz.service');
+
+  const app = createExpressApp();
+  const apiServer = await new Promise<import('node:http').Server>((resolve) => {
+    const s = app.listen(0, '127.0.0.1', () => resolve(s));
+  });
+  const port = (apiServer.address() as import('node:net').AddressInfo).port;
+  const webhookUrl = `http://127.0.0.1:${port}/api/webhooks/digiflazz`;
+
+  const signBody = (raw: string, secret: string) =>
+    `sha1=${crypto.createHmac('sha1', secret).update(raw, 'utf8').digest('hex')}`;
+
+  const gw: PaymentGatewayPort = {
+    isConfigured: () => true,
+    getMissingConfiguration: () => [],
+    createPayment: async ({ transactionId, amount }) => ({
+      ok: true,
+      mappedStatus: 'PENDING',
+      gatewayReference: `GW-WH-${transactionId}`,
+      qrString: 'QRIS-WH',
+      rawResponse: { amount },
+    }),
+    checkPaymentStatus: async (gatewayReference) => ({
+      ok: true,
+      mappedStatus: 'PENDING',
+      gatewayReference,
+    }),
+    cancelPayment: async () => ({ ok: true, supported: false, mappedStatus: 'FAILED' }),
+    verifyCallback: () => ({ valid: false, mappedStatus: 'UNKNOWN', reason: 'unused', safePayload: {} }),
+  };
+
+  try {
+    // 1. Fail-closed 503 when DIGIFLAZZ_WEBHOOK_SECRET is not configured
+    config.digiflazz.webhookSecret = '';
+    const unconfiguredRes = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Digiflazz-Event': 'ping' },
+      body: JSON.stringify({ hook_id: 1 }),
+    });
+    assert.equal(unconfiguredRes.status, 503);
+
+    // 2. Configure secret -> missing/forged X-Hub-Signature returns 401
+    const webhookSecret = 'super-secret-digi-wh-key';
+    config.digiflazz.webhookSecret = webhookSecret;
+
+    const pingBody = JSON.stringify({ hook_id: 42, zen: 'pong' });
+    const badSigRes = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Digiflazz-Event': 'ping',
+        'X-Hub-Signature': 'sha1=0000000000000000000000000000000000000000',
+      },
+      body: pingBody,
+    });
+    assert.equal(badSigRes.status, 401);
+
+    // 3. Valid ping event returns 200 OK
+    const pingRes = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Digiflazz-Event': 'ping',
+        'X-Hub-Signature': signBody(pingBody, webhookSecret),
+      },
+      body: pingBody,
+    });
+    assert.equal(pingRes.status, 200);
+    const pingJson = (await pingRes.json()) as { ok: boolean; event: string };
+    assert.equal(pingJson.ok, true);
+    assert.equal(pingJson.event, 'ping');
+
+    // 4. Real-time SUCCESS webhook updates SUPPLIER_PENDING -> SUCCESS + SN, idempotent on duplicate, polling skips
+    const okOrder = await createOrder(
+      {
+        platform: 'TELEGRAM',
+        platformUserId: 'digi-wh-user-1',
+        productSkuOrId: 'BAL_ISAT_10',
+        destination: '085700009911',
+      },
+      gw
+    );
+    assert.equal(okOrder.ok, true);
+    const okTxId = okOrder.transaction!.transaction_id;
+    handleVerifiedPaymentPaid(okTxId, 'TEST_CALLBACK', new Date().toISOString());
+
+    let pollCount = 0;
+    const pendingSupplier = new DigiflazzService({
+      isConfigured: () => true,
+      fetchPriceList: async () => ({ ok: true, items: [] }),
+      createTransaction: async ({ refId }) => {
+        pollCount += 1;
+        return { ok: true, mappedStatus: 'PENDING', refId, rc: '03', rawStatus: 'Pending', message: 'Pending' };
+      },
+      inquireTransaction: async ({ refId }) => {
+        pollCount += 1;
+        return { ok: true, mappedStatus: 'PENDING', refId, rc: '03', rawStatus: 'Pending', message: 'Pending' };
+      },
+      checkBalance: async () => ({ ok: true, balance: 100000 }),
+    });
+
+    const firstPoll = await processSingleSupplierJob(okTxId, 'wh-worker-1', pendingSupplier);
+    assert.equal(firstPoll.status, 'PENDING');
+
+    const successPayload = JSON.stringify({
+      data: {
+        ref_id: okTxId,
+        customer_no: '085700009911',
+        buyer_sku_code: 'BAL_ISAT_10',
+        message: 'Transaksi Sukses',
+        status: 'Sukses',
+        rc: '00',
+        sn: 'SN-WEBHOOK-778899',
+        price: 18000,
+      },
+    });
+
+    const whSuccessRes = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Digiflazz-Event': 'update',
+        'X-Hub-Signature': signBody(successPayload, webhookSecret),
+      },
+      body: successPayload,
+    });
+    assert.equal(whSuccessRes.status, 200);
+    const whSuccessJson = (await whSuccessRes.json()) as { ok: boolean; transactionStatus: string; alreadyProcessed: boolean };
+    assert.equal(whSuccessJson.ok, true);
+    assert.equal(whSuccessJson.transactionStatus, 'SUCCESS');
+    assert.equal(whSuccessJson.alreadyProcessed, false);
+
+    const txAfterSuccess = db
+      .prepare('SELECT transaction_status, supplier_status, supplier_sn FROM transactions WHERE transaction_id = ?')
+      .get(okTxId) as { transaction_status: string; supplier_status: string; supplier_sn: string };
+    assert.equal(txAfterSuccess.transaction_status, 'SUCCESS');
+    assert.equal(txAfterSuccess.supplier_status, 'SUCCESS');
+    assert.equal(txAfterSuccess.supplier_sn, 'SN-WEBHOOK-778899');
+
+    // Duplicate delivery -> idempotent alreadyProcessed=true
+    const whDupRes = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Digiflazz-Event': 'update',
+        'X-Hub-Signature': signBody(successPayload, webhookSecret),
+      },
+      body: successPayload,
+    });
+    assert.equal(whDupRes.status, 200);
+    const whDupJson = (await whDupRes.json()) as { ok: boolean; alreadyProcessed: boolean };
+    assert.equal(whDupJson.alreadyProcessed, true);
+
+    // Job is COMPLETED so polling won't run again
+    const pollBefore = pollCount;
+    const pollAfterWh = await processSingleSupplierJob(okTxId, 'wh-worker-2', pendingSupplier);
+    assert.equal(pollAfterWh.handled, false);
+    assert.equal(pollCount, pollBefore);
+
+    // 5. Real-time FAILED webhook triggers FAILED -> REFUNDED + auto-refund credited once, and handles retry ref_id (-R1) vs stale ref_id
+    const failOrder = await createOrder(
+      {
+        platform: 'TELEGRAM',
+        platformUserId: 'digi-wh-user-2',
+        productSkuOrId: 'BAL_ISAT_10',
+        destination: '085700009922',
+      },
+      gw
+    );
+    const failTxId = failOrder.transaction!.transaction_id;
+    handleVerifiedPaymentPaid(failTxId, 'TEST_CALLBACK', new Date().toISOString());
+    await processSingleSupplierJob(failTxId, 'wh-worker-3', pendingSupplier);
+
+    // Simulate manual retry having moved supplier_reference to -R1
+    db.prepare('UPDATE transactions SET supplier_reference = ? WHERE transaction_id = ?').run(
+      `${failTxId}-R1`,
+      failTxId
+    );
+
+    // Stale webhook with old ref_id (without -R1) MUST be ignored safely!
+    const stalePayload = JSON.stringify({
+      data: {
+        ref_id: failTxId,
+        customer_no: '085700009922',
+        buyer_sku_code: 'BAL_ISAT_10',
+        message: 'Old ref status',
+        status: 'Gagal',
+        rc: '07',
+      },
+    });
+    const staleRes = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Digiflazz-Event': 'update',
+        'X-Hub-Signature': signBody(stalePayload, webhookSecret),
+      },
+      body: stalePayload,
+    });
+    assert.equal(staleRes.status, 200);
+    const staleJson = (await staleRes.json()) as { ok: boolean; ignored: boolean };
+    assert.equal(staleJson.ignored, true);
+
+    // Webhook with active -R1 ref_id -> FAILED -> REFUNDED + credit balance
+    const failPayload = JSON.stringify({
+      data: {
+        ref_id: `${failTxId}-R1`,
+        customer_no: '085700009922',
+        buyer_sku_code: 'BAL_ISAT_10',
+        message: 'Nomor tujuan gangguan',
+        status: 'Gagal',
+        rc: '07',
+      },
+    });
+    const failRes = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Digiflazz-Event': 'update',
+        'X-Hub-Signature': signBody(failPayload, webhookSecret),
+      },
+      body: failPayload,
+    });
+    assert.equal(failRes.status, 200);
+    const failJson = (await failRes.json()) as { ok: boolean; transactionStatus: string };
+    assert.equal(failJson.ok, true);
+    assert.equal(failJson.transactionStatus, 'REFUNDED');
+
+    const refundedTx = db
+      .prepare('SELECT customer_id, payment_amount, transaction_status FROM transactions WHERE transaction_id = ?')
+      .get(failTxId) as { customer_id: number; payment_amount: number; transaction_status: string };
+    assert.equal(refundedTx.transaction_status, 'REFUNDED');
+    assert.equal(getCustomerRefundCreditTotal(refundedTx.customer_id), refundedTx.payment_amount);
+  } finally {
+    config.digiflazz.webhookSecret = prevSecret;
+    await new Promise<void>((resolve) => apiServer.close(() => resolve()));
+  }
+});
+
 test.after(() => {
   closeDb();
   fs.rmSync(tempDir, { recursive: true, force: true });

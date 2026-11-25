@@ -41,6 +41,7 @@ export interface AppConfig {
     timeoutMs: number;
     priceSyncCron: string;
     priceSyncIntervalMinutes: number | null;
+    webhookSecret: string;
   };
   whatsapp: {
     enabled: boolean;
@@ -359,6 +360,7 @@ export function validateAndLoadConfig(env: NodeJS.ProcessEnv = process.env): App
       timeoutMs: digiflazzTimeoutMs,
       priceSyncCron: (env.DIGIFLAZZ_PRICE_SYNC_CRON || '0 */6 * * *').trim(),
       priceSyncIntervalMinutes,
+      webhookSecret: (env.DIGIFLAZZ_WEBHOOK_SECRET || '').trim(),
     },
     whatsapp: {
       enabled: waEnabled,
@@ -504,6 +506,9 @@ export function getSafeConfigSummary(cfg: AppConfig = config) {
       timeoutMs: cfg.digiflazz.timeoutMs,
       priceSyncCron: cfg.digiflazz.priceSyncCron,
       priceSyncIntervalMinutes: cfg.digiflazz.priceSyncIntervalMinutes,
+      webhookPath: '/api/webhooks/digiflazz',
+      webhookUrl: `${cfg.appUrl.replace(/\/+$/, '')}/api/webhooks/digiflazz`,
+      webhookConfigured: Boolean(cfg.digiflazz.webhookSecret),
     },
     paymentGateway: {
       baseUrl: cfg.paymentGateway.baseUrl,

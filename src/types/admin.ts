@@ -115,6 +115,9 @@ export interface SafeConfigSummary {
     timeoutMs: number;
     priceSyncCron: string;
     priceSyncIntervalMinutes?: number | null;
+    webhookPath?: string;
+    webhookUrl?: string;
+    webhookConfigured?: boolean;
   };
   paymentGateway: {
     baseUrl: string;
